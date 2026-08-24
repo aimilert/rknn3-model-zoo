@@ -18,7 +18,7 @@ The LLM Head is separated and runs independently on the host device, reducing me
 
 ### 2.3 Full Model Mode (No Pruning)
 
-Devices with larger memory (e.g., RK1828) can use the full model directly. Add the `--no_prune_mode` parameter when exporting:
+Devices with larger memory (e.g., RK1828) can use the full model directly. Add the `--no_prune_mode` parameter when exporting the Vision model:
 
 ```bash
 python export_rknn.py --no_prune_mode
@@ -55,26 +55,40 @@ python export_llm.py \
     --export_llm_path Qwen3-VL-4B-llm.onnx \
     --modelscope
 
-# Export RKNN model
+# Export RKNN model (without LoRA)
 python export_rknn.py \
     --onnx_path Qwen3-VL-4B-llm.onnx \
     --config Qwen3-VL-4B-llm.config.pkl \
     --rknn_path Qwen3-VL-4B-llm.rknn
+
+# Export RKNN model (with LoRA)
+python export_rknn.py \
+    --onnx_path Qwen3-VL-4B-llm.onnx \
+    --config Qwen3-VL-4B-llm.config.pkl \
+    --rknn_path Qwen3-VL-4B-llm-lora.rknn \
+    --lora_path /path/to/lora/adapter_model.safetensors \
+    --lora_config_path /path/to/lora/adapter_config.json
 ```
+
+> ⚠️ **Note**:
+> - If the model structure and quantization parameters are unchanged and you only need to re-export the `.rknn` file, use `--rebuild` for a quick rebuild. It depends on intermediate artifacts generated during the previous `build` phase in the `./tmp` directory.
+> - LoRA weights (e.g., `adapter_model.safetensors`) do **not** need to be converted to ONNX separately — simply pass the weight path via `--lora_path` and the config path via `--lora_config_path` in `export_rknn.py`, and the script will internally call `rknn.load_lora()` to load the `.safetensors` file directly, with no intermediate format conversion required.
+> - When exporting an RKNN model with LoRA, an additional `.lora_weight` file is generated alongside the `.rknn` file. Both files are required for C++ inference (`.rknn` as the model path, `.lora_weight` as the LoRA weight path).
+> - Make sure `--lora_path` points to the correct LoRA weight file (e.g., `.safetensors`) and `--lora_config_path` points to the corresponding config file (e.g., `adapter_config.json`).
 
 ## 4. Vision Model Resolution Adjustment
 
 Use `--img_h` and `--img_w` parameters to adjust input resolution (must be a multiple of 32):
 
 ```bash
-# Export Vision ONNX model
+# Export Vision ONNX model (resolution specified via --img_h/--img_w)
 python export_vision.py \
     --model_path Qwen/Qwen3-VL-4B-Instruct \
     --export_vision_path Qwen3-VL-4B-vision.onnx \
     --img_h 384 --img_w 384 \
     --modelscope
 
-# Export Vision RKNN model
+# Export Vision RKNN model (resolution auto-read from vision_config.json)
 python export_rknn.py \
     --onnx_path Qwen3-VL-4B-vision.onnx \
     --rknn_path Qwen3-VL-4B-vision.rknn
@@ -83,6 +97,7 @@ python export_rknn.py \
 > ⚠️ **Note**:
 > - Higher resolution increases memory usage and affects the maximum LLM context length
 > - Some resolutions may be incompatible with the RKNN inference framework; contact the RKNPU team if errors occur
+> - Vision RKNN export resolution is controlled by `vision_config.json`; no need to pass `--img_h`/`--img_w` again
 
 ## 5. C++ Deployment
 
@@ -108,21 +123,30 @@ Usage:
 ```text
 ./rknn_qwen3_vl_demo <vision_model_path> <vision_weight_path> <llm_model_path> <llm_weight_path> \
     <tokenizer_path> <embedding_path> <vision_core_mask> <llm_core_mask> <image_path> <prompt> \
-    <model_width> <model_height> [llm_lora_weight_path]
+    <model_width> <model_height> <max_context_len1> <max_context_len2> [llm_lora_weight_path]
 ```
 
 | Arg count | Meaning |
 |-----------|--------|
-| **13**    | 12 required args (including `model_width`, `model_height`), which must match the Vision export resolution. |
-| **14**    | Same as 13 plus `llm_lora_weight_path` for LoRA weights. |
+| **15**    | 14 required args (including `model_width`, `model_height`, `max_context_len1`, `max_context_len2`). |
+| **16**    | Same as 15 plus `llm_lora_weight_path` for LoRA weights. |
 
-**Example (13 args; resolution must match Vision export, e.g., 384x384)**:
+New context-length arguments:
+
+| Argument | Description |
+|----------|-------------|
+| `max_context_len1` | Maximum context length for the **Base session** (`session_base params.max_context_len`). |
+| `max_context_len2` | Maximum context length for the **LoRA session** (`session_lora params.max_context_len`). |
+
+> Both arguments are required and must be greater than 0. You can set them independently based on device memory, e.g., Base = 2048 and LoRA = 3072.
+
+**Example (15 args; resolution must match Vision export, e.g., 384x384)**:
 
 ```bash
-./rknn_qwen3_vl_demo ... 384 384
+./rknn_qwen3_vl_demo ... 384 384 2048 3072
 ```
 
-**Compare Base and LoRA (14 args, with LoRA weight path)**:
+**Compare Base and LoRA (16 args, with LoRA weight path)**:
 
 ```bash
 ./rknn_qwen3_vl_demo \
@@ -132,6 +156,7 @@ Usage:
     0x3 0x3 \
     ./model/demo.jpg "Describe this image." \
     384 384 \
+    2048 3072 \
     ./model/llm_lora.weight
 ```
 

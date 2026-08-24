@@ -56,8 +56,6 @@ if __name__ == "__main__":
     for line in tqdm(lines):
         path, label = line.strip().split()
         label = int(label)
-        if model_path.find("mobilenet_v1_1.0_224.onnx") > -1:
-            label += 1
         image_path = os.path.join(data_root, path[:-1])
         input_tensor = preprocess_image(image_path)
         outputs = session.run([output_name], {input_name: input_tensor})

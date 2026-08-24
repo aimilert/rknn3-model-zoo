@@ -2,6 +2,35 @@
 
 # RKNN3-MODEL-ZOO
 
+## Table of Contents
+
+- [1. Introduction](#1-introduction)
+- [2. Supported Models](#2-supported-models)
+  - [2.1 LLM](#21-llm)
+  - [2.2 VLM](#22-vlm)
+  - [2.3 Omni](#23-omni)
+  - [2.4 ASR (Speech Recognition)](#24-asr-speech-recognition)
+  - [2.5 TTS (Text-to-Speech)](#25-tts-text-to-speech)
+  - [2.6 Embedding / Reranker](#26-embedding--reranker)
+  - [2.7 Translation](#27-translation)
+  - [2.8 OCR](#28-ocr)
+  - [2.9 CV (Computer Vision)](#29-cv-computer-vision)
+- [3. Supported Platforms](#3-supported-platforms)
+- [4. Quick Start](#4-quick-start)
+  - [4.1 Environment Setup](#41-environment-setup)
+  - [4.2 General Deployment Flow](#42-general-deployment-flow)
+  - [4.3 Common Parameters](#43-common-parameters)
+- [5. Advanced Features](#5-advanced-features)
+  - [5.1 SpeedUP Inference Acceleration](#51-speedup-inference-acceleration)
+  - [5.2 Multi-card Inference](#52-multi-card-inference)
+  - [5.3 LoRA Support](#53-lora-support)
+- [6. Model Adaptation Guide](#6-model-adaptation-guide)
+- [7. Important Notes](#7-important-notes)
+- [8. Additional Notes](#8-additional-notes)
+
+
+## 1. Introduction
+
 RKNN3 SDK provides the complete software stack for deploying AI models on RK1820/RK1828 coprocessors, including:
 
 - **[RKNN3-Toolkit](https://github.com/airockchip/rknn3-toolkit)**: PC-side software development kit for model conversion, inference, performance evaluation, etc.
@@ -13,53 +42,100 @@ This repository provides a complete model deployment workflow:
 - **Model Conversion**: Convert ONNX models to RKNN format using RKNN3 Toolkit
 - **On-board Deployment**: Provide C++ inference example code
 
-## 1. Supported Models
+## 2. Supported Models
 
-### LLM/VLM
+### 2.1 LLM
 
-- FastVLM
-- SmolVLM / SmolVLM2
-- GLM-Edge
-- GME-Qwen2-VL
-- InternVLM
-- Janus-Pro
-- MiniCPM-V / MiniCPM-V-4
-- Qwen2.5 / Qwen2.5-VL / Qwen2.5-Omni
-- Qwen3 / Qwen3-VL / Qwen3-VL-LoRA
-- Gemma-4
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [GLM-Edge](examples/glm_edge/README.md) | `examples/glm_edge` | GLM Edge series on-device LLM |
+| [MiniCPM5](examples/MiniCPM5/README.md) | `examples/MiniCPM5` | MiniCPM5 LLM |
+| [Nanbeige4.2](examples/Nanbeige4_2/README.md) | `examples/Nanbeige4_2` | Nanbeige Looped Transformer LLM |
+| [Qwen2.5](examples/Qwen2_5/README.md) | `examples/Qwen2_5` | Tongyi Qianwen 2.5 series LLM |
+| [Qwen3](examples/Qwen3/README.md) | `examples/Qwen3` | Tongyi Qianwen 3 series LLM |
+| [Qwen3.5](examples/Qwen3_5/README.md) | `examples/Qwen3_5` | Tongyi Qianwen 3.5 series LLM |
+| [FunctionGemma](examples/functiongemma/README.md) | `examples/functiongemma` | Google FunctionGemma function-calling model |
+| [LFM2.5](examples/LFM2_5/README.md) | `examples/LFM2_5` | LiquidAI LFM2.5 hybrid-architecture LLM (Full Attention + streaming short convolution) |
 
-### ASR (Speech Recognition)
+### 2.2 VLM
 
-- Qwen3-ASR (Streaming / Non-streaming)
-- SenseVoiceSmall
-- Zipformer
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [FastVLM](examples/FastVLM/README.md) | `examples/FastVLM` | Apple lightweight vision-language model |
+| [SmolVLM](examples/SmolVLM/README.md) | `examples/SmolVLM` | HuggingFace lightweight vision-language model |
+| [SmolVLM2](examples/SmolVLM2/README.md) | `examples/SmolVLM2` | HuggingFace SmolVLM second-generation vision-language model |
+| [GME-Qwen2-VL](examples/GME-Qwen2-VL/README.md) | `examples/GME-Qwen2-VL` | Tongyi Qianwen vision embedding model |
+| [InternVLM](examples/InternVLM/README.md) | `examples/InternVLM` | InternVL vision-language model |
+| [Janus-Pro](examples/Janus_Pro/README.md) | `examples/Janus_Pro` | DeepSeek multimodal understanding and generation model |
+| [LocateAnything](examples/LocateAnything/README.md) | `examples/LocateAnything` | NVIDIA visual grounding multimodal model (object detection / phrase grounding / GUI grounding) |
+| [MiniCPM-V-4](examples/MiniCPM_V_4/README.md) | `examples/MiniCPM_V_4` | MiniCPM-V-4 vision-language model |
+| [Qwen2.5-VL](examples/Qwen2_5_VL/README.md) | `examples/Qwen2_5_VL` | Tongyi Qianwen 2.5 vision-language model |
+| [Qwen3-VL](examples/Qwen3_VL/README.md) | `examples/Qwen3_VL` | Tongyi Qianwen 3 vision-language model |
+| [Qwen3-VL-LoRA](examples/Qwen3_VL_LoRA/README.md) | `examples/Qwen3_VL_LoRA` | Tongyi Qianwen 3-VL LoRA fine-tuned model |
+| [Qwen3.5-VL](examples/Qwen3_5_VL/README.md) | `examples/Qwen3_5_VL` | Tongyi Qianwen 3.5 vision-language model |
+| [UI-TARS](examples/UI_TARS/README.md) | `examples/UI_TARS` | ByteDance GUI Agent vision-language model |
 
-### TTS (Text-to-Speech)
+### 2.3 Omni
 
-- Qwen3-TTS
-- VITS (LJSpeech / VCTK)
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [Gemma-4](examples/gemma4/README.md) | `examples/gemma4` | Google Gemma-4 multimodal model (text + audio) |
+| [Qwen2.5-Omni](examples/Qwen2_5_Omni/README.md) | `examples/Qwen2_5_Omni` | Tongyi Qianwen 2.5 omni model |
+| Qwen3-Omni | Commercial closed-source model | Tongyi Qianwen 3 omni model |
+| Qwen3.5-Omni | Commercial closed-source model | Tongyi Qianwen 3.5 omni model |
 
-### Embedding / Reranker
+### 2.4 ASR (Speech Recognition)
 
-- Qwen3-Embedding
-- Qwen3-Reranker
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [Qwen3-ASR](examples/Qwen3_ASR/README.md) | `examples/Qwen3_ASR` | Tongyi Qianwen speech recognition (streaming / non-streaming) |
+| [SenseVoiceSmall](examples/sensevoice_small/README.md) | `examples/sensevoice_small` | Alibaba FunAudioLLM speech recognition model |
+| [WeNet (Conformer)](examples/wenet/README.md) | `examples/wenet` | WeNet U2++ Conformer streaming Chinese speech recognition |
+| [Whisper](examples/whisper/README.md) | `examples/whisper` | OpenAI multilingual speech recognition model |
+| [Zipformer](examples/zipformer/README.md) | `examples/zipformer` | Zipformer streaming speech recognition |
 
-### Translation
+### 2.5 TTS (Text-to-Speech)
 
-- HY-MT1.5
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [Qwen3-TTS](examples/Qwen3_TTS/README.md) | `examples/Qwen3_TTS` | Tongyi Qianwen text-to-speech |
+| [VITS](examples/vits/README.md) | `examples/vits` | VITS speech synthesis (LJSpeech / VCTK) |
 
-### OCR
+### 2.6 Embedding / Reranker
 
-- PaddleOCR-VL
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [Qwen3-Embedding](examples/Qwen3_Embedding/README.md) | `examples/Qwen3_Embedding` | Tongyi Qianwen text embedding model |
+| [Qwen3-Reranker](examples/Qwen3_Reranker/README.md) | `examples/Qwen3_Reranker` | Tongyi Qianwen reranker model |
 
-### CV (Computer Vision)
+### 2.7 Translation
 
-- MobileNetV1 / MobileNetV2 / ResNet
-- YOLOv5 / YOLOv6 / YOLOv8
-- DINOv3
-- SigLIP2
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [HY-MT1.5](examples/HY_MT_1_5/README.md) | `examples/HY_MT_1_5` | Hunyuan multilingual translation model |
 
-## 2. Supported Platforms
+### 2.8 OCR
+
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [PaddleOCR-VL](examples/paddleocr_vl/README.md) | `examples/paddleocr_vl` | Baidu PaddleOCR-VL visual OCR model |
+
+### 2.9 CV (Computer Vision)
+
+| Model | Example Directory | Description |
+|-------|-------------------|-------------|
+| [MobileNetV2](examples/mobilenet_v2/README.md) | `examples/mobilenet_v2` | Lightweight image classification model |
+| [ResNet](examples/resnet/README.md) | `examples/resnet` | Classic residual image classification model |
+| [YOLOv5](examples/yolov5/README.md) | `examples/yolov5` | Object detection model |
+| [YOLOv6](examples/yolov6/README.md) | `examples/yolov6` | Object detection model |
+| [YOLOv8](examples/yolov8/README.md) | `examples/yolov8` | Object detection model |
+| [YOLO26](examples/yolo26/README.md) | `examples/yolo26` | Ultralytics YOLO26 object detection model (yolo26n/s/m) |
+| [YOLO26-Segment](examples/yolo26_segment/README.md) | `examples/yolo26_segment` | Ultralytics YOLO26 instance segmentation model |
+| [YOLO26-Pose](examples/yolo26_pose/README.md) | `examples/yolo26_pose` | Ultralytics YOLO26 human pose estimation model |
+| [QA-CLIP](examples/QAClip/README.md) | `examples/QAClip` | Chinese-English image-text similarity model |
+| [Depth Anything V3](examples/depth_anything_v3/README.md) | `examples/depth_anything_v3` | Multi-view stereo depth estimation model |
+
+## 3. Supported Platforms
 
 | Host SoC | Coprocessor | OS |
 |----------|-------------|-----|
@@ -68,14 +144,14 @@ This repository provides a complete model deployment workflow:
 | RK3572 Series | - | Linux / Android |
 
 > **Build and runtime library notes**:
-> - The top-level build scripts `build-linux.sh` / `build-android.sh` accept `-t rk3588`, `rk3576`, `rk3572`, and `x86`.
+> - The top-level build scripts `build-linux.sh` / `build-android.sh` accept `-t` with `rk3588`, `rk3576`, `rk3572`, and `x86`.
 > - RKNN3 runtime libraries installed into each demo's `lib/` directory are SoC-specific:
 >   - `RK3588` / `RK3576`: `librknn3_api.so` and `librknn3_api_rkcp.so`
 >   - `RK3572`: `librknn3_api.so` and `librknn3_api_native.so`
 
-## 3. LLM Model Deployment (Example: Qwen2.5-3B)
+## 4. Quick Start
 
-### 3.1 Export Model Configuration
+### 4.1 Environment Setup
 
 > **Requirements**: Python 3.10
 
@@ -83,74 +159,31 @@ This repository provides a complete model deployment workflow:
 cd rknn3_model_zoo/
 pip install -r requirements.txt
 export PYTHONPATH=./
+```
 
+### 4.2 General Deployment Flow
+
+All models follow a unified four-step flow: **Export ONNX -> Convert RKNN -> Build -> Run**.
+
+#### LLM Model (Example: Qwen2.5-3B)
+
+```bash
+# Step 1: Export ONNX model (--quant enables GRQ quantization)
 cd examples/Qwen2_5/python/
 python export_llm.py --quant
-```
 
-#### Parameters
-
-| Parameter | Type | Description | Default |
-|-----------|------|-------------|---------|
-| `--load_weight` | bool | Load model weights (`False` exports structure only) | `True` |
-| `--quan_dataset` | bool | Generate quantization dataset (requires `--load_weight=True`) | `True` |
-| `--model_path` | str | Model path or HuggingFace name | `Qwen/Qwen2.5-3B-Instruct` |
-| `--export_llm_path` | str | Export path | `../model/llm/Qwen2.5-3B-Instruct.onnx` |
-| `--quant` | bool | Enable GRQ quantization | `False` |
-| `--modelscope` | bool | Download from ModelScope (recommended for China users) | `False` |
-
-> **Notes**:
-> - When using GRQ quantization, the model contains quantization parameters; no quantization dataset is needed for RKNN conversion
-> - Exported configuration files include: ONNX model, Config, Tokenizer, and Embed files
-
-### 3.2 Export RKNN Model
-
-```bash
+# Step 2: Convert to RKNN model
 python export_rknn.py
-```
 
-#### Parameters
-
-| Parameter | Type | Description | Default |
-|-----------|------|-------------|---------|
-| `--onnx_path` | str | Input ONNX model path | `../model/llm/Qwen2.5-3B-Instruct.onnx` |
-| `--config` | str | Model Config path | `../model/llm/Qwen2.5-3B-Instruct.config.pkl` |
-| `--rknn_path` | str | Output RKNN model path | `../model/llm/Qwen2.5-3B-Instruct.rknn` |
-| `--dataset_path` | str | Quantization dataset path | `../data/dataset.txt` |
-
-> **Notes**:
-> - When using GRQ quantization, RKNN conversion ignores the quantization dataset
-> - Export uses weight-separated mode, generating both `.rknn` and `.weight` files
-
-### 3.3 Linux Platform Example
-
-#### Build
-
-```bash
+# Step 3: Build
 cd ../../../
-
-# Optional: specify cross-compiler path
-export GCC_COMPILER=<GCC_COMPILER_PATH>
-
-# Build command
-./build-linux.sh -t <TARGET_PLATFORM> -a <ARCH> -d Qwen2_5
-
-# Example: RK3588 platform
+export GCC_COMPILER=<GCC_COMPILER_PATH>     # Optional: specify cross-compiler path
 ./build-linux.sh -t rk3588 -a aarch64 -d Qwen2_5
-```
 
-#### Push to Board
-
-```bash
-adb push install/<TARGET_PLATFORM>_linux_<ARCH>/rknn_Qwen2_5_demo/ /data/
-```
-
-#### Run
-
-```bash
+# Step 4: Push and run
+adb push install/rk3588_linux_aarch64/rknn_Qwen2_5_demo/ /data/
 adb shell
 cd /data/rknn_Qwen2_5_demo
-
 export LD_LIBRARY_PATH=./lib
 ./rknn_qwen2_5_demo \
     model/Qwen2.5-0.5B-Instruct.rknn \
@@ -161,133 +194,73 @@ export LD_LIBRARY_PATH=./lib
     "Who are you?"
 ```
 
-## 4. VLM Model Deployment (Example: FastVLM-1.5B)
-
-### 4.1 Export Model Configuration
-
-> **Requirements**: Python 3.10
+#### VLM Model (Example: Qwen3-VL-4B)
 
 ```bash
-cd rknn3_model_zoo/
-pip install -r requirements.txt
-export PYTHONPATH=./
-
-cd examples/FastVLM/python/
-
-# Export LLM model configuration
-cd ./llm
-python export_llm.py --quant
-
-# Export Vision model configuration
+# Step 1: Export ONNX models (Vision + LLM exported separately; --quant requires calibration data generated first)
+cd examples/Qwen3_VL/python/llm/
+python make_calidata.py --model_path Qwen/Qwen3-VL-4B-Instruct --modelscope
+python export_llm.py --quant \
+    --model_path Qwen/Qwen3-VL-4B-Instruct \
+    --export_llm_path Qwen3-VL-4B-llm.onnx --modelscope
 cd ../vision/
-python export_vision.py
-```
+python make_calidata.py --model_path Qwen/Qwen3-VL-4B-Instruct --modelscope
+python export_vision.py --quant \
+    --model_path Qwen/Qwen3-VL-4B-Instruct \
+    --export_vision_path Qwen3-VL-4B-vision.onnx --modelscope
 
-#### LLM Export Parameters (export_llm.py)
+# Step 2: Convert to RKNN models (Vision + LLM converted separately)
+python export_rknn.py \
+    --onnx_path Qwen3-VL-4B-vision.onnx \
+    --rknn_path Qwen3-VL-4B-vision.rknn --platform rk1820   # Vision RKNN
+cd ../llm/
+python export_rknn.py \
+    --onnx_path Qwen3-VL-4B-llm.onnx \
+    --config Qwen3-VL-4B-llm.config.pkl \
+    --rknn_path Qwen3-VL-4B-llm.rknn --platform rk1820       # LLM RKNN
 
-| Parameter | Type | Description | Default |
-|-----------|------|-------------|---------|
-| `--load_weight` | bool | Load model weights (`False` exports structure only) | `True` |
-| `--quan_dataset` | bool | Generate quantization dataset (requires `--load_weight=True`) | `True` |
-| `--model_path` | str | Model path or HuggingFace name | `../../llava-fastvithd_1.5b_stage3` |
-| `--export_llm_path` | str | Export path | `../../model/llm/FastVLM-llm.onnx` |
-| `--quant` | bool | Enable AWQ + GRQ quantization | `False` |
-| `--modelscope` | bool | Download from ModelScope (recommended for China users) | `False` |
+# Step 3: Build
+cd ../../../
+export GCC_COMPILER=<GCC_COMPILER_PATH>     # Optional
+./build-linux.sh -t rk3588 -a aarch64 -d Qwen3_VL
 
-> **Notes**:
-> - Model needs to be downloaded externally
-> - When using AWQ + GRQ quantization, the model contains quantization parameters; no quantization dataset is needed for RKNN conversion
-> - Exported configuration files include: ONNX model, Config, Tokenizer, and Embed files
-
-#### Vision Export Parameters (export_vision.py)
-
-| Parameter | Type | Description | Default |
-|-----------|------|-------------|---------|
-| `--load_weight` | bool | Load model weights | `True` |
-| `--model_path` | str | Model path | `../../llava-fastvithd_1.5b_stage3` |
-| `--export_vision_path` | str | Export path | `../../model/vision/FastVLM-vision.onnx` |
-| `--img_size` | int | Input image resolution | `512` |
-
-> **Note**: Vision model exports ONNX format only
-
-### 4.2 Export RKNN Model
-
-```bash
-# Export Vision RKNN model
-cd ./vision
-python export_rknn.py
-
-# Export LLM RKNN model
-cd ../llm
-python export_rknn.py
-```
-
-#### Vision RKNN Export Parameters
-
-| Parameter | Type | Description | Default |
-|-----------|------|-------------|---------|
-| `--onnx_path` | str | Input ONNX model path | `../../model/vision/FastVLM-vision.onnx` |
-| `--rknn_path` | str | Output RKNN model path | `../../model/vision/FastVLM-vision.rknn` |
-| `--dataset_path` | str | Quantization dataset path | `../../../../datasets/MMBench/vision/datasets.txt` |
-
-> **Note**: Uses Normal quantization by default; set `quantized_algorithm='grq'` for higher accuracy
-
-#### LLM RKNN Export Parameters
-
-| Parameter | Type | Description | Default |
-|-----------|------|-------------|---------|
-| `--onnx_path` | str | Input ONNX model path | `../../model/llm/FastVLM-llm.onnx` |
-| `--config` | str | Model Config path | `../../model/llm/FastVLM-llm.config.pkl` |
-| `--rknn_path` | str | Output RKNN model path | `../../model/llm/FastVLM-llm.rknn` |
-| `--dataset_path` | str | Quantization dataset path | `../../data/llm/dataset.txt` |
-
-> **Notes**:
-> - When using AWQ + GRQ quantization, RKNN conversion ignores the quantization dataset
-> - Export uses weight-separated mode, generating both `.rknn` and `.weight` files
-
-### 4.3 Linux Platform Example
-
-#### Build
-
-```bash
-cd rknn3_model_zoo/
-
-# Optional: specify cross-compiler path
-export GCC_COMPILER=<GCC_COMPILER_PATH>
-
-# Build command
-./build-linux.sh -t <TARGET_PLATFORM> -a <ARCH> -d FastVLM
-
-# Example: RK3588 platform
-./build-linux.sh -t rk3588 -a aarch64 -d FastVLM
-```
-
-#### Push to Board
-
-```bash
-adb push install/<TARGET_PLATFORM>_linux_<ARCH>/rknn_FastVLM_demo/ /data/
-```
-
-#### Run
-
-```bash
+# Step 4: Push and run
+adb push install/rk3588_linux_aarch64/rknn_Qwen3_VL_demo/ /data/
 adb shell
-cd /data/rknn_FastVLM_demo
-
+cd /data/rknn_Qwen3_VL_demo
 export LD_LIBRARY_PATH=./lib
-./rknn_fastvlm_demo \
-    model/FastVLM-vision.rknn \
-    model/FastVLM-vision.weight \
-    model/FastVLM-llm.rknn \
-    model/FastVLM-llm.weight \
-    model/FastVLM-llm.tokenizer.gguf \
-    model/FastVLM-llm.embed.bin \
+./rknn_qwen3_vl_demo \
+    model/Qwen3-VL-4B-vision.rknn model/Qwen3-VL-4B-vision.weight \
+    model/Qwen3-VL-4B-llm.rknn model/Qwen3-VL-4B-llm.weight \
+    model/Qwen3-VL-4B-llm.tokenizer.gguf model/Qwen3-VL-4B-llm.embed.bin \
     0xff 0xff \
     model/demo.jpg \
-    "Please describe the content of the picture."
+    "Please describe this image"
 ```
 
-### 4.4 SpeedUP Usage
+> For model-specific parameters and differences, refer to the README in each example directory.
+
+### 4.3 Common Parameters
+
+The export scripts of each model share the following common parameters (specific default values vary by model; see the README in each example directory):
+
+| Parameter | Description |
+|-----------|-------------|
+| `--model_path` | Model path or HuggingFace name |
+| `--quant` | Enable GRQ quantization algorithm (requires CUDA environment) |
+| `--modelscope` | Download model from ModelScope (recommended for China users) |
+| `--export_llm_path` / `--export_vision_path` | ONNX export path |
+| `--platform` / `--target_platform` | RKNN target platform (`rk1820` / `rk1828` / `rk3572`) |
+| `--load_weight` | Whether to load model weights (`False` exports structure only) |
+
+> **Notes**:
+> - When using GRQ quantization, the model contains quantization parameters; no quantization dataset is needed for RKNN conversion
+> - RKNN conversion uses weight-separated mode, generating both `.rknn` and `.weight` files
+> - LLM model export also includes Config (`.config.pkl`), Tokenizer (`.tokenizer.gguf`), and Embed (`.embed.bin`) files
+
+## 5. Advanced Features
+
+### 5.1 SpeedUP Inference Acceleration
 
 The Qwen2.5-VL and Qwen3-VL examples can link against the SpeedUP third-party library for inference acceleration.
 
@@ -304,15 +277,11 @@ Keep the following files in the release package:
 
 #### Build
 
-Qwen2.5-VL:
-
 ```bash
+# Qwen2.5-VL
 ./build-linux.sh -t rk3588 -a aarch64 -d Qwen2_5_VL
-```
 
-Qwen3-VL:
-
-```bash
+# Qwen3-VL
 ./build-linux.sh -t rk3588 -a aarch64 -d Qwen3_VL
 ```
 
@@ -320,22 +289,8 @@ After installation, `libSpeedUP.so` is copied into the corresponding demo `lib/`
 
 #### Runtime Arguments
 
-Qwen2.5-VL:
-
 ```bash
-./rknn_qwen2_5_vl_demo \
-    <vision_model_path> <vision_weight_path> \
-    <llm_model_path> <llm_weight_path> \
-    <tokenizer_path> <embedding_path> \
-    <vision_core_mask> <llm_core_mask> \
-    <image_path> <prompt> \
-    [model_width model_height] [speedup_ratio]
-```
-
-Qwen3-VL:
-
-```bash
-./rknn_qwen3_vl_demo \
+./rknn_qwen2_5_vl_demo \    # or ./rknn_qwen3_vl_demo
     <vision_model_path> <vision_weight_path> \
     <llm_model_path> <llm_weight_path> \
     <tokenizer_path> <embedding_path> \
@@ -400,21 +355,139 @@ export LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH
     1.0
 ```
 
-## 5. Model Adaptation Guide
+### 5.2 Multi-card Inference
+
+This example splits an LLM model into multiple segments (stages) at Transformer layer boundaries, with each segment deployed on one RK182X accelerator card. Through pipeline parallelism, it enables multi-card collaborative inference, supporting larger models and improving prefill performance.
+
+Currently supported models:
+
+| Model | RK182X Accelerator Cards |
+|-------|--------------------------|
+| `Qwen/Qwen3.5-9B` | 2 |
+| `google/gemma-4-12B-it` | 2 |
+| `Qwen/Qwen3.5-27B` | 4 |
+| `Qwen/Qwen3.8-27B` | 4 |
+| `google/gemma-4-31B-it` | 4 |
+
+#### Model Splitting Principle
+
+Segments are cut between layers without changing the intra-layer computation order; the last segment always contains the final `norm` and `lm_head` on top of its assigned Transformer layers. The export script does not simply split by `total_layers / num_segments` — it estimates each layer's weight (Transformer layers as W4A16/group32, `lm_head` as W6A16/group32, final `norm` as FP16) and automatically searches for balanced split boundaries so the estimated total weight of every segment is as close as possible. `--num_segments N` specifies the number of segments.
+
+#### Model Conversion
+
+```bash
+# Example: splitting Qwen3.5-9B into 2 segments
+cd examples/multicard/python/qwen3_5
+
+# Export segmented ONNX model
+python export_llm_segment.py --model_path /path/to/Qwen3.5-9B --multi_segment --num_segments 2
+
+# Export segmented RKNN model
+python export_rknn_segment.py --multi_segment --num_segments 2
+```
+
+Qwen3.5 and Gemma-4 use an external rope cache by default. Each segment produces an identical `.safetensors` file; pass any one of them via `--rope-tensor` at runtime.
+
+#### Build and Run
+
+```bash
+# Build
+./build-linux.sh -t rk3588 -a aarch64 -d multicard
+
+# Run (2-segment Qwen3.5-9B)
+cd /data/rknn_multicard_demo
+export LD_LIBRARY_PATH=./lib
+taskset f0 ./rknn_multicard_demo \
+    --model /data/models/multicard/Qwen3.5-9B-llm_seg0.rknn \
+    --weight /data/models/multicard/Qwen3.5-9B-llm_seg0.weight \
+    --vocab /data/models/multicard/Qwen3.5-9B-llm.tokenizer.gguf \
+    --embed /data/models/multicard/Qwen3.5-9B-llm.embed.bin \
+    -c 4096 \
+    --core-mask 0xff \
+    --stage-count 2 \
+    --bucket-size 128 \
+    --rope-tensor /data/models/multicard/Qwen3.5-9B-llm_seg0.safetensors \
+    --prompt "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" \
+    --predict 128
+```
+
+Only the seg0 model/weight paths need to be passed; the paths of `seg1..segN` are derived automatically from the `_segN` suffix.
+
+> For complete parameter descriptions, Gemma-4 examples, KV Cache rebuild, and multi-card inference code logic, see [`examples/multicard/README.md`](examples/multicard/README.md).
+
+### 5.3 LoRA Support
+
+RKNN3 supports LoRA (Low-Rank Adaptation) adapter loading, which overlays LoRA weights onto the RKNN model without modifying the base model weights, enabling task-specific fine-tuned inference. Currently, Qwen3-VL is provided as an example.
+
+#### Model Export
+
+LoRA weights (e.g., `adapter_model.safetensors`) do not need to be converted to ONNX separately; they can be passed directly to `export_rknn.py`:
+
+```bash
+cd examples/Qwen3_VL_LoRA/python/llm
+
+# Export RKNN model with LoRA
+python export_rknn.py \
+    --onnx_path Qwen3-VL-4B-llm.onnx \
+    --config Qwen3-VL-4B-llm.config.pkl \
+    --rknn_path Qwen3-VL-4B-llm-lora.rknn \
+    --lora_path /path/to/lora/adapter_model.safetensors \
+    --lora_config_path /path/to/lora/adapter_config.json
+```
+
+After export, two files are generated: `.rknn` and `.lora_weight`. Both must be provided during C++ inference.
+
+#### Build and Run
+
+```bash
+# Build
+./build-linux.sh -t rk3588 -a aarch64 -d Qwen3_VL_LoRA
+
+# Run (Base + LoRA dual-path comparison)
+cd /data/rknn_Qwen3_VL_LoRA_demo
+export LD_LIBRARY_PATH=./lib
+./rknn_qwen3_vl_demo \
+    ./model/vision.rknn ./model/vision.weight \
+    ./model/llm.rknn ./model/llm.weight \
+    ./model/tokenizer.gguf ./model/embed.bin \
+    0x3 0x3 \
+    ./model/demo.jpg "Describe this image" \
+    384 384 \
+    2048 3072 \
+    ./model/llm_lora.weight
+```
+
+The program will sequentially output inference results and performance statistics for both the Base model and LoRA model.
+
+#### LoRA-related API
+
+| API | Description |
+|-----|-------------|
+| `rknn3_lora_init(ctx, lora_weight_path)` | Initialize LoRA environment from file |
+| `rknn3_lora_load(ctx, lora)` | Load LoRA adapter into context |
+| `rknn3_session_enable_lora(session, lora)` | Enable LoRA for the specified session (automatically clears kvcache) |
+| `rknn3_session_disable_lora(session, lora)` | Disable LoRA for the specified session |
+| `rknn3_lora_unload(ctx, lora)` | Unload LoRA adapter |
+
+**Recommended call sequence**: `lora_init` -> `query(LORA_NUM)` -> `query(LORA_INFO)` -> `lora_load` -> `session_enable_lora` -> `lora_unload`
+
+> For complete parameter descriptions, API details, and dual-path inference implementation, see [`examples/Qwen3_VL_LoRA/README.md`](examples/Qwen3_VL_LoRA/README.md).
+
+## 6. Model Adaptation Guide
 
 - **Same-series Compatibility**: Examples within the same model series are interchangeable. For instance, the Qwen2.5-0.5B example works directly with Qwen2.5-7B by simply changing the model loading path.
 
 - **New Model Adaptation**: For LLM models not included in this repository, refer to the [LLM Model Adaptation Tutorial](LLM_model_modification_guide_EN.md) for ONNX export and deployment porting.
 
-## 6. Important Notes
+## 7. Important Notes
 
 - **Transformers Version**: Different models may require different `transformers` versions. Before exporting to ONNX, install the correct version. Version info can be found in the `transformers_version` field of the model's config.json (e.g., https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/config.json ). Some models have special version requirements; refer to the `requirements.txt` in each example directory.
 
-- **PyTorch Version**: Recommended PyTorch <= 2.8.0 (Qwen3-VL, Gemma-4 service models require PyTorch >= 2.9.0; PaddleOCR-VL requires transformers == 4.55.0. Please refer to the requirements.txt under the corresponding model for specific details.)
+- **PyTorch Version**: Recommended PyTorch <= 2.8.0 (Qwen3-VL, Gemma-4, and other models require PyTorch >= 2.9.0; PaddleOCR-VL requires transformers == 4.55.0. See the `requirements.txt` under the corresponding model for details.)
 
 - **Module Compatibility**: Gemma-4 Audio and LLM models must use the same version (both E2B or both E4B); mixing versions is not supported.
 
-## 7. Additional Notes
+## 8. Additional Notes
 
 This repository uses the following mirror sites by default to obtain model files:
 - [ModelScope](https://www.modelscope.cn) (recommended for China users)

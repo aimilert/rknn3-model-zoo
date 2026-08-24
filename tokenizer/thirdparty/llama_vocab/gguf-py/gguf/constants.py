@@ -429,6 +429,7 @@ class MODEL_ARCH(IntEnum):
     SEED_OSS         = auto()
     GROVEMOE         = auto()
     APERTUS          = auto()
+    NANBEIGE         = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -784,6 +785,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.SEED_OSS:         "seed_oss",
     MODEL_ARCH.GROVEMOE:         "grovemoe",
     MODEL_ARCH.APERTUS:          "apertus",
+    MODEL_ARCH.NANBEIGE:         "nanbeige",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -2900,6 +2902,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_CHEXP,
         MODEL_TENSOR.FFN_UP_CHEXP,
     ],
+    MODEL_ARCH.NANBEIGE: [],
     # TODO
 }
 

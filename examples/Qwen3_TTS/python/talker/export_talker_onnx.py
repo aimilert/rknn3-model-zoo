@@ -243,8 +243,35 @@ if __name__ == "__main__":
         required=False,
         default="eager",
     )
+    parser.add_argument("--quant", action='store_true', help="Whether use Normal_Hybrid quantization")
 
     args = parser.parse_args()
     model = build_model(args)
+    if args.quant and torch.cuda.is_available(): # qwen3-tts 全int4量化精度较低，需要开启混合量化
+        from rknn.quantization.api import RKQuantizer
+
+        
+        ## 初始化量化工具
+        QuantTool = RKQuantizer(verbose=True)
+        
+        ## 量化工具加载模型
+        ret = QuantTool.load_model(model=model.talker.model, tokenizer=None, device='cuda')
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        
+        ## 执行量化算法, hybrid_rate=0.2表示20%的Linear层会被设置为int8类型
+        model.talker.model = QuantTool.quantize(quantized_dtype="w4a16",
+                                                quantized_method="group32",
+                                                quantized_algorithm="normal",
+                                                dataset=None,
+                                                auto_hybrid_rate=0.2)
+
+        model = model.cpu()
+
     export_talker(model, args)
+    if args.quant and torch.cuda.is_available(): ## 混合量化开启下，需要导出op位宽配置json文件，在后续导出rknn的时候使用
+        QuantTool.export_op_quantized_dtype(args.export_talker_path, op_dtype_path='layer_bit.json')
+    
+    
     export_talker_config(model, args)

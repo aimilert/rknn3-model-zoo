@@ -1,10 +1,10 @@
 import numpy as np
 from rknn.api import RKNN
 
-ONNX_MODEL = 'InternVL3-2B-llm/InternVL3-2B-llm.onnx'
-LLM_CONFIG = 'InternVL3-2B-llm/InternVL3-2B-llm.config.pkl'
-RKNN_MODEL = 'InternVL3-2B-llm/InternVL3-2B-llm.rknn'
-DATASET_PATH = '../../data/llm/dataset.txt'
+ONNX_MODEL = 'llm/InternVL3.5-2B-llm.onnx'
+LLM_CONFIG = 'llm/InternVL3.5-2B-llm.config.pkl'
+RKNN_MODEL = 'llm/InternVL3.5-2B-llm.rknn'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 
@@ -23,7 +23,7 @@ if __name__ == '__main__':
     # pre-process config
     print('--> config model')
     rknn.config(target_platform=args.platform, 
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
                 )
     print('done')
 

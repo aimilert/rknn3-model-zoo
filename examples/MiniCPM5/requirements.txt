@@ -1,0 +1,6 @@
+modelscope==1.38.1
+numpy==2.5.1
+py_utils==0.1.1
+torch==2.7.0
+tqdm==4.68.4
+transformers==4.51.3

@@ -20,7 +20,7 @@
 
 #include "rknn_paddleocr_vl_llm.h"
 
-int init_paddleocr_vl_llm(rknn_paddleocr_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t core_mask)
+int init_paddleocr_vl_llm(rknn_paddleocr_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t core_mask)
 {
     int ret;
     rknn3_context  ctx     = 0;
@@ -29,7 +29,7 @@ int init_paddleocr_vl_llm(rknn_paddleocr_vl_llm_context* llm_ctx, const char* mo
     rknn3_config config;
     memset(&config, 0, sizeof(config));
     config.run_core_mask = core_mask;
-    config.user_mem_internal = 1; // 使用用户管理的internal内存
+    config.user_mem_internal = 0; // 使用用户管理的internal内存
 
     // RKNN Init
     ret = rknn3_init(&ctx, NULL);
@@ -124,9 +124,9 @@ int inference_paddleocr_vl_llm(rknn_paddleocr_vl_llm_context* llm_ctx, rknn3_llm
 
     // Run
     printf("rknn_session_run\n");
-    // perf->llm_start_time = getCurrentTimeUs();
+    perf->llm_start_time = getCurrentTimeUs();
     ret = rknn3_session_run(llm_ctx->rknn_sess, inputs, n_inputs, &llm_infer_param);
-    // perf->llm_end_time = getCurrentTimeUs();
+    perf->llm_end_time = getCurrentTimeUs();
     if (ret < 0)
     {
         printf("rknn_session_run fail! ret=%d\n", ret);

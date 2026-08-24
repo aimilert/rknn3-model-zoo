@@ -5,7 +5,7 @@ from rknn.api import RKNN
 
 ONNX_MODEL = './gemma-e2b-vision.onnx'
 RKNN_MODEL = './gemma-e2b-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
+DATASET_PATH = None
 RKNN_LOAD_JSON = 'gemma4_vision_rknn_load.json'
 
 

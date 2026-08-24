@@ -1,0 +1,4 @@
+numpy<2
+onnx
+depth-anything-3==0.1.1
+modelscope

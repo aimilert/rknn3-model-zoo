@@ -873,6 +873,9 @@ class TextModel(ModelBase):
         if chkhsh == "9ca2dd618e8afaf09731a7cf6e2105b373ba6a1821559f258b272fe83e6eb902":
             # ref: https://huggingface.co/zai-org/GLM-4.5-Air
             res = "glm4"
+        if chkhsh == "cdf5f35325780597efd76153d4d1c16778f766173908894c04afc20108536267":
+            # ref: https://huggingface.co/zai-org/GLM-4.7-Flash
+            res = "glm4"
         if chkhsh == "1431a23e583c97432bc230bff598d103ddb5a1f89960c8f1d1051aaa944d0b35":
             # ref: https://huggingface.co/sapienzanlp/Minerva-7B-base-v1.0
             res = "minerva-7b"
@@ -900,9 +903,21 @@ class TextModel(ModelBase):
         if chkhsh == "d4540891389ea895b53b399da6ac824becc30f2fba0e9ddbb98f92e55ca0e97c":
             # ref: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
             res = "qwen2"
+        if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
+            # ref: https://huggingface.co/openbmb/MiniCPM-V-4_6
+            res = "qwen35"
         if chkhsh == "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273":
             # ref: https://huggingface.co/alvarobartt/grok-2-tokenizer
             res = "grok-2"
+        if chkhsh == "b3d1dd861f1d4c5c0d2569ce36baf3f90fe8a102db3de50dd71ff860d91be3df":
+            # ref: https://huggingface.co/aari1995/German_Semantic_V3
+            res = "jina-v2-de"
+        if chkhsh == "0fe1cf6eda062318a1af7270f3331a85c539a01778ff948e24388e949c5282f4":
+            # ref: https://huggingface.co/evilfreelancer/ruGPT3XL
+            res = "gpt-2"
+        if chkhsh == "9e454714343b69b99b71795c1d27a68c2a1d15dab111f4d353109f966af29da7":
+            # ref: https://huggingface.co/LiquidAI/LFM2.5-8B-A1B
+            res = "lfm2"
         if chkhsh == "0ef9807a4087ebef797fc749390439009c3b9eda9ad1a097abbe738f486c01e5":
             # ref: https://huggingface.co/meta-llama/Meta-Llama-3-8B
             res = "llama-bpe"
@@ -1065,6 +1080,9 @@ class TextModel(ModelBase):
         if chkhsh == "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4":
             # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct
             res = "qwen35"
+        if chkhsh == "36f3066e97b7f3994b379aaacde306c1444c6ae84e81a5ae3cd2b7ed3b8c42d4":
+            # ref: https://huggingface.co/openbmb/MiniCPM5-1B
+            res = "minicpm5"
 
         if res is None:
             logger.warning("\n")
@@ -2191,7 +2209,7 @@ class StableLMModel(TextModel):
     "VoxtralForConditionalGeneration",
     "LlamaModel",
     "MultiModalityCausalLM", # RKLLM: For Janus Pro
-    "MiniCPMV"
+    "MiniCPMV",
     )
 class LlamaModel(TextModel):
     model_arch = gguf.MODEL_ARCH.LLAMA
@@ -2441,6 +2459,35 @@ class LlamaModel(TextModel):
             experts = [k for d in self._experts for k in d.keys()]
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
+
+
+@ModelBase.register("NanbeigeForCausalLM")
+class NanbeigeModel(LlamaModel):
+    model_arch = gguf.MODEL_ARCH.NANBEIGE
+    undo_permute = True
+
+    def _set_vocab_sentencepiece(self, add_to_gguf=True):
+        tokens, scores, toktypes = self._create_vocab_sentencepiece()
+
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+
+        special_vocab.add_special_token['bos'] = False
+
+        if isinstance(special_vocab.chat_template, str) and \
+                "not(visible_text(message.content).startswith" in special_vocab.chat_template:
+            special_vocab.chat_template = special_vocab.chat_template.replace(
+                "    {%- if ns.multi_step_tool and message.get('role', '') == \"user\" and visible_text(message.content) is string and not(visible_text(message.content).startswith('<tool_response>') and visible_text(message.content).endswith('</tool_response>')) %}",
+                "    {%- set _msg_content = visible_text(message.content) %}\n"
+                "    {%- if ns.multi_step_tool and message.get('role', '') == \"user\" and _msg_content is string and not (_msg_content.startswith('<tool_response>') and _msg_content.endswith('</tool_response>')) %}",
+            )
+
+        special_vocab.add_to_gguf(self.gguf_writer)
 
 
 @ModelBase.register("ArceeForCausalLM")
@@ -5021,7 +5068,7 @@ class InternLM3Model(TextModel):
         return [(self.map_tensor_name(name), data_torch)]
 
 
-@ModelBase.register("BertModel", "BertForMaskedLM", "CamembertModel", "BertForSequenceClassification")
+@ModelBase.register("BertModel", "BertForMaskedLM", "CamembertModel", "BertForSequenceClassification", "ChineseCLIPTextModel")
 class BertModel(TextModel):
     model_arch = gguf.MODEL_ARCH.BERT
 
@@ -5068,8 +5115,24 @@ class BertModel(TextModel):
         self.gguf_writer.add_token_types(toktypes)
 
         # handle special tokens
-        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
-        special_vocab.add_to_gguf(self.gguf_writer)
+        if self.hf_arch == "ChineseCLIPTextModel":
+            # llama.cpp's WPM tokenizer uses "bos" as the leading BERT special token.
+            # ChineseCLIP sets text_config.bos_token_id to PAD (0), but its tokenizer
+            # should start with [CLS]. Avoid exporting that PAD id as BOS.
+            special_vocab = gguf.SpecialVocab(
+                self.dir_model,
+                special_token_types=('unk', 'sep', 'pad', 'mask'),
+                n_vocab=len(tokens),
+            )
+            special_vocab.add_to_gguf(self.gguf_writer)
+
+            if "[CLS]" in tokens:
+                self.gguf_writer.add_bos_token_id(tokens.index("[CLS]"))
+            if "sep" not in special_vocab.special_token_ids and "[SEP]" in tokens:
+                self.gguf_writer.add_sep_token_id(tokens.index("[SEP]"))
+        else:
+            special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+            special_vocab.add_to_gguf(self.gguf_writer)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
@@ -5890,7 +5953,7 @@ class Gemma3NModel(Gemma3Model):
         return super().modify_tensors(data_torch, name, bid)
 
 
-@ModelBase.register("Gemma4ForConditionalGeneration")
+@ModelBase.register("Gemma4ForConditionalGeneration", "Gemma4UnifiedForConditionalGeneration")
 class Gemma4Model(Gemma3Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4
 

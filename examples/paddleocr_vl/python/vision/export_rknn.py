@@ -5,8 +5,8 @@ ONNX_MODEL = '../../model/vision/PaddleOCR-vision.onnx'
 RKNN_MODEL = '../../model/vision/PaddleOCR-vision.rknn'
 MLPAR_ONNX_MODEL = '../../model/vision/PaddleOCR-vision-mlp_AR.onnx'
 MLPAR_RKNN_MODEL = '../../model/vision/PaddleOCR-vision-mlp_AR.rknn'
-DATASET_PATH = '../../data/vision/datasets_vision.txt'
-MLPAR_DATASET_PATH = '../../data/vision/datasets_mlpar.txt'
+DATASET_PATH = None
+MLPAR_DATASET_PATH = None
 QUANTIZED = True
 TARGET_PLATFORM = None
 DEVICE_ID = None
@@ -72,7 +72,7 @@ if __name__ == '__main__':
 
     print('--> config model')
     rknn.config(target_platform='rk1820', core_num=8,
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
                 dynamic_input=dynamic_input,
                 profile_mode=True # 逐层dump时需要设置为True
                 )
@@ -90,7 +90,7 @@ if __name__ == '__main__':
 
     # Build model
     print('--> Building model')
-    rknn.build(do_quantization=QUANTIZED, dataset=args.dataset_path)
+    ret = rknn.build(do_quantization=QUANTIZED, dataset=args.dataset_path)
     if ret != 0:
         print('Build model failed!')
         exit(ret)
@@ -98,21 +98,22 @@ if __name__ == '__main__':
     
     # Export rknn model
     print('--> Export rknn model')
-    ret = rknn.export_rknn(args.rknn_path, save_ctx=True)
+    ret = rknn.export_rknn(args.rknn_path, save_ctx=False)
     if ret != 0:
         print('Export rknn model failed!')
         exit(ret)
     print('done')
     
-    if IS_ACCURACY:
+    if args.accuracy:
         rknn.init_runtime(target=TARGET_PLATFORM, device_id=DEVICE_ID, core_mask=CORE_MASK)
         
         pixel = np.load("../../model/vision/flatten.npy")
         position_embedding = np.load("../../model/vision/position.npy")
         rope_emb = np.load("../../model/vision/rope.npy")
-        rknn.accuracy_analysis(inputs=[pixel, position_embedding, rope_emb], core_mask=CORE_MASK,
-                            target=TARGET_PLATFORM, device_id=DEVICE_ID,
-                            output_dir="./vision_snapshot")
+        inputs = [pixel, position_embedding, rope_emb]
+        data_format = ['nchw'] * len(inputs)
+        rknn.inference(inputs, data_format, output_dir="./vision_snapshot", 
+                       accuracy_analysis=True, analysis_core_mask=CORE_MASK)
     
     rknn.release()
     
@@ -140,7 +141,7 @@ if __name__ == '__main__':
         
     print('--> config model')
     rknn.config(target_platform='rk1820', core_num=8,
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
                 dynamic_input=dynamic_input,
                 profile_mode=True # 逐层dump时需要设置为True
                 )
@@ -158,7 +159,7 @@ if __name__ == '__main__':
 
     # Build model
     print('--> Building model')
-    rknn.build(do_quantization=QUANTIZED, dataset=args.mlpar_dataset_path)
+    ret = rknn.build(do_quantization=QUANTIZED, dataset=args.mlpar_dataset_path)
     if ret != 0:
         print('Build model failed!')
         exit(ret)
@@ -166,19 +167,20 @@ if __name__ == '__main__':
     
     # Export rknn model
     print('--> Export rknn model')
-    ret = rknn.export_rknn(args.mlpar_rknn_path, save_ctx=True)
+    ret = rknn.export_rknn(args.mlpar_rknn_path, save_ctx=False)
     if ret != 0:
         print('Export rknn model failed!')
         exit(ret)
     print('done')
 
-    if IS_ACCURACY:
+    if args.accuracy:
         rknn.init_runtime(target=TARGET_PLATFORM, device_id=DEVICE_ID, core_mask=CORE_MASK)
         
         image_embeds = np.load("../../model/vision/mlp_input.npy")
-        rknn.accuracy_analysis(inputs=[image_embeds], core_mask=CORE_MASK, 
-                            target=TARGET_PLATFORM, device_id=DEVICE_ID,
-                            output_dir="./mlpar_snapshot")
+        inputs = [image_embeds]
+        data_format = ['nchw'] * len(inputs)
+        rknn.inference(inputs, data_format, output_dir="./mlpar_snapshot", 
+                       accuracy_analysis=True, analysis_core_mask=CORE_MASK)
     
     rknn.release()
 

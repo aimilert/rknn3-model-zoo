@@ -4,7 +4,7 @@ from rknn.api import RKNN
 ONNX_MODEL = '../../model/llm/SmolVLM-500M-llm.onnx'
 LLM_CONFIG = '../../model/llm/SmolVLM-500M-llm.config.pkl'
 RKNN_MODEL = '../../model/llm/SmolVLM-500M-llm.rknn'
-DATASET_PATH = '../../data/llm/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 
@@ -15,6 +15,7 @@ if __name__ == '__main__':
     parser.add_argument("--rknn_path", type=str, help="output rknn model path", required=False, default=RKNN_MODEL)
     parser.add_argument('--platform', type=str, default= "rk1820", help='Target platform (e.g. rk1820)')
     parser.add_argument("--dataset_path", type=str, help="model quantization dataset path", required=False, default=DATASET_PATH)
+    parser.add_argument('--rebuild', action='store_true', required=False, default=False, help='Whether to rebuild the model')
     args = parser.parse_args()
 
     # Create RKNN object
@@ -24,26 +25,33 @@ if __name__ == '__main__':
     print('--> config model')
     rknn.config(target_platform=args.platform, 
                 quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
-                #该模型需要实际场景的prompt去做grq量化，使用MMBench效果一般
                 )
     print('done')
 
-    # Load model
-    print('--> Loading model')
-    ret = rknn.load_llm(model=args.onnx_path, config=args.config)
+    if args.rebuild:
+        print('--> Rebuilding model')
+        ret = rknn.rebuild("./tmp")
+        if ret != 0:
+            print('Rebuild rknn model failed!')
+            exit(ret)
+        print('done')
+    else:
+        # Load model
+        print('--> Loading model')
+        ret = rknn.load_llm(model=args.onnx_path, config=args.config)
 
-    if ret != 0:
-        print('Load model failed!')
-        exit(ret)
-    print('done')
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        print('done')
 
-    # Build model
-    print('--> Building model')
-    ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
-    if ret != 0:
-        print('Build model failed!')
-        exit(ret)
-    print('done')
+        # Build model
+        print('--> Building model')
+        ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
+        if ret != 0:
+            print('Build model failed!')
+            exit(ret)
+        print('done')
 
     # Export rknn model
     print('--> Export rknn model')

@@ -36,7 +36,7 @@ const rknn3_sampling_params SAMPLE_PARAMS = {
 
 const char* system_prompt  = "";
 const char* prompt_prefix  = "<|begin_of_sentence|>User: ";
-const char* prompt_postfix = "\nAssistant: ";
+const char* prompt_postfix = "\nAssistant:\n";
 
 int64_t first_token;
 bool first_decode = true;

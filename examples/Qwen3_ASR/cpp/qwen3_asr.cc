@@ -150,7 +150,7 @@ int release_internal_share(rknn_app_context_t* app_ctx)
 
 int init_qwen3_asr_model(rknn_app_context_t* app_ctx, const char* llm_model_path, const char* llm_weight_path,
                     const char* audio_model_path, const char* audio_weight_path,
-                    rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t llm_core_mask, uint32_t audio_core_mask)
+                    rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t llm_core_mask, uint32_t audio_core_mask)
 {
     int ret = 0;
 

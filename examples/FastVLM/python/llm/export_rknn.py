@@ -3,7 +3,7 @@ from rknn.api import RKNN
 ONNX_MODEL = '../../model/llm/FastVLM-llm.onnx'
 LLM_CONFIG = '../../model/llm/FastVLM-llm.config.pkl'
 RKNN_MODEL = '../../model/llm/FastVLM-llm.rknn'
-DATASET_PATH = '../../data/llm/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 

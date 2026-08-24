@@ -4,7 +4,7 @@ from rknn.api import RKNN
 ONNX_MODEL = '../../model/llm/PaddleOCR-llm.onnx'
 LLM_CONFIG = '../../model/llm/PaddleOCR-llm.config.pkl'
 RKNN_MODEL = '../../model/llm/PaddleOCR-llm.rknn'
-DATASET_PATH = '../../data/llm/dataset.txt'
+DATASET_PATH = None
 QUANTIZED = True
 
 if __name__ == '__main__':
@@ -23,8 +23,8 @@ if __name__ == '__main__':
     # pre-process config
     print('--> config model')
     rknn.config(target_platform='rk1820', 
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
-                # max_ctx_len=2048, max_position_embeddings=2048,
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
+                max_ctx_len=4096,
                 )
     print('done')
 
@@ -39,7 +39,7 @@ if __name__ == '__main__':
 
     # Build model
     print('--> Building model')
-    rknn.build(do_quantization=QUANTIZED, dataset=args.dataset_path)
+    ret = rknn.build(do_quantization=QUANTIZED, dataset=args.dataset_path)
     if ret != 0:
         print('Build model failed!')
         exit(ret)
@@ -47,7 +47,7 @@ if __name__ == '__main__':
 
     # Export rknn model
     print('--> Export rknn model')
-    ret = rknn.export_rknn(args.rknn_path, save_ctx=True)
+    ret = rknn.export_rknn(args.rknn_path, save_ctx=False)
     if ret != 0:
         print('Export rknn model failed!')
         exit(ret)

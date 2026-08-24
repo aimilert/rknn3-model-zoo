@@ -56,7 +56,7 @@ int load_gme_qwen_vl_llm_model(rknn_gme_qwen_vl_llm_context* llm_ctx, const char
     return ret;
 }
 
-int init_gme_qwen_vl_llm_session(rknn_gme_qwen_vl_llm_context* llm_ctx, rknn3_llm_param* params, int n_params, RKLLMCallback callback)
+int init_gme_qwen_vl_llm_session(rknn_gme_qwen_vl_llm_context* llm_ctx, rknn3_llm_param* params, int n_params, RKLLMCallback& callback)
 {
     int ret;
     rknn3_session* session = NULL;

@@ -1,9 +1,9 @@
 import numpy as np
 from rknn.api import RKNN
 
-ONNX_MODEL = './onnx/InternViT3-vision.onnx'
-RKNN_MODEL = './onnx/InternViT3-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
+ONNX_MODEL = './vision/InternVL3.5-2B-vision.onnx'
+RKNN_MODEL = './vision/InternVL3.5-2B-vision.rknn'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 

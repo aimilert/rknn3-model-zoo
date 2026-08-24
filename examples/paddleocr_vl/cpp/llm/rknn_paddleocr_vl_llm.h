@@ -25,7 +25,7 @@ extern const char* prompt_prefix;
 extern const char* prompt_postfix;
 
 #define MAX_NEW_TOKENS 1024
-#define MAX_CONTEXT_LEN 1024
+#define MAX_CONTEXT_LEN 4096
 
 typedef struct {
     rknn3_context   rknn_ctx;
@@ -33,7 +33,7 @@ typedef struct {
 
 } rknn_paddleocr_vl_llm_context;
 
-int init_paddleocr_vl_llm(rknn_paddleocr_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t core_mask);
+int init_paddleocr_vl_llm(rknn_paddleocr_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t core_mask);
 
 int release_paddleocr_vl_llm(rknn_paddleocr_vl_llm_context* llm_ctx);
 

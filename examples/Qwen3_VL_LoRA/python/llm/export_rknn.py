@@ -4,9 +4,10 @@ from rknn.api import RKNN,DEFAULT_RKNN_LLM_CONFIG
 
 ONNX_MODEL = './Qwen3-VL-4B-Instruct/Qwen3-VL-4B-Instruct-llm.onnx'
 LORA_MODEL = None
+LORA_CONFIG = None
 LLM_CONFIG = './Qwen3-VL-4B-Instruct/Qwen3-VL-4B-Instruct-llm.config.pkl'
 RKNN_MODEL = './Qwen3-VL-4B-Instruct/Qwen3-VL-4B-Instruct-llm.rknn'
-DATASET_PATH = '../../data/llm/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 
@@ -14,9 +15,11 @@ if __name__ == '__main__':
     parser = ArgumentParser(description="Export Qwen/Qwen3-VL llm to RKNN model") 
     parser.add_argument("--onnx_path", type=str, help="onnx model path", required=False, default=ONNX_MODEL)
     parser.add_argument("--lora_path", type=str, help="lora model path", required=False, default=LORA_MODEL)
+    parser.add_argument("--lora_config_path", type=str, help="lora config file path", required=False, default=LORA_CONFIG)
     parser.add_argument("--config", type=str, help="config file path", required=False, default=LLM_CONFIG)
     parser.add_argument("--rknn_path", type=str, help="output rknn model path", required=False, default=RKNN_MODEL)
     parser.add_argument("--dataset_path", type=str, help="model quantization dataset path", required=False, default=DATASET_PATH)
+    parser.add_argument('--rebuild', action='store_true', required=False, default=False, help='Whether to rebuild the model')
     args = parser.parse_args()
 
     # Create RKNN object
@@ -45,33 +48,42 @@ if __name__ == '__main__':
     )
     print('done')
 
-    # Load model
-    print('--> Loading model')
-    ret = rknn.load_llm(model=args.onnx_path, config=args.config, seq=[1,128])
+    if args.rebuild:
+        print('--> Rebuilding model')
+        ret = rknn.rebuild("./tmp")
+        if ret != 0:
+            print('Rebuild rknn model failed!')
+            exit(ret)
+        print('done')
+    else:
+        # Load model
+        print('--> Loading model')
+        ret = rknn.load_llm(model=args.onnx_path, config=args.config, seq=[1,128])
 
-    if (args.lora_path is not None) and os.path.exists(args.lora_path):
-        ret = rknn.load_lora(
-            lora_paths=[[args.lora_path]],
-            lora_patterns=[["lora0_pattern0"]],
-            lora_quantized_dtype="float16",
-            lora_quantized_method="",
-            lora_prefix="base_model.model.model.",
-            lora_postfix_a=".lora_A.weight",
-            lora_postfix_b=".lora_B.weight"
-        )
+        if (args.lora_path is not None and args.lora_config_path is not None) and os.path.exists(args.lora_path):
+            ret = rknn.load_lora(
+                lora_paths=[[args.lora_path]],
+                lora_config_paths=[[args.lora_config_path]],
+                lora_patterns=[["lora0_pattern0"]],
+                lora_quantized_dtype="float16",
+                lora_quantized_method="",
+                lora_prefix="base_model.model.model.",
+                lora_postfix_a=".lora_A.weight",
+                lora_postfix_b=".lora_B.weight"
+            )
 
-    if ret != 0:
-        print('Load model failed!')
-        exit(ret)
-    print('done')
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        print('done')
 
-    # Build model
-    print('--> Building model')
-    ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
-    if ret != 0:
-        print('Build model failed!')
-        exit(ret)
-    print('done')
+        # Build model
+        print('--> Building model')
+        ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
+        if ret != 0:
+            print('Build model failed!')
+            exit(ret)
+        print('done')
 
     # Export rknn model
     print('--> Export rknn model')

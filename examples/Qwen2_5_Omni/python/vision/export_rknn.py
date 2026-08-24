@@ -3,7 +3,7 @@ from rknn.api import RKNN
 
 ONNX_MODEL = '../../model/vision/Qwen2.5-Omni-3B-vision.onnx'
 RKNN_MODEL = '../../model/vision/Qwen2.5-Omni-3B-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 

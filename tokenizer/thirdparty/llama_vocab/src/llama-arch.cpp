@@ -102,6 +102,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_LLADA,            "llada"            },
     { LLM_ARCH_LLADA_MOE,        "llada-moe"        },
     { LLM_ARCH_SEED_OSS,         "seed_oss"         },
+    { LLM_ARCH_NANBEIGE,         "nanbeige"         },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 

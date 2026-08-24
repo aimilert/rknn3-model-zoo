@@ -4,7 +4,7 @@ from rknn.api import RKNN
 ONNX_MODEL = '../model/llm/Qwen3-Reranker-0.6B.onnx'
 LLM_CONFIG = '../model/llm/Qwen3-Reranker-0.6B.config.pkl'
 RKNN_MODEL = '../model/llm/Qwen3-Reranker-0.6B.rknn'
-DATASET_PATH = '../../../datasets/CMMLU/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 
@@ -23,7 +23,7 @@ if __name__ == '__main__':
     # pre-process config
     print('--> config model')
     rknn.config(target_platform=args.platform, 
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
                 max_ctx_len=2048
                 )
     print('done')

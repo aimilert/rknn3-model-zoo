@@ -12,10 +12,11 @@ from transformers import AutoConfig, AutoModel
 if __name__ == '__main__':
     from argparse import ArgumentParser
 
-    parser = ArgumentParser(description="Export InternViT-300M-448px-V2_5 vision configuration and onnx model for RKNN")
-    parser.add_argument("--load_weight", type=int, help="Whether load model weight", required=False, default=True)
-    parser.add_argument("--model_path", type=str, help="model path or name", required=False, default='OpenGVLab/InternVL3-2B') # 模型下载链接：https://huggingface.co/OpenGVLab/InternVL3_5-2B/tree/main
-    parser.add_argument("--export_vision_path", type=str, help="export vision onnx model path", required=False, default="./onnx/InternViT3-vision.onnx")
+    parser = ArgumentParser(description="Export OpenGVLab/InternVL3.5-2B vision configuration and onnx model for RKNN")
+    parser.add_argument("--model_path", type=str, help="model path or name", required=False, default='OpenGVLab/InternVL3.5-2B') # 模型下载链接：https://huggingface.co/OpenGVLab/InternVL3_5-2B/tree/main
+    parser.add_argument("--export_vision_path", type=str, help="export vision onnx model path", required=False, default="./vision/InternVL3.5-2B-vision.onnx")
+    parser.add_argument("--quant", action='store_true', help="Whether use AWQ and GRQ quantization")
+    parser.add_argument("--cali_dataset", default='./quant_data/model_inputs.json', help="some samples for grq quantized_algorithm")
     parser.add_argument("--modelscope", action='store_true', help="Whether download model from www.modelscope.cn")
     args = parser.parse_args()
 
@@ -30,18 +31,33 @@ if __name__ == '__main__':
     config = AutoConfig.from_pretrained(args.model_path, **kwargs)
     update_config(config, ['use_cache'], False)
     update_config(config, ['_attn_implementation'], 'eager')
-    if args.load_weight:
-        print("args.load_weight")
-        model = AutoModel.from_pretrained(args.model_path, **kwargs).eval()
-    else:
-        print("not args.load_weight")
-        kwargs = {   
-            'torch_dtype': torch.float32,  
-            'trust_remote_code': True,
-        }
-        update_config(config, ["use_cache"], False)
-        model = AutoModel.from_config(config, **kwargs)
+    # 关闭 InternViT 的 flash_attn, 量化阶段改用 naive attention, 避免 dtype 冲突。
+    update_config(config, ['use_flash_attn'], False)
+    model = AutoModel.from_pretrained(args.model_path, **kwargs).eval()
+    # from_pretrained 会重新从磁盘读取 vision_config, 覆盖上面设置的 use_flash_attn=False,
+    # 故在模型加载后强制关闭 InternViT 各 attn 层的 use_flash_attn, 改用 naive attention,
+    # 避免量化阶段 flash_attn 的 fp16/bf16 assert 与 autoround 的 fp32 中间张量冲突。
+    for _name, _mod in model.vision_model.named_modules():
+        if hasattr(_mod, 'use_flash_attn'):
+            _mod.use_flash_attn = False
 
+    if args.quant and torch.cuda.is_available():
+        from rknn.quantization.api import RKQuantizer
+
+        ## 初始化量化工具
+        QuantTool = RKQuantizer(verbose=True)
+        
+        ## 量化工具加载模型
+        ret = QuantTool.load_model(model=model.vision_model, tokenizer=None, device='cuda')
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        
+        ## 执行量化算法
+        dataset = args.cali_dataset
+        model.vision_model = QuantTool.quantize(quantized_dtype="w4a16", quantized_method="group32", quantized_algorithm="grq", dataset=dataset)
+
+        model = model.cpu()
 
     export_vision_dirname = os.path.dirname(args.export_vision_path)
     if not os.path.exists(export_vision_dirname):
@@ -49,6 +65,3 @@ if __name__ == '__main__':
     
     # export vision model
     export_internvl_vision(model, args)
-
-    if not args.load_weight:
-        clear_llm_external_weight_in_dir(export_vision_dirname)

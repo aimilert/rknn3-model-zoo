@@ -17,7 +17,6 @@ if __name__ == '__main__':
     from argparse import ArgumentParser
 
     parser = ArgumentParser(description="Export FastVLM vision configuration and onnx model for RKNN")
-    parser.add_argument("--load_weight", type=int, help="Whether load model weight", required=False, default=True)
     parser.add_argument("--model_path", type=str, help="model path or name", required=False, default='../../llava-fastvithd_1.5b_stage3') # 模型下载链接：https://ml-site.cdn-apple.com/datasets/fastvlm/llava-fastvithd_1.5b_stage3.zip
     parser.add_argument("--export_vision_path", type=str, help="export vision onnx model path", required=False, default="../../model/vision/FastVLM-vision.onnx")
     parser.add_argument("--img_size", type=int, help="vision model input image size", required=False, default=512)
@@ -28,11 +27,8 @@ if __name__ == '__main__':
     }
     config = AutoConfig.from_pretrained(args.model_path, **kwargs)
     update_config(config, ['use_cache'], False)
-    if args.load_weight:
-        kwargs['config'] = config
-        model = LlavaQwen2ForCausalLM.from_pretrained(args.model_path, **kwargs)
-    else:
-        model = LlavaQwen2ForCausalLM(config)
+    kwargs['config'] = config
+    model = LlavaQwen2ForCausalLM.from_pretrained(args.model_path, **kwargs)
 
     export_vision_dirname = os.path.dirname(args.export_vision_path)
     if not os.path.exists(export_vision_dirname):
@@ -40,6 +36,3 @@ if __name__ == '__main__':
     
     # export vision model
     export_fastvlm_vision(model, args)
-
-    if not args.load_weight:
-        clear_llm_external_weight_in_dir(export_vision_dirname)

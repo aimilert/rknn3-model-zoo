@@ -4,7 +4,7 @@ from rknn.api import RKNN
 ONNX_MODEL = '../../model/llm/MiniCPM-V-4-llm.onnx'
 LLM_CONFIG = '../../model/llm/MiniCPM-V-4-llm.config.pkl'
 RKNN_MODEL = '../../model/llm/MiniCPM-V-4-llm.rknn'
-DATASET_PATH = '../../data/llm/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 

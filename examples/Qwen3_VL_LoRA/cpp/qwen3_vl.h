@@ -18,8 +18,8 @@
 
 #include "rknn3_api.h"
 #include "common.h"
-#include "rknn_qwen3_vl_vision.h"
-#include "rknn_qwen3_vl_llm.h"
+#include "vision/rknn_qwen3_vl_vision.h"
+#include "llm/rknn_qwen3_vl_llm.h"
 #include "time_utils.h"
 
 // llm
@@ -35,7 +35,7 @@ typedef struct {
 } rknn_app_context_t;
 
 int init_qwen3_vl_model(rknn_app_context_t* app_ctx, const char* llm_model_path, const char* llm_weight_path, const char* vision_model_path, const char* vision_weight_path,
-                        rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t vision_core_mask, uint32_t llm_core_mask, char* lora_weight_path);
+                        rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t vision_core_mask, uint32_t llm_core_mask, int max_context_len1, int max_context_len2, char* lora_weight_path);
 
 int release_qwen3_vl_model(rknn_app_context_t* app_ctx);
 

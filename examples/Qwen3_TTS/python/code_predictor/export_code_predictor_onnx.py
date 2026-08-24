@@ -237,8 +237,8 @@ if __name__ == "__main__":
         required=False,
         default="eager",
     )
-
     args = parser.parse_args()
     model = build_model(args)
+        
     export_code_predictor(model, args)
     export_code_predictor_config(model, args)

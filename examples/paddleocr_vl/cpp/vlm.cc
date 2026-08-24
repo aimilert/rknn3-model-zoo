@@ -15,6 +15,26 @@
 #include "vlm.h"
 
 
+static const char* normalize_prompt(const char* prompt)
+{
+    const char* DEFAULT_PROMPT = "OCR:";
+    const char* TABLE_PROMPT = "Table Recognition:";
+    const char* CHART_PROMPT = "Chart Recognition:";
+    const char* FORMULA_PROMPT = "Formula Recognition:";
+
+    if (prompt == nullptr) {
+        return DEFAULT_PROMPT;
+    } else if (strcmp(prompt, "table") == 0) {
+        return TABLE_PROMPT;
+    } else if (strcmp(prompt, "chart") == 0) {
+        return CHART_PROMPT;
+    } else if (strcmp(prompt, "formula") == 0) {
+        return FORMULA_PROMPT;
+    }
+    return DEFAULT_PROMPT;
+}
+
+
 /*-------------------------------------------
                 Callback Function
 -------------------------------------------*/
@@ -317,7 +337,7 @@ int inference_model(const char *img_path, const char *prompt){
     // LLM Input
     tensor.name           = "input_embeds";
     // Add image start tags to the prompt
-    prompt_with_image = "<image> " + std::string(prompt);
+    prompt_with_image = "<image>" + std::string(normalize_prompt(prompt));
     tensor.prompt         = (prompt_with_image).c_str();
     tensor.image.image_embed    = img_embeds;
     if(rknn_app_ctx.mlpar.embeds_ndims == 2) {

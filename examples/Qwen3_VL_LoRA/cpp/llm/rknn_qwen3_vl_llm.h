@@ -13,8 +13,8 @@
 // limitations under the License.
 
 
-#ifndef _RKNN_DEMO_QWEN3_VL_LLM_UTILS_H_
-#define _RKNN_DEMO_QWEN3_VL_LLM_UTILS_H_
+#ifndef _RKNN_DEMO_QWEN3_VL_LORA_LLM_UTILS_H_
+#define _RKNN_DEMO_QWEN3_VL_LORA_LLM_UTILS_H_
 
 #include "rknn3_api.h"
 #include "Tokenizer.h"
@@ -36,11 +36,11 @@ typedef struct {
     rknn3_aux_tensor deepstack_tensor[3];
 } rknn_qwen3_vl_llm_context;
 
-int init_qwen3_vl_llm(rknn_qwen3_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t core_mask, int* deepstack_aligned_size, char* lora_weight_path);
+int init_qwen3_vl_llm(rknn_qwen3_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t core_mask, int max_context_len1, int max_context_len2, int* deepstack_aligned_size, char* lora_weight_path);
 
 int release_qwen3_vl_llm(rknn_qwen3_vl_llm_context* llm_ctx);
 
 int inference_qwen3_vl_llm_base(rknn_qwen3_vl_llm_context* llm_ctx, rknn3_llm_multimodal_tensor tensor, int n_inputs, rknn_perf_metrics_t* perf);
 int inference_qwen3_vl_llm_lora(rknn_qwen3_vl_llm_context* llm_ctx, rknn3_llm_multimodal_tensor tensor, int n_inputs, rknn_perf_metrics_t* perf);
 
-#endif //_RKNN_DEMO_QWEN3_VL_LLM_UTILS_H_
+#endif //_RKNN_DEMO_QWEN3_VL_LORA_LLM_UTILS_H_

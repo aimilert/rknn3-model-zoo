@@ -42,25 +42,25 @@ Qwen3_ASR/
 
 ### 模型导出环境
 
-由于Qwen3ASR和RKNN3部分依赖包存在冲突，建议分别为两者搭建独立的运行环境：一个用于 Qwen3-ASR，以导出 ONNX 模型；另一个用于 RKNN3，以导出 RKNN3 模型。
+需要在同一个环境中安装rknn3和Qwen3-ASR的环境。首先安装rknn3环境，安装完成后安装Qwen3-ASR环境。
+
+#### RKNN3
+
+根据发布包直接安装即可。
 
 #### Qwen3ASR
 
-建议新建一个python环境，避免潜在的环境问题。
 按Qwen3-ASR官方代码，从源码安装环境，便于修改。官方环境安装命令如下：
 
 ```bash
-conda create -n qwen3-asr python=3.12
-conda activate qwen3-asr
-
 git clone https://github.com/QwenLM/Qwen3-ASR.git
 cd Qwen3-ASR
 pip install -e .
 ```
 
-#### RKNN3
+#### 常见问题
 
-根据发布包直接安装即可。
+导出llm onnx模型时出现报错，通常是torch版本过低，已验证通过`torch==2.10.0`
 
 ### 2.1 导出 Audio Encoder 模型
 
@@ -87,10 +87,47 @@ python export_audio_onnx.py \
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
 | `--model_path` | str | 模型路径或 HuggingFace 名称 | `Qwen/Qwen3-ASR-0.6B` |
-| `--export_encoder_path` | str | 输出 ONNX 路径 | `../../models/encoder.onnx` |
+| `--export_encoder_path` | str | 输出 ONNX 路径 | `../../../models/encoder.onnx` |
 | `--modelscope` | bool | 从 ModelScope 下载（推荐国内用户） | `False` |
 
-### 2.2 导出 LLM 模型
+### 2.2 生成量化校准数据
+
+在启用 `--quant`（GRQ 量化）导出 LLM ONNX 之前，需要先准备量化校准数据。
+`make_calidata.py` 会加载 Qwen3-ASR 模型，对一批音频执行语音识别，并捕获进入 thinker
+模型的真实输入，pickle 落盘后生成校准数据索引文件，供 `export_llm.py` 的 `--cali_dataset`
+使用。
+
+```bash
+cd python/llm
+python make_calidata.py
+```
+
+执行后会在当前目录下生成：
+
+```
+quant_data/
+├── model_input.json          # 校准数据索引（供 export_llm.py --cali_dataset 使用）
+└── model_inputs/
+    ├── sample_0              # 每条音频捕获的输入（pickle）
+    ├── sample_1
+    └── ...
+```
+
+脚本逻辑要点：
+
+- 音频清单从 `../../../../datasets/ASR/audio_data.txt` 读取，每行为 `datasets/ASR/` 目录下
+  的一个音频文件名；可按需替换为你自己的音频清单与音频文件。
+- 对每条音频调用 `model.transcribe(...)`，同时通过 `capture_module_input` 钩住
+  `model.model.thinker.model` 捕获其输入张量。
+- 索引文件 `model_input.json` 的路径与 `export_llm.py` 的默认 `--cali_dataset`
+  （`quant_data/model_input.json`）一致，无需额外传参。
+
+> ⚠️ **注意**：
+> - `make_calidata.py` 中的模型路径为脚本内硬编码（如 `/data/public/Qwen3-ASR-0.6B`），
+>   执行前请修改为本地实际的模型路径。
+> - 仅当 LLM 导出启用 `--quant` 时才需要执行本步骤；导出 float（非量化）模型时可跳过。
+
+### 2.3 导出 LLM 模型
 
 将 Qwen3-ASR 模型的 LLM 部分导出为 ONNX 格式：
 
@@ -99,7 +136,8 @@ cd python/llm
 python export_llm.py \
     --model_path Qwen/Qwen3-ASR-0.6B \
     --export_llm_path llm.onnx \
-    --modelscope
+    --modelscope \
+    --quant
 ```
 
 #### 参数说明
@@ -118,24 +156,26 @@ python export_llm.py \
 # 非流式
 cd python/audio/offline
 python export_audio_rknn.py \
-    --onnx_path ../../models/encoder.onnx \
-    --rknn_path ../../models/encoder.rknn
+    --onnx_path ../../../models/encoder.onnx \
+    --rknn_path ../../../models/encoder.rknn
 
 # 流式
 cd python/audio/online
 python export_audio_rknn.py \
-    --onnx_path ../../models/encoder_online.onnx \
-    --rknn_path ../../models/encoder_online.rknn
+    --onnx_path ../../../models/encoder_online.onnx \
+    --rknn_path ../../../models/encoder_online.rknn
 ```
 
 #### 参数说明
 
-| 参数 | 类型 | 说明 | 默认值 |
-|------|------|------|--------|
-| `--onnx_path` | str | 输入 ONNX 模型路径 | `../../models/encoder.onnx` |
-| `--rknn_path` | str | 输出 RKNN 模型路径 | `../../models/encoder.rknn` |
-| `--platform` | str | 目标平台 | `rk1820` |
-| `--do_quant` | bool | 开启量化构建 | `False` |
+非流式与流式脚本参数一致，仅默认路径不同（流式默认为 `encoder_online.onnx` / `encoder_online.rknn`）：
+
+| 参数 | 类型 | 说明 | 非流式默认值 | 流式默认值 |
+|------|------|------|--------|--------|
+| `--onnx_path` | str | 输入 ONNX 模型路径 | `../../../models/encoder.onnx` | `../../../models/encoder_online.onnx` |
+| `--rknn_path` | str | 输出 RKNN 模型路径 | `../../../models/encoder.rknn` | `../../../models/encoder_online.rknn` |
+| `--platform` | str | 目标平台 | `rk1820` | `rk1820` |
+| `--do_quant` | bool | 开启量化构建 | `False` | `False` |
 
 ### 3.2 导出 LLM RKNN 模型
 
@@ -147,13 +187,21 @@ python export_rknn.py \
     --rknn_path ../../models/llm.rknn
 ```
 
+Qwen3-ASR最长可支持20分钟音频，代码默认导出的模型上下文为24k, 可支持约20分钟的音频转录。    
+若需要降低182x内存占用，可缩短上下文长度，即缩短支持的转录音频时长。需要修改`python/llm/export_rknn.py`中的配置，找到下面两行：
+```
+    my_config['attention_config'][0]['kvcache_buffer_len'] = 1024*24
+    my_config['attention_config'][0]['max_position_embeddings'] = 1024*24
+```
+将`1024*24`改小重新导出rknn即可。
+
 #### 参数说明
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
-| `--onnx_path` | str | 输入 ONNX 模型路径 | 必选 |
-| `--config` | str | 模型 Config 路径（LLM 必需） | 必选 |
-| `--rknn_path` | str | 输出 RKNN 模型路径 | 必选 |
+| `--onnx_path` | str | 输入 ONNX 模型路径 | `llm.onnx` |
+| `--config` | str | 模型 Config 路径（LLM 必需） | `llm.config.pkl` |
+| `--rknn_path` | str | 输出 RKNN 模型路径 | `../../models/llm.rknn` |
 
 > **注意**：导出使用权重分离模式，会生成 `.rknn` 和 `.weight` 两个文件。
 
@@ -230,11 +278,11 @@ export LD_LIBRARY_PATH=./lib
 # 非流式
 language res: language English
 text res:
-Uh huh. Oh yeah, yeah. He wasn't even that big when I started listening to him, but and his solo music didn't do overly well, but he did very well when he started writing for other people.
+Oh yeah, yeah. He wasn't even that big when I started listening to him, but and his solo music didn't do overly well, but he did very well when he started writing for other people.
 
 # 流式
 ================ Final Commit Result ================
-Uh huh. Oh yeah, yeah! He wasn't even that big when I started listening to him, but in his solo music, didn't do overly well, but he did very well when he started writing for other people.
+Uh huh. Oh yeah, yeah he wasn't even that big when I started listening to him, but and his solo music didn't do overly well, but he did very well when he started writing for other people.
 
 ```
 

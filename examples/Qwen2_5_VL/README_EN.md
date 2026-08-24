@@ -37,18 +37,22 @@ python export_llm.py \
 python export_rknn.py \
     --onnx_path ../../model/llm/Qwen2.5-VL-7B-llm.onnx \
     --config ../../model/llm/Qwen2.5-VL-7B-llm.config.pkl \
-    --rknn_path ../../model/llm/Qwen2.5-VL-7B-llm.rknn
+    --rknn_path ../../model/llm/Qwen2.5-VL-7B-llm.rknn \
+    --platform rk1820
 
 # Export Vision ONNX model
 python export_vision.py \
     --model_path Qwen/Qwen2.5-VL-7B-Instruct \
     --export_vision_path ../../model/vision/Qwen2.5-VL-7B-vision.onnx \
-    --modelscope
+    --modelscope \
+    --img_h 392 \
+    --img_w 392
 
 # Export Vision RKNN model
 python export_rknn.py \
     --onnx_path ../../model/vision/Qwen2.5-VL-7B-vision.onnx \
-    --rknn_path ../../model/vision/Qwen2.5-VL-7B-vision.rknn
+    --rknn_path ../../model/vision/Qwen2.5-VL-7B-vision.rknn \
+    --platform rk1820
 ```
 
 ## 3. KV Cache INT4 Quantization
@@ -67,7 +71,7 @@ The configuration for enabling Int4_to_F16 RKNN model transformation is as follo
 
 ```python
 rknn.config(target_platform='rk1820', 
-          quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
+          quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
           max_ctx_len           =2048,
           max_position_embeddings=2048,
           kvcache_store_method='GroupQuant', kvcache_dtype='Int4_to_F16', 

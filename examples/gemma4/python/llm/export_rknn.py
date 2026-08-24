@@ -15,8 +15,9 @@ MODEL_CONFIGS = {
     },
 }
 
-DATASET_PATH = '../../../datasets/CMMLU/dataset.txt'
-# DATASET_PATH = '../datasets/gsm8k/dataset.txt'
+DATASET_PATH = None
+
+MAX_CONTEXT_LEN = 4096
 
 if __name__ == '__main__':
 
@@ -37,7 +38,7 @@ if __name__ == '__main__':
     args.rknn_path = args.rknn_path or cfg['rknn_path']
 
     import os
-    os.chdir("../../model/llm/")
+    # os.chdir("../../model/llm/")
 
     # Create RKNN object
     rknn = RKNN(verbose=True)
@@ -46,8 +47,8 @@ if __name__ == '__main__':
     print('--> config model')
     
     from rknn.api import DEFAULT_RKNN_LLM_CONFIG
-    kvcache_buffer_len = 16 * 1024
-    max_position_embeddings = 16 * 1024
+    kvcache_buffer_len = MAX_CONTEXT_LEN
+    max_position_embeddings = MAX_CONTEXT_LEN
     my_config = DEFAULT_RKNN_LLM_CONFIG.copy()
     sliding_window = 512
 

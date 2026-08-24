@@ -3,7 +3,7 @@ from rknn.api import RKNN
 
 ONNX_MODEL = '../../model/vision/SmolVLM-500M-vision.onnx'
 RKNN_MODEL = '../../model/vision/SmolVLM-500M-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
+DATASET_PATH = None
 
 
 if __name__ == '__main__':
@@ -15,6 +15,7 @@ if __name__ == '__main__':
     parser.add_argument('--platform', type=str, default= "rk1820", help='Target platform (e.g. rk1820)')
     parser.add_argument("--dataset_path", type=str, help="model quantization dataset path", required=False, default=DATASET_PATH)
     parser.add_argument('--core_num', type=int, default=8, help='core_num (1-8)')
+    parser.add_argument('--rebuild', action='store_true', required=False, default=False, help='Whether to rebuild the model')
     args = parser.parse_args()
 
     # Create RKNN object
@@ -29,22 +30,30 @@ if __name__ == '__main__':
                 disable_rules=['fuse_tp_rs_tp_rs_tp_to_conv']
                 )
 
-    # Load model
-    ret = rknn.load_onnx(model=args.onnx_path,
-                        inputs=['pixel'], #完整版
-                        input_size_list = [[1,3,512,512]])
-    if ret != 0:
-        print('Load model failed!')
-        exit(ret)
-    print('done')
+    if args.rebuild:
+        print('--> Rebuilding model')
+        ret = rknn.rebuild("./tmp")
+        if ret != 0:
+            print('Rebuild rknn model failed!')
+            exit(ret)
+        print('done')
+    else:
+        # Load model
+        ret = rknn.load_onnx(model=args.onnx_path,
+                            inputs=['pixel'], #完整版
+                            input_size_list = [[1,3,512,512]])
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        print('done')
 
-    # Build model
-    print('--> Building model')
-    ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
-    if ret != 0:
-        print('Build model failed!')
-        exit(ret)
-    print('done')
+        # Build model
+        print('--> Building model')
+        ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
+        if ret != 0:
+            print('Build model failed!')
+            exit(ret)
+        print('done')
 
     # Export rknn model
     print('--> Export rknn model')

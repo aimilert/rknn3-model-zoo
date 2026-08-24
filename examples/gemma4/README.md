@@ -169,7 +169,7 @@ chmod +x rknn_gemma4_demo
     0xff \
     model/gemma-4-e2b-it.tokenizer.gguf \
     model/gemma-4-e2b-it.embed.bin \
-    16384 \
+    4096 \
     4096 \
     model/gemma-4-e2b-it_per_layer_inputs.embed.bin \
     model/gemma-4-e2b-it.safetensors \
@@ -195,7 +195,7 @@ chmod +x rknn_gemma4_demo
     0xff \
     model/gemma-4-e2b-it.tokenizer.gguf \
     model/gemma-4-e2b-it.embed.bin \
-    16384 \
+    4096 \
     4096 \
     model/gemma-4-e2b-it_per_layer_inputs.embed.bin \
     model/gemma-4-e2b-it.safetensors \
@@ -221,7 +221,7 @@ chmod +x rknn_gemma4_demo
     0xff \
     model/gemma-4-e2b-it.tokenizer.gguf \
     model/gemma-4-e2b-it.embed.bin \
-    16384 \
+    4096 \
     4096 \
     model/gemma-4-e2b-it_per_layer_inputs.embed.bin \
     model/gemma-4-e2b-it.safetensors \

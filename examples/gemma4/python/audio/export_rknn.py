@@ -36,8 +36,8 @@ if __name__ == '__main__':
 
     print('--> config model')
     rknn.config(target_platform=args.platform, core_num=4,
-                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
-                profile_mode=True)
+                quantized_dtype='w8a16', quantized_algorithm='normal', quantized_method='group32',
+                profile_mode=False)
     print('done')
 
     # Load model
@@ -50,7 +50,7 @@ if __name__ == '__main__':
 
     # Build model
     print('--> Building model')
-    ret = rknn.build(do_quantization=False)
+    ret = rknn.build(do_quantization=False, dataset="dataset.txt")
     if ret != 0:
         print('Build model failed!')
         exit(ret)
@@ -58,7 +58,7 @@ if __name__ == '__main__':
 
     # Export rknn model
     print('--> Export rknn model')
-    ret = rknn.export_rknn(args.rknn_path, save_ctx=True)
+    ret = rknn.export_rknn(args.rknn_path, save_ctx=False)
     if ret != 0:
         print('Export rknn model failed!')
         exit(ret)

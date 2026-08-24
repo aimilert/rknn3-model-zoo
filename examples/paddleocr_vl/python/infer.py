@@ -208,15 +208,29 @@ def prepare_vlm_input(vision_rknn, mlpar_rknn, embeds_data, tokenizer_path, prom
         {
             "role": "user",
             "content": [
-                {"type": "image"},
-                {"type": "text", "text": query}
-            ]
+                {"type": "image", "image": image},
+                {"type": "text", "text": query},
+            ],
         }
     ]
-    text = tokenizer.apply_chat_template(messages, tokenize=False)
-    inputs = processor(image, text=text, return_tensors="pt", format=True)
-    
+    inputs = processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        images_kwargs={
+            "size": {
+                "shortest_edge": processor.image_processor.min_pixels,
+                "longest_edge": 1280 * 28 * 28,
+            }
+        },
+    )
+
     input_ids = inputs["input_ids"].cpu().numpy().astype(np.int64)
+    print("input_prompt", tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=False))
+    if "image_grid_thw" in inputs:
+        print("processor image_grid_thw:", inputs["image_grid_thw"])
     inputs_embeds = embeds_data[input_ids].astype(np.float32)
     print("inputs_embeds shape:", inputs_embeds.shape)
 
@@ -262,11 +276,11 @@ if __name__ == '__main__':
     # pre-process config
     print('--> Config model')
     vision_rknn.config(target_platform='rk1820',
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32')
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32')
     mlpar_rknn.config(target_platform='rk1820',
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32')
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32')
     llm_rknn.config(target_platform='rk1820', 
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32')
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32')
     print('done')
     
     print('--> Load model')

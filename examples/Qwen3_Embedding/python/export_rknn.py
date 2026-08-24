@@ -4,7 +4,7 @@ from rknn.api import RKNN
 ONNX_MODEL = '../model/llm/Qwen3-Embedding-0.6B.onnx'
 LLM_CONFIG = '../model/llm/Qwen3-Embedding-0.6B.config.pkl'
 RKNN_MODEL = '../model/llm/Qwen3-Embedding-0.6B.rknn'
-DATASET_PATH = '../../../datasets/CMMLU/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 

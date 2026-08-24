@@ -36,7 +36,7 @@ typedef struct {
 
 int init_qwen2_5_omni_model(rknn_app_context_t* app_ctx, const char* llm_model_path, const char* llm_weight_path, 
                         const char* vision_model_path, const char* vision_weight_path, const char* audio_model_path, const char* audio_weight_path,
-                        rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t llm_core_mask, uint32_t vision_core_mask, uint32_t audio_core_mask);
+                        rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t llm_core_mask, uint32_t vision_core_mask, uint32_t audio_core_mask);
 
 int release_qwen2_5_omni_model(rknn_app_context_t* app_ctx);
 

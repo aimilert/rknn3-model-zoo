@@ -1,0 +1,8 @@
+torch==2.7.0
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+transformers==4.51.3
+onnx==1.18.0
+onnxruntime==1.23.2
+modelscope

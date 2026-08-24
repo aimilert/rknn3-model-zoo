@@ -1,0 +1,130 @@
+[
+  {
+    "input": "半胱氨酸和酪氨酸在人体内可分别由什么转变而来。\nA. 胱氨酸和蛋氨酸\nB. 蛋氨酸和苯丙氨酸\nC. 赖氨酸和蛋氨酸\nD. 胱氨酸和苯丙氨酸",
+    "target": "\n答案:\n B\n\n下列关于蛋白质的叙述，错误的是____\nA. 有些蛋白质具有运输功能\nB. 有些蛋白质具有催化功能\nC. 有些蛋白质具有调节功能\nD. 有些蛋白质具有免疫功能\nE. 所有蛋白质都含有S元素\n答案:\n"
+  },
+  {
+    "input": "Here are some examples of how to solve similar problems:\n\nNatalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\nPlease reason step by step, and put your final answer within \\boxed{}.",
+    "target": ""
+  },
+  {
+    "input": "区域经济从本质上讲是\nA. 商品经济\nB. 一体化经济\nC. 信用经济\nD. 市场经济",
+    "target": "\n答案:\n D\n\n在进行项目范围管理时，以下哪项活动不属于项目范围确认的范畴？\nA. 审查工作分解结构(WBS)\nB. 确认可交付成果\nC. 验证需求\nD. 检查项目文件\n答案:\n A\n\n"
+  },
+  {
+    "input": "Tina makes $18.00 an hour.  If she works more than 8 hours per shift, she is eligible for overtime, which is paid by your hourly wage + 1/2 your hourly wage.  If she works 10 hours every day for 5 days, how much money does she make?\nPlease reason step by step, and put your final answer within \\boxed{}.",
+    "target": ""
+  },
+  {
+    "input": "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\nfrom typing import List\n\n\ndef separate_paren_groups(paren_string: str) -> List[str]:\n    \"\"\" Input to this function is a string containing multiple groups of nested parentheses. Your goal is to\n    separate those group into separate strings and return the list of those.\n    Separate groups are balanced (each open brace is properly closed) and not nested within each other\n    Ignore any spaces in the input string.\n    >>> separate_paren_groups('( ) (( )) (( )( ))')\n    ['()', '(())', '(()())']\n    \"\"\"\n",
+    "target": ""
+  },
+  {
+    "input": "The following are multiple choice questions (with answers) about computer science. Think step by step and then finish your answer with 'ANSWER: [LETTER]' (without quotes) where [LETTER] is the correct letter choice.\n\nQuestion:\nIn a given population, 1 out of every 400 people has a cancer caused by a completely recessive allele, b. Assuming the population is in Hardy-Weinberg equilibrium, which of the following is the expected proportion of individuals who carry the b allele but are not expected to develop the cancer?",
+    "target": ""
+  },
+  {
+    "input": "四倍体细胞具有\nA. 4条染色体\nB. 4个核\nC. 每条染色体具有4个拷贝\nD. 4对染色体",
+    "target": "\n答案:\n C\n\n在Excel中，若要选择多个不连续的单元格区域，则在单击选定第一个区域后，应按住____键再依次单击其它区域。\nShift\nCtrl\nAlt\nTab\n答案:\n Ctrl\n\n下列关于“三段论”的说法错误的是____。\n"
+  },
+  {
+    "input": "克林顿政府对外政策的三大支柱之一是什么\nA. 经济安全\nB. 社会安全\nC. 科技安全\nD. 国家安全",
+    "target": "\n答案:\n D\n\n在Excel中，若要表示“学生成绩表”中的B2到G8的整个单元格区域，则应书写为____。\nA. B2:G8\nB. G8:B2\nC. B2,G8\nD. G8,B2\n"
+  },
+  {
+    "input": "按照《突发事件应对法》的规定，突发事件可分为()和社会安全事件\nA. 自然灾害、事故灾难、公共卫生事件\nB. 自然灾害、安全事故、卫生事故\nC. 自然灾害、人为事故\nD. 地震灾难、人为火灾、交通事故",
+    "target": "\n\n根据《突发事件应对法》的规定，突发事件分为四类：自然灾害、事故灾难、公共卫生事件和社会安全事件。因此答案选A。\n\n最终答案是：A. 自然灾害、事故灾难、公共卫生事件"
+  },
+  {
+    "input": "设char str[20]；，从键盘能完整地输⼊字符串“I am a student.”的语句是\nA. str= gets( )\nB. scanf( \"%c\",str)\nC. gets(str)\nD. scanf( \" %s\",str)",
+    "target": " 本题答案为C。gets()函数用于从标准输入读取字符串，直到遇到回车符（\\n），或者读取到指定数量的字符数（以sizeof(str)-1为限）。因此选项C正确。\n\n选项A中，`str = gets();` 是错误的，"
+  },
+  {
+    "input": "\nSolve the following math problem step by step. Put your answer inside \\boxed{}.\n\nA standard fair six-sided die is rolled repeatedly. Each time the die reads 1 or 2, Alice gets a coin; each time it reads 3 or 4, Bob gets a coin; and each time it reads 5 or 6, Carol gets a coin. The probability that Alice and Bob each receive at least two coins before Carol receives any coins can be written as $\tfrac{m}{n},$ where $m$ and $n$ are relatively prime positive integers. Find $100m+n.$\n\nRemember to put your answer inside \\boxed{}.",
+    "target": ""
+  },
+  {
+    "input": "Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: [LETTER]' (without quotes) where [LETTER] is one of A,B,C,D. Think step by step before answering.\n\nStatement 1 | A ring homomorphism is one to one if and only if the kernel is {0}. Statement 2 | Q is an ideal in R.\n\nA) True, True\nB) False, False\nC) True, False\nD) False, True",
+    "target": ""
+  },
+  {
+    "input": "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\nfrom typing import List\n\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and\n    at that point function should return True. Otherwise it should return False.\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n",
+    "target": ""
+  },
+  {
+    "input": "Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: [LETTER]' (without quotes) where [LETTER] is one of A,B,C,D. Think step by step before answering.\n\nStatement 1 | If T: V -> W is a linear transformation and dim(V ) < dim(W) < 1, then T must be injective. Statement 2 | Let dim(V) = n and suppose that T: V -> V is linear. If T is injective, then it is a bijection.\n\nA) True, True\nB) False, False\nC) True, False\nD) False, True",
+    "target": ""
+  },
+  {
+    "input": "The following are multiple choice questions (with answers) about computer science. Think step by step and then finish your answer with 'ANSWER: [LETTER]' (without quotes) where [LETTER] is the correct letter choice.\n\nQuestion:\nA tank initially contains a salt solution of 3 grams of salt dissolved in 100 liters of water. A salt solution containing 0.02 grams of salt per liter of water is sprayed into the tank at a rate of 4 liters per minute. The sprayed solution is continually mixed with the salt solution in the tank, and the mixture flows out of the tank at a rate of 4 liters per minute. If the mixing is instantaneous, how many grams of salt are in the tank after 100 minutes have elapsed?",
+    "target": ""
+  },
+  {
+    "input": "Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: [LETTER]' (without quotes) where [LETTER] is one of A,B,C,D. Think step by step before answering.\n\nThe polynomial x^3 + 2x^2 + 2x + 1 can be factored into linear factors in Z_7[x]. Find this factorization.\n\nA) (x − 2)(x + 2)(x − 1)\nB) (x + 1)(x + 4)(x − 2)\nC) (x + 1)(x − 4)(x − 2)\nD) (x - 1)(x − 4)(x − 2)",
+    "target": ""
+  },
+  {
+    "input": "The following are multiple choice questions (with answers) about computer science. Think step by step and then finish your answer with 'ANSWER: [LETTER]' (without quotes) where [LETTER] is the correct letter choice.\n\nQuestion:\nA solution contains 2.00 mole of acetic acid, CH3COOH, and 1.00 mole of calcium acetate, Ca(CH3COO)2. The solution is able to resist the addition of a small amount of strong acid or strong base with only minor changes in the pH of the solution. Larger quantities of strong acid or strong base can cause a significant change in pH. How many moles of nitric acid, HNO3, may be added before the pH begins to change significantly?",
+    "target": ""
+  },
+  {
+    "input": "人体中氟缺乏时，会出现的相关的症状为\nA. 损伤免疫功能\nB. 氟骨病\nC. 斑釉症\nD. 骨质疏松症",
+    "target": "\n答案:\nA\n\n在进行高处作业时,除有关人员外,不准他人在工作地点的下面通行或逗留,工作地点下面应有____。\nA. 专人监护\nB. 足够的空间\nC. 围栏或装设其他保护装置防止落物"
+  },
+  {
+    "input": "Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: [LETTER]' (without quotes) where [LETTER] is one of A,B,C,D. Think step by step before answering.\n\nStatement 1 | If H is a subgroup of G and a belongs to G then aH is a subgroup of G if and only if a is in H. Statement 2 | If H is a subgroup of G and a and b belong to G then aH = bH if and only if ab is in H.\n\nA) True, True\nB) False, False\nC) True, False\nD) False, True",
+    "target": ""
+  },
+  {
+    "input": "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\nfrom typing import List\n\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n",
+    "target": ""
+  },
+  {
+    "input": "一个小麦杂交组合的F三个世代的粒重方差分别为500，400和450，则该杂交组合粒重的狭义遗传率为\nA. 30%\nB. 15%\nC. 85%\nD. 60%",
+    "target": ".\n答案:\n A\n\n在进行某项实验时，发现处理组与对照组之间存在显著差异，但其原因可能是由于偶然性造成的。为了排除这种可能性，应采用的方法是____。\nA. 增加样本量\nB. 进行重复试验\nC. 改"
+  },
+  {
+    "input": "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\ndef truncate_number(number: float) -> float:\n    \"\"\" Given a positive floating point number, it can be decomposed into\n    and integer part (largest integer smaller than given number) and decimals\n    (leftover part always smaller than 1).\n\n    Return the decimal part of the number.\n    >>> truncate_number(3.5)\n    0.5\n    \"\"\"\n",
+    "target": ""
+  },
+  {
+    "input": "Jasper will serve charcuterie at his dinner party. He buys 2 pounds of cheddar cheese for $10, a pound of cream cheese that cost half the price of the cheddar cheese, and a pack of cold cuts that cost twice the price of the cheddar cheese. How much does he spend on the ingredients?\nPlease reason step by step, and put your final answer within \\boxed{}.",
+    "target": ""
+  },
+  {
+    "input": "路面沥青层渗水系数宜在什么时间进行测定\nA. 交工验收前\nB. 交工验收后\nC. 碾压成型后\nD. 通车一年后",
+    "target": "\n答案:\n C\n\n下列关于施工缝的说法中，正确的是____。\nA. 柱子的水平施工缝应留在柱子顶面\nB. 墙体的水平施工缝应留在高出底板表面不小于200mm的墙体上\nC. 楼"
+  },
+  {
+    "input": "The following are multiple choice questions (with answers) about computer science. Think step by step and then finish your answer with 'ANSWER: [LETTER]' (without quotes) where [LETTER] is the correct letter choice.\n\nQuestion:\nLet V be the set of all real polynomials p(x). Let transformations T, S be defined on V by T:p(x) -> xp(x) and S:p(x) -> p'(x) = d/dx p(x), and interpret (ST)(p(x)) as S(T(p(x))). Which of the following is true?",
+    "target": ""
+  },
+  {
+    "input": "关系数据库中的数据逻辑结构是\nA. 树形结构\nB. ⼆维表格\nC. 层次结构\nD. ⽹状结构",
+    "target": "\n答案:\n B\n\n在SQL Server中，创建存储过程的语句是____。\nCREATE PROCEDURE\nCREATE DATABASE\nCREATE TABLE\nCREATE VIEW\n答案:\n A\n\n下列关于“三会一课”制度说法正确的是____。\nA. 支部党员大会一般每季度召开一次,未"
+  },
+  {
+    "input": "母乳中的非特异性免疫物质包括\nA. 乳过氧化氢酶、乳铁蛋白、T淋巴细胞\nB. T淋巴细胞、抗体、B淋巴细胞\nC. 抗体、吞噬细胞、乳铁蛋白\nD. 乳铁蛋白、溶菌酶、双歧杆菌因子",
+    "target": "\nE. 溶菌酶、巨噬细胞、补体\n答案:\n D\n\n下列哪项不是新生儿败血症的临床表现____。\nA. 高热或体温不升\nB. 黄疸加重\nC. 呼吸急促\nD. 肝"
+  },
+  {
+    "input": "\nSolve the following math problem step by step. Put your answer inside \\boxed{}.\n\nFind the number of positive integer palindromes written in base $10$ with no zero digits, and whose digits add up to $13$. For example, $42124$ has these properties. Recall that a palindrome is a number whose representation reads the same from left to right as from right to left.\n\nRemember to put your answer inside \\boxed{}.",
+    "target": ""
+  },
+  {
+    "input": "\nSolve the following math problem step by step. Put your answer inside \\boxed{}.\n\nFor each positive integer $n$ let $f(n)$ be the value of the base-ten numeral $n$ viewed in base $b$, where $b$ is the least integer greater than the greatest digit in $n$. For example, if $n=72$, then $b=8$, and $72$ as a numeral in base $8$ equals $7\\cdot 8+2=58$; therefore $f(72)=58$. Find the number of positive integers $n$ less than $1000$ such that $f(n)=n$.\n\nRemember to put your answer inside \\boxed{}.",
+    "target": ""
+  },
+  {
+    "input": "\nSolve the following math problem step by step. Put your answer inside \\boxed{}.\n\nPatrick started walking at a constant rate along a straight road from school to the park. One hour after Patrick left, Tanya started running along the same road from school to the park. One hour after Tanya left, Jose started bicycling along the same road from school to the park. Tanya ran at a constant rate of $2$ miles per hour faster than Patrick walked, Jose bicycled at a constant rate of $7$ miles per hour faster than Tanya ran, and all three arrived at the park at the same time. The distance from the school to the park is $\frac{m}{n}$ miles, where $m$ and $n$ are relatively prime positive integers. Find $m + n$.\n\nRemember to put your answer inside \\boxed{}.",
+    "target": ""
+  },
+  {
+    "input": "A deep-sea monster rises from the waters once every hundred years to feast on a ship and sate its hunger. Over three hundred years, it has consumed 847 people. Ships have been built larger over time, so each new ship has twice as many people as the last ship. How many people were on the ship the monster ate in the first hundred years?\nPlease reason step by step, and put your final answer within \\boxed{}.",
+    "target": ""
+  },
+  {
+    "input": "当长期均衡时，完全竞争企业总是\nA. 经济利润大于零\nB. 正常利润为零\nC. 经济利润小于零\nD. 经济利润为零",
+    "target": "\n答案:\n D\n\n在完全竞争市场上，厂商的短期供给曲线是____。\nA. AVC>MC中的那部分AVC曲线\nB. AC>MC中的那部分AC曲线\nC. MC≥AVC中的那部分MC曲线\nD. MC≥AC中的那部分MC曲线\n"
+  }
+]

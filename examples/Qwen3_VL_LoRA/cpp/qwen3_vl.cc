@@ -161,7 +161,7 @@ int release_internal_share(rknn_app_context_t* app_ctx)
     if (app_ctx->internal_mems) {
         for (int i = 0; i < app_ctx->n_internal_mems; i++) {
             if (app_ctx->internal_mems[i]) {
-                rknn3_destroy_mem(app_ctx->llm.rknn_ctx, app_ctx->internal_mems[i]);
+                rknn3_destroy_mem(app_ctx->vision.rknn_ctx, app_ctx->internal_mems[i]);
                 app_ctx->internal_mems[i] = NULL;
             }
         }
@@ -175,7 +175,7 @@ int release_internal_share(rknn_app_context_t* app_ctx)
 
 
 
-int init_qwen3_vl_model(rknn_app_context_t* app_ctx, const char* llm_model_path, const char* llm_weight_path, const char* vision_model_path, const char* vision_weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t vision_core_mask, uint32_t llm_core_mask, char* lora_weight_path)
+int init_qwen3_vl_model(rknn_app_context_t* app_ctx, const char* llm_model_path, const char* llm_weight_path, const char* vision_model_path, const char* vision_weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t vision_core_mask, uint32_t llm_core_mask, int max_context_len1, int max_context_len2, char* lora_weight_path)
 {
     int ret = 0;
 
@@ -189,7 +189,7 @@ int init_qwen3_vl_model(rknn_app_context_t* app_ctx, const char* llm_model_path,
     }
 
     printf("--> init qwen3_vl llm model\n");
-    ret = init_qwen3_vl_llm(&(app_ctx->llm), llm_model_path, llm_weight_path, params, n_params, callback, llm_core_mask, &deepstack_aligned_size, lora_weight_path);
+    ret = init_qwen3_vl_llm(&(app_ctx->llm), llm_model_path, llm_weight_path, params, n_params, callback, llm_core_mask, max_context_len1, max_context_len2, &deepstack_aligned_size, lora_weight_path);
     if (ret < 0)
     {
         printf("rknn_init qwen3_vl llm model fail! ret=%d\n", ret);

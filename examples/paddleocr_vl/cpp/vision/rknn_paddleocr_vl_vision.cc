@@ -50,6 +50,126 @@ static void dump_tensor_attr(rknn3_tensor_attr* attrs)
 }
 
 
+static inline int clamp_int(int v, int lo, int hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static int image_format_channels(image_format_t format)
+{
+    switch (format) {
+    case IMAGE_FORMAT_GRAY8:
+        return 1;
+    case IMAGE_FORMAT_RGB888:
+        return 3;
+    case IMAGE_FORMAT_RGBA8888:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+static const float kWeightEps = 1e-6f;
+
+static inline float triangle_weight(float x)
+{
+    x = fabsf(x);
+    return x < 1.0f ? 1.0f - x : 0.0f;
+}
+
+static inline float read_pixel_channel(const unsigned char* pixel, int src_channels, int dst_channels, int dst_channel)
+{
+    if (src_channels == 1) {
+        return dst_channel == 3 ? 255.0f : (float)pixel[0];
+    }
+    if (dst_channels == 1) {
+        return 0.299f * (float)pixel[0] + 0.587f * (float)pixel[1] + 0.114f * (float)pixel[2];
+    }
+    if (dst_channel < 3) {
+        return (float)pixel[dst_channel];
+    }
+    return src_channels == 4 ? (float)pixel[3] : 255.0f;
+}
+
+static int ResizeImageBilinear(const image_buffer_t* src_img, image_buffer_t* dst_img)
+{
+    if (!src_img || !dst_img || !src_img->virt_addr || !dst_img->virt_addr) {
+        return -1;
+    }
+    if (src_img->width <= 0 || src_img->height <= 0 || dst_img->width <= 0 || dst_img->height <= 0) {
+        return -1;
+    }
+
+    const int src_channels = image_format_channels(src_img->format);
+    const int dst_channels = image_format_channels(dst_img->format);
+    if (src_channels == 0 || dst_channels == 0) {
+        return -1;
+    }
+
+    const int src_stride = src_img->width_stride > 0 ? src_img->width_stride : src_img->width;
+    const int dst_stride = dst_img->width_stride > 0 ? dst_img->width_stride : dst_img->width;
+    const float scale_x = (float)src_img->width / (float)dst_img->width;
+    const float scale_y = (float)src_img->height / (float)dst_img->height;
+    const float filter_scale_x = scale_x > 1.0f ? scale_x : 1.0f;
+    const float filter_scale_y = scale_y > 1.0f ? scale_y : 1.0f;
+    const float support_x = filter_scale_x;
+    const float support_y = filter_scale_y;
+
+    for (int dy = 0; dy < dst_img->height; ++dy) {
+        const float center_y = ((float)dy + 0.5f) * scale_y;
+        const int y_start = (int)ceilf(center_y - support_y - 0.5f);
+        const int y_end = (int)floorf(center_y + support_y - 0.5f);
+        for (int dx = 0; dx < dst_img->width; ++dx) {
+            const float center_x = ((float)dx + 0.5f) * scale_x;
+            const int x_start = (int)ceilf(center_x - support_x - 0.5f);
+            const int x_end = (int)floorf(center_x + support_x - 0.5f);
+            unsigned char* dst_pixel = dst_img->virt_addr + ((size_t)dy * dst_stride + dx) * dst_channels;
+
+            float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float weight_sum = 0.0f;
+            for (int sy = y_start; sy <= y_end; ++sy) {
+                const int cy = clamp_int(sy, 0, src_img->height - 1);
+                const float wy = triangle_weight((((float)sy + 0.5f) - center_y) / filter_scale_y);
+                if (wy < kWeightEps) {
+                    continue;
+                }
+                for (int sx = x_start; sx <= x_end; ++sx) {
+                    const int cx = clamp_int(sx, 0, src_img->width - 1);
+                    const float wx = triangle_weight((((float)sx + 0.5f) - center_x) / filter_scale_x);
+                    const float w = wx * wy;
+                    if (w < kWeightEps) {
+                        continue;
+                    }
+                    const unsigned char* src_pixel = src_img->virt_addr + ((size_t)cy * src_stride + cx) * src_channels;
+                    for (int c = 0; c < dst_channels; ++c) {
+                        sum[c] += read_pixel_channel(src_pixel, src_channels, dst_channels, c) * w;
+                    }
+                    weight_sum += w;
+                }
+            }
+
+            if (weight_sum < kWeightEps) {
+                const int sy = clamp_int((int)floorf(center_y), 0, src_img->height - 1);
+                const int sx = clamp_int((int)floorf(center_x), 0, src_img->width - 1);
+                const unsigned char* src_pixel = src_img->virt_addr + ((size_t)sy * src_stride + sx) * src_channels;
+                for (int c = 0; c < dst_channels; ++c) {
+                    const int value = (int)floorf(read_pixel_channel(src_pixel, src_channels, dst_channels, c) + 0.5f);
+                    dst_pixel[c] = (unsigned char)clamp_int(value, 0, 255);
+                }
+                continue;
+            }
+
+            for (int c = 0; c < dst_channels; ++c) {
+                const int value = (int)floorf(sum[c] / weight_sum + 0.5f);
+                dst_pixel[c] = (unsigned char)clamp_int(value, 0, 255);
+            }
+        }
+    }
+
+    return 0;
+}
+
+
 int init_paddleocr_vl_vision(rknn_paddleocr_vl_vision_context* vision_ctx, const char* model_path, const char* weight_path, const char* position_embedding_path, uint32_t core_mask, uint32_t model_width, uint32_t model_height)
 {
     int ret;
@@ -57,7 +177,7 @@ int init_paddleocr_vl_vision(rknn_paddleocr_vl_vision_context* vision_ctx, const
     rknn3_config config;
     memset(&config, 0, sizeof(config));
     config.run_core_mask = core_mask;
-    config.user_mem_internal = 1; // 使用用户管理的internal内存
+    config.user_mem_internal = 0; // 使用用户管理的internal内存
 
     // RKNN Init
     ret = rknn3_init(&ctx, NULL);
@@ -421,11 +541,14 @@ int BuildFlattenPatches(image_buffer_t* src_img, int patch_num, embed_t* flatten
         return -1;
     }
 
-    if (convert_image(src_img, &dst_img, NULL, NULL, 0) != 0) {
-        printf("convert_image failed for resize %dx%d -> %dx%d\n", src_width, src_height, new_width, new_height);
-        return -1;
+    if (ResizeImageBilinear(src_img, &dst_img) != 0) {
+        printf("ResizeImageBilinear failed for resize %dx%d -> %dx%d, try convert_image fallback\n", src_width, src_height, new_width, new_height);
+        if (convert_image(src_img, &dst_img, NULL, NULL, 0) != 0) {
+            printf("convert_image failed for resize %dx%d -> %dx%d\n", src_width, src_height, new_width, new_height);
+            free(dst_img.virt_addr);
+            return -1;
+        }
     }
-
     NormalizeAndPackPatches(dst_img.virt_addr, new_width, new_height, *grid_w, *grid_h, flatten_patches->virt_addr);
     
     printf("flattened patches size=%zu for grid %dx%d\n", flatten_patches->size, *grid_w, *grid_h);

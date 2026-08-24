@@ -46,6 +46,90 @@ def check_gptq(bit, group_size):
     return False
 
 
+def causal_qwen_3_5_llm_to_onnx(model, args):
+    import torch
+    import os
+
+    messages = args.chat_context
+    tokenizer = args.tokenizer
+    out_path = args.export_llm_path
+    
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,  # 封装在提示词模板里，所有模型默认，function calling功能也依赖提示词模板
+        enable_thinking=True,  # 是否启动思考模式，也是通过修改提示词模板实现
+    )
+
+    # 1. 构造模型推理所需的张量输入
+    # 注意：这里的 model 是包裹后的 Qwen3_5_export_model_cst，我们要用它内部的原始模型(model.model)做初始推理
+    device = model.model.device
+    model_inputs = tokenizer([text], return_tensors="pt").to(device)
+    src_len = model_inputs['input_ids'].shape[1]
+    
+    input_ids = model_inputs['input_ids']
+    full_attention_mask = model_inputs['attention_mask'].to(torch.float)
+    position_ids = torch.arange(src_len, dtype=torch.long, device=device).unsqueeze(0)
+    num_logits_to_keep = torch.tensor([src_len-1], dtype=torch.long, device=device)
+    tc_in = torch.tensor([src_len], dtype=torch.int64, device=device)
+
+    # 2. 跑一次原始模型的前向推理，以此获取合法的 past_key_values / conv_states
+    with torch.no_grad():
+        model_out = model.model(
+            input_ids=input_ids, 
+            attention_mask=full_attention_mask, 
+            position_ids=position_ids, 
+            num_logits_to_keep=num_logits_to_keep, 
+            Tc=tc_in
+        )
+
+    # 3. 提取用于导出的状态变量
+    past_key_values = model_out.past_key_values
+    conv_status = torch.concat([v for v in past_key_values.conv_states if v is not None], dim=0)
+
+    # 4. 配置 ONNX 输入输出名称及动态轴
+    input_names = ['input_ids', 'position_ids', 'attention_mask', 'Linear_Tc', 'num_logits_to_keep', 'conv_state']
+    basic_in_len = 5 # 在 conv_state 之前的输入个数
+    
+    output_names = ['output'] + [n+'_out' for n in input_names[basic_in_len:]]
+    dynamic_axes = {
+        'attention_mask': {1: 'seq_len'}, 
+        'position_ids': {1: 'seq_len'}, 
+        'input_ids': {1: 'seq_len'}
+    }
+
+    print(f"Exporting model to {out_path} ...")
+    if hasattr(model.config, 'quantization_config'):
+        q_config = model.config.quantization_config
+        if check_gptq(q_config.bits, q_config.group_size) == False:
+            print("GRQ model quantization not supported. Only W4A16 quantization grouped or channel asymmetric/symmetric with group_size in {32, 64, 128} or -1 (per-channel) is supported.")
+            exit(1)
+        register_bitwise_right_shift()
+
+    # 5. 导出 ONNX（整合并清理了之前重复的代码块）
+    with torch.no_grad():
+        torch.onnx.export(
+            model, # 传入包裹后的导出专用模型
+            (
+                input_ids,
+                position_ids,
+                full_attention_mask,
+                tc_in,
+                num_logits_to_keep,
+                conv_status,
+            ),
+            out_path,
+            export_params=True,             # 做参数导出
+            do_constant_folding=True,       # 做常量折叠优化
+            opset_version=19,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            custom_opsets={"rknn": 1},      # 声明自定义域 (适配 NPU 等场景)
+        )
+    print("Export completed successfully!")
+
+
 def causal_llm_to_onnx(model, args):
     import torch
 
@@ -201,6 +285,407 @@ def causal_llm_to_onnx(model, args):
             print(f"ONNX model input/output saved to {save_dir}")
 
     print(f"Exported to {os.path.abspath(args.export_llm_path)}")
+
+class Qwen3_5SegmentWrapper(torch.nn.Module):
+    """Wrap a segment of Qwen3_5DecoderLayer for ONNX export.
+    
+    Qwen3_5 has mixed layer types (full_attention + linear_attention) and needs
+    position_embeddings (cos/sin from mrope) and Tc for linear attention layers.
+    
+    Inputs match the single-segment export format:
+        input_ids, position_ids, attention_mask, Linear_Tc, num_logits_to_keep, conv_state
+    """
+    def __init__(self, embed_tokens, layers, rotary_emb, norm=None, lm_head=None,
+                 is_last_segment=False, layer_indices=None, config=None):
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.layers = torch.nn.ModuleList(layers)
+        self.rotary_emb = rotary_emb
+        self.norm = norm
+        self.lm_head = lm_head
+        self.is_last_segment = is_last_segment
+        self.layer_indices = layer_indices or list(range(len(layers)))
+        self.config = config
+
+    def forward(self, hidden_states, position_ids, attention_mask, Linear_Tc, num_logits_to_keep, conv_state):
+        # Embed input_ids to hidden_states (same as single-segment model)
+        # hidden_states = self.embed_tokens(input_ids)
+
+        # Compute position embeddings (mrope)
+        # position_ids is expected to be (bs, seq_len) for Qwen3_5 mrope
+        if position_ids.dim() == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # Match Qwen3_5TextModel.forward(): use the same mask factory as the
+        # single-segment export instead of constructing a separate manual mask.
+        batch_size, seq_len = hidden_states.shape[:2]
+        device = hidden_states.device
+        cache_position = torch.arange(seq_len, dtype=torch.long, device=device)
+
+        if self.config is None:
+            raise ValueError("Qwen3_5SegmentWrapper requires the Qwen3_5 text config")
+
+        from transformers.masking_utils import create_causal_mask
+
+        full_attention_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=None,
+            position_ids=None,
+        )
+
+        # Match Qwen3_5TextModel._update_linear_attn_mask().
+        linear_attn_mask = attention_mask
+        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+            linear_attn_mask = None
+
+        for layer in self.layers:
+            if layer.layer_type == "linear_attention":
+                layer_mask = linear_attn_mask
+            else:
+                layer_mask = full_attention_mask
+
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=layer_mask,
+                position_ids=position_ids,
+                Tc=Linear_Tc,
+            )
+
+        if self.is_last_segment:
+            if self.norm is not None:
+                hidden_states = self.norm(hidden_states)
+            if self.lm_head is not None:
+                # Only keep the last token's logits to match single-segment behavior
+                if num_logits_to_keep is not None:
+                    hidden_states = self.lm_head(hidden_states.index_select(dim=1, index=num_logits_to_keep))
+                else:
+                    hidden_states = self.lm_head(hidden_states)
+            else:
+                print("Warning: lm_head is None in last segment wrapper.")
+                exit()
+        return hidden_states
+
+
+def _estimate_module_weight_size(
+    module,
+    weight_bits,
+    group_size=32,
+    metadata_bytes_per_group=3,
+):
+    """Estimate packed weight bytes for a module.
+
+    The default matches RKNN W4A16/W6A16 group32 weights: packed payload plus
+    an approximate FP16 scale and 8-bit zero-point for each quantization group.
+    Set ``metadata_bytes_per_group`` to zero for non-quantized FP16/FP32 data.
+    """
+    if module is None:
+        return 0
+
+    size = 0
+    for parameter in module.parameters():
+        numel = parameter.numel()
+        size += (numel * weight_bits + 7) // 8
+        if group_size and metadata_bytes_per_group:
+            size += (
+                (numel + group_size - 1) // group_size
+            ) * metadata_bytes_per_group
+    return size
+
+
+def _balanced_segment_layer_counts(layer_weight_sizes, num_segments, last_segment_extra_size=0):
+    """Split contiguous layers so estimated segment weight sizes are balanced.
+
+    ``last_segment_extra_size`` represents weights that must stay in the final
+    segment, such as the final norm and lm_head. Every returned segment contains
+    at least one layer, and layer order is preserved.
+    """
+    num_layers = len(layer_weight_sizes)
+    if num_layers == 0:
+        return []
+    if any(weight_size < 0 for weight_size in layer_weight_sizes):
+        raise ValueError("layer weight sizes must be non-negative")
+    if last_segment_extra_size < 0:
+        raise ValueError("last segment extra size must be non-negative")
+
+    num_segments = min(max(int(num_segments), 1), num_layers)
+    if num_segments == 1:
+        return [num_layers]
+
+    prefix_weight_sizes = [0]
+    for weight_size in layer_weight_sizes:
+        prefix_weight_sizes.append(prefix_weight_sizes[-1] + weight_size)
+
+    total_weight_size = prefix_weight_sizes[-1] + last_segment_extra_size
+
+    def scaled_deviation(layer_start, layer_end, segment_index):
+        segment_weight_size = (
+            prefix_weight_sizes[layer_end] - prefix_weight_sizes[layer_start]
+        )
+        if segment_index == num_segments:
+            segment_weight_size += last_segment_extra_size
+        return abs(segment_weight_size * num_segments - total_weight_size)
+
+    # First minimize the largest deviation from the average segment size.
+    previous_max_deviations = {0: 0}
+    for segment_index in range(1, num_segments + 1):
+        current_max_deviations = {}
+        min_layer_end = segment_index
+        max_layer_end = num_layers - (num_segments - segment_index)
+
+        for layer_end in range(min_layer_end, max_layer_end + 1):
+            for layer_start in previous_max_deviations:
+                if layer_start >= layer_end:
+                    continue
+                candidate_max_deviation = max(
+                    previous_max_deviations[layer_start],
+                    scaled_deviation(layer_start, layer_end, segment_index),
+                )
+                best_max_deviation = current_max_deviations.get(layer_end)
+                if (
+                    best_max_deviation is None
+                    or candidate_max_deviation < best_max_deviation
+                ):
+                    current_max_deviations[layer_end] = candidate_max_deviation
+
+        previous_max_deviations = current_max_deviations
+
+    optimal_max_deviation = previous_max_deviations[num_layers]
+
+    # Then, among partitions with that optimal maximum deviation, minimize the
+    # total squared deviation. Reverse boundary iteration keeps more blocks in
+    # earlier segments when both objectives are exactly tied.
+    previous_states = {0: (0, [])}
+    for segment_index in range(1, num_segments + 1):
+        current_states = {}
+        min_layer_end = segment_index
+        max_layer_end = num_layers - (num_segments - segment_index)
+
+        for layer_end in range(min_layer_end, max_layer_end + 1):
+            for layer_start in sorted(previous_states, reverse=True):
+                if layer_start >= layer_end:
+                    continue
+                deviation = scaled_deviation(layer_start, layer_end, segment_index)
+                if deviation > optimal_max_deviation:
+                    continue
+
+                previous_squared_deviation, previous_counts = previous_states[layer_start]
+                squared_deviation = previous_squared_deviation + deviation * deviation
+                best_state = current_states.get(layer_end)
+                if best_state is None or squared_deviation < best_state[0]:
+                    current_states[layer_end] = (
+                        squared_deviation,
+                        previous_counts + [layer_end - layer_start],
+                    )
+
+        previous_states = current_states
+
+    return previous_states[num_layers][1]
+
+
+def causal_qwen_3_5_llm_to_onnx_multi_segment(model, args):
+    """Export Qwen3_5 LLM to multiple ONNX files, split by transformer blocks.
+    
+    Input format matches single-segment causal_qwen_3_5_llm_to_onnx:
+        input_ids, position_ids, attention_mask, Linear_Tc, num_logits_to_keep, conv_state
+    
+    Each segment includes embed_tokens so it can independently embed input_ids.
+    The conv_state is split per-segment based on which linear_attention layers
+    are in that segment.
+    """
+    import torch
+    import os
+
+    # Access text model layers
+    text_model = model.model if hasattr(model, 'model') else model
+    all_layers = text_model.model.layers
+    model_norm = text_model.model.norm if hasattr(text_model.model, 'norm') else None
+    embed_tokens = text_model.model.embed_tokens if hasattr(text_model.model, 'embed_tokens') else None
+    rotary_emb = text_model.model.rotary_emb if hasattr(text_model.model, 'rotary_emb') else None
+    lm_head = text_model.lm_head if hasattr(text_model, 'lm_head') else None
+
+    config = model.config
+
+    num_total_layers = len(all_layers)
+    num_segments = getattr(args, 'num_segments', None) or 0
+
+    # Auto-determine segment count if not specified
+    if num_segments <= 0:
+        layers_per_segment = 8
+        num_segments = max(1, (num_total_layers + layers_per_segment - 1) // layers_per_segment)
+
+    # Estimate packed RKNN weights: transformer blocks use W4A16/group32,
+    # while the default final lm_head uses W6A16/group32.
+    block_weight_bits = 4
+    lm_head_weight_bits = 6
+
+    layer_weight_sizes = [
+        _estimate_module_weight_size(
+            layer,
+            block_weight_bits,
+        )
+        for layer in all_layers
+    ]
+    last_segment_extra_size = (
+        _estimate_module_weight_size(
+            model_norm,
+            16,
+            metadata_bytes_per_group=0,
+        )
+        + _estimate_module_weight_size(
+            lm_head,
+            lm_head_weight_bits,
+        )
+    )
+    segment_layer_counts = _balanced_segment_layer_counts(
+        layer_weight_sizes,
+        num_segments,
+        last_segment_extra_size,
+    )
+    num_segments = len(segment_layer_counts)
+
+    segment_weight_sizes = []
+    layer_start = 0
+    for segment_index, layer_count in enumerate(segment_layer_counts):
+        layer_end = layer_start + layer_count
+        segment_weight_size = sum(layer_weight_sizes[layer_start:layer_end])
+        if segment_index == num_segments - 1:
+            segment_weight_size += last_segment_extra_size
+        segment_weight_sizes.append(segment_weight_size)
+        layer_start = layer_end
+
+    print(f"Total layers: {num_total_layers}, Segments: {num_segments}")
+    print(f"Layer distribution: {segment_layer_counts}")
+    print(
+        "Theoretical quantized weight distribution (MiB, INT4 blocks / INT6 lm_head): "
+        f"{[round(size / (1024 ** 2), 2) for size in segment_weight_sizes]}"
+    )
+    print(
+        "Last segment fixed norm + INT6 lm_head weight (MiB): "
+        f"{last_segment_extra_size / (1024 ** 2):.2f}"
+    )
+    print(f"Layer types: {config.layer_types}")
+
+    # --- Precompute conv_state shapes for each segment ---
+    # Each linear_attention layer has conv_state of shape (d_inner, conv_kernel_size)
+    # In single-segment, they are concatenated along dim=0: (num_linear_layers, d_inner, conv_kernel_size)
+    # We need to split this per segment
+    linear_conv_dim = getattr(config, 'linear_conv_kernel_dim', 4)
+    # Calculate d_inner for linear attention (key_dim * 2 + value_dim)
+    num_k_heads = config.linear_num_key_heads
+    num_v_heads = config.linear_num_value_heads
+    k_head_dim = config.linear_key_head_dim
+    v_head_dim = config.linear_value_head_dim
+    key_dim = num_k_heads * k_head_dim
+    value_dim = num_v_heads * v_head_dim
+    conv_dim = key_dim * 2 + value_dim  # d_inner for conv1d
+
+    # Count linear_attention layers in each segment
+    def count_linear_layers(layer_start, layer_end):
+        count = 0
+        for i in range(layer_start, layer_end):
+            if config.layer_types[i] == "linear_attention":
+                count += 1
+        return count
+
+    # --- Prepare common args ---
+    args.prompt_size = getattr(args, 'prompt_size', 64)
+    args.dynamic_shape = getattr(args, 'dynamic_shape', True)
+    in_len = args.prompt_size
+
+    model.eval()
+    model.float()
+
+    # Base output path
+    base_path = args.export_llm_path
+    base_dir = os.path.dirname(base_path)
+    base_name = os.path.splitext(os.path.basename(base_path))[0]
+
+    # --- Build dummy inputs (matching single-segment format) ---
+    dummy_input_ids = torch.zeros((1, in_len), dtype=torch.long)
+    with torch.no_grad():
+        inputs_embeds = embed_tokens(dummy_input_ids)
+    attention_mask = torch.ones((1, in_len), dtype=torch.float32)
+    position_ids = torch.arange(0, in_len, dtype=torch.long).unsqueeze(0)
+    Tc = torch.tensor([in_len], dtype=torch.int64)
+    num_logits_to_keep = torch.tensor([in_len - 1], dtype=torch.long)
+
+    # Input names must match single-segment format
+    input_names = ['input_embeds', 'position_ids', 'attention_mask', 'Linear_Tc', 'num_logits_to_keep', 'conv_state']
+    dynamic_axes = {
+        'attention_mask': {1: 'seq_len'},
+        'position_ids': {1: 'seq_len'},
+        'input_embeds': {1: 'seq_len'},
+    }
+
+    output_names = ['output']
+
+    # --- Export each segment ---
+    layer_start = 0
+    for seg_idx, layer_count in enumerate(segment_layer_counts):
+        layer_end = layer_start + layer_count
+        is_last = (seg_idx == num_segments - 1)
+
+        segment_layers = list(all_layers[layer_start:layer_end])
+        layer_indices = list(range(layer_start, layer_end))
+
+        seg_norm = model_norm if is_last else None
+        seg_lm_head = lm_head if is_last else None
+
+        # Build dummy conv_state for this segment
+        num_linear = count_linear_layers(layer_start, layer_end)
+        dummy_conv_state = torch.zeros((num_linear, conv_dim, linear_conv_dim), dtype=torch.float32)
+
+        segment_model = Qwen3_5SegmentWrapper(
+            embed_tokens=embed_tokens,
+            layers=segment_layers,
+            rotary_emb=rotary_emb,
+            norm=seg_norm,
+            lm_head=seg_lm_head,
+            is_last_segment=is_last,
+            layer_indices=layer_indices,
+            config=config,
+        )
+        segment_model.eval()
+        segment_model.float()
+
+        # Build segment path
+        if num_segments == 1:
+            seg_path = base_path
+        else:
+            seg_dir = os.path.join(base_dir, f"seg{seg_idx}")
+            os.makedirs(seg_dir, exist_ok=True)
+            seg_path = os.path.join(seg_dir, f"{base_name}_seg{seg_idx}.onnx")
+
+        inputs = (inputs_embeds, position_ids, attention_mask, Tc, num_logits_to_keep, dummy_conv_state)
+
+        print(f"Exporting segment {seg_idx}: layers {layer_start}-{layer_end-1} ({layer_count} layers)"
+              f", linear_attn={num_linear}"
+              f"{' + norm + lm_head' if is_last else ''} -> {seg_path}")
+
+        with torch.no_grad():
+            torch.onnx.export(
+                segment_model,
+                inputs,
+                seg_path,
+                export_params=True,
+                opset_version=19,
+                do_constant_folding=True,
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+                custom_opsets={"rknn": 1},
+            )
+
+        print(f"  Segment {seg_idx} exported to {os.path.abspath(seg_path)}")
+        layer_start = layer_end
+
+    print(f"All {num_segments} segments exported successfully.")
+
 
 # disable attribute that may cause error while export onnx
 def update_config(_config, _attr_names, _value):
@@ -421,10 +906,10 @@ def export_llm_config(model_path, config_path, chat_context, prompt, user_config
     vocab_size = config.vocab_size if hasattr(config, "vocab_size") else config.text_config.vocab_size
     hidden_size = config.hidden_size if hasattr(config, "hidden_size") else config.text_config.hidden_size
 
-    hf_config_json = json.dumps(config.to_dict())
+    hf_config_json = json.dumps(config.to_dict(), default=str)
     if user_config is not None:
         merged_config = {**config.to_dict(), **user_config}
-        hf_config_json = json.dumps(merged_config)
+        hf_config_json = json.dumps(merged_config, default=str)
 
     llm_config = {
         "system_prompt": system_prompt,

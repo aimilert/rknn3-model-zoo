@@ -307,7 +307,7 @@ int main(int argc, char **argv)
     callback.embed_userdata     = &embedding_info;
 
     ret = init_qwen2_5_omni_model(&rknn_app_ctx, llm_model_path, llm_weight_path, vision_model_path, vision_weight_path, audio_model_path, audio_weight_path,
-                                &params, n_params, callback, vision_core_mask, audio_core_mask, llm_core_mask);
+                                &params, n_params, callback, llm_core_mask, vision_core_mask, audio_core_mask);
     if (ret != 0) {
         printf("init_qwen2_5_omni_model fail! ret=%d llm_model_path=%s vision_model_path=%s\n", ret, llm_model_path, vision_model_path);
         goto out;

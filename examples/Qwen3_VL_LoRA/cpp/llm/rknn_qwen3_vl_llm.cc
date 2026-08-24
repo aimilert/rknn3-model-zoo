@@ -21,7 +21,7 @@
 #include "rknn_qwen3_vl_llm.h"
 
 // 为 session 设置 chat template 与 callback
-static int setup_session(rknn3_session* session, RKLLMCallback callback)
+static int setup_session(rknn3_session* session, RKLLMCallback& callback)
 {
     int ret = rknn3_session_set_chat_template(session, system_prompt, prompt_prefix, prompt_postfix);
     if (ret < 0) {
@@ -86,7 +86,7 @@ static int setup_context_lora(rknn3_context ctx, rknn3_session* session_lora, co
     return 0;
 }
 
-int init_qwen3_vl_llm(rknn_qwen3_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t core_mask, int* deepstack_aligned_size, char* lora_weight_path)
+int init_qwen3_vl_llm(rknn_qwen3_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t core_mask, int max_context_len1, int max_context_len2, int* deepstack_aligned_size, char* lora_weight_path)
 {
     int ret;
     rknn3_context  ctx = 0;
@@ -118,8 +118,18 @@ int init_qwen3_vl_llm(rknn_qwen3_vl_llm_context* llm_ctx, const char* model_path
         return ret;
     }
 
+    if (!params || n_params <= 0) {
+        printf("invalid llm params\n");
+        return -1;
+    }
+
+    rknn3_llm_param params_base = params[0];
+    rknn3_llm_param params_lora = params[0];
+    params_base.max_context_len = max_context_len1;
+    params_lora.max_context_len = max_context_len2;
+
     // Base session: 初始化 -> 设置 chat template 和 callback
-    session_base = rknn3_session_init(ctx, params, n_params);
+    session_base = rknn3_session_init(ctx, &params_base, 1);
     if (!session_base) {
         printf("Failed to initialize base session\n");
         return -1;
@@ -129,7 +139,7 @@ int init_qwen3_vl_llm(rknn_qwen3_vl_llm_context* llm_ctx, const char* model_path
         return ret;
 
     // LoRA session: 初始化
-    session_lora = rknn3_session_init(ctx, params, n_params);
+    session_lora = rknn3_session_init(ctx, &params_lora, 1);
     if (!session_lora) {
         printf("Failed to initialize lora session\n");
         return -1;

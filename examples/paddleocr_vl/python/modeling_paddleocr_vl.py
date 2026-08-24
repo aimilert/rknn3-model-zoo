@@ -1056,7 +1056,7 @@ class Projector(nn.Module):
         return hidden_states.view(*dims, -1)
 
 
-class SiglipVisionEmbeddings(nn.Module):
+class PaddleOCRVisionEmbeddings(nn.Module):
     def __init__(self, config: PaddleOCRVisionConfig):
         super().__init__()
         self.config = config
@@ -1242,7 +1242,7 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-class SiglipAttention(nn.Module):
+class PaddleOCRAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: PaddleOCRVisionConfig):
@@ -1373,8 +1373,8 @@ class SiglipAttention(nn.Module):
         return attn_output, attn_weights
 
 
-# Copied from transformers.models.clip.modeling_clip.CLIPMLP with CLIP->Siglip
-class SiglipMLP(nn.Module):
+# Copied from transformers.models.clip.modeling_clip.CLIPMLP with CLIP->PaddleOCR
+class PaddleOCRMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -1389,14 +1389,14 @@ class SiglipMLP(nn.Module):
         return hidden_states
 
 
-class SiglipEncoderLayer(nn.Module):
+class PaddleOCREncoderLayer(nn.Module):
     def __init__(self, config: PaddleOCRVisionConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.self_attn = SiglipAttention(config)
+        self.self_attn = PaddleOCRAttention(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = SiglipMLP(config)
+        self.mlp = PaddleOCRMLP(config)
 
     def forward(
         self,
@@ -1441,23 +1441,23 @@ class SiglipEncoderLayer(nn.Module):
         return outputs
 
 
-class SiglipPreTrainedModel(PreTrainedModel):
+class PaddleOCRPreTrainedModel(PreTrainedModel):
     config_class = PaddleOCRVLConfig
-    base_model_prefix = "siglip"
+    base_model_prefix = "PaddleOCR"
     supports_gradient_checkpointing = True
 
     _no_split_modules = [
-        "SiglipTextEmbeddings",
-        "SiglipEncoderLayer",
-        "SiglipVisionEmbeddings",
-        "SiglipMultiheadAttentionPoolingHead",
+        "PaddleOCRTextEmbeddings",
+        "PaddleOCREncoderLayer",
+        "PaddleOCRVisionEmbeddings",
+        "PaddleOCRMultiheadAttentionPoolingHead",
     ]
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
     def _init_weights(self, module):
         """Initialize the weights"""
-        if isinstance(module, SiglipVisionEmbeddings):
+        if isinstance(module, PaddleOCRVisionEmbeddings):
             width = (
                 self.config.vision_config.hidden_size
                 if isinstance(self.config, PaddleOCRVLConfig)
@@ -1466,7 +1466,7 @@ class SiglipPreTrainedModel(PreTrainedModel):
             nn.init.normal_(module.position_embedding.weight, std=1 / np.sqrt(width))
         elif isinstance(module, nn.Embedding):
             default_flax_embed_init(module.weight)
-        elif isinstance(module, SiglipAttention):
+        elif isinstance(module, PaddleOCRAttention):
             nn.init.xavier_uniform_(module.q_proj.weight)
             nn.init.xavier_uniform_(module.k_proj.weight)
             nn.init.xavier_uniform_(module.v_proj.weight)
@@ -1475,12 +1475,12 @@ class SiglipPreTrainedModel(PreTrainedModel):
             nn.init.zeros_(module.k_proj.bias)
             nn.init.zeros_(module.v_proj.bias)
             nn.init.zeros_(module.out_proj.bias)
-        elif isinstance(module, SiglipMLP):
+        elif isinstance(module, PaddleOCRMLP):
             nn.init.xavier_uniform_(module.fc1.weight)
             nn.init.xavier_uniform_(module.fc2.weight)
             nn.init.normal_(module.fc1.bias, std=1e-6)
             nn.init.normal_(module.fc2.bias, std=1e-6)
-        elif isinstance(module, SiglipMultiheadAttentionPoolingHead):
+        elif isinstance(module, PaddleOCRMultiheadAttentionPoolingHead):
             nn.init.xavier_uniform_(module.probe.data)
             nn.init.xavier_uniform_(module.attention.in_proj_weight.data)
             nn.init.zeros_(module.attention.in_proj_bias.data)
@@ -1493,11 +1493,11 @@ class SiglipPreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
 
-# Copied from transformers.models.altclip.modeling_altclip.AltCLIPEncoder with AltCLIP->Siglip
-class SiglipEncoder(nn.Module):
+# Copied from transformers.models.altclip.modeling_altclip.AltCLIPEncoder with AltCLIP->PaddleOCR
+class PaddleOCREncoder(nn.Module):
     """
     Transformer encoder consisting of `config.num_hidden_layers` self attention layers. Each layer is a
-    [`SiglipEncoderLayer`].
+    [`PaddleOCREncoderLayer`].
 
     Args:
         config: PaddleOCRVLConfig
@@ -1510,7 +1510,7 @@ class SiglipEncoder(nn.Module):
         num_heads = config.num_attention_heads
         head_dim = embed_dim // num_heads
         self.layers = nn.ModuleList(
-            [SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [PaddleOCREncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
         self.rotary_pos_emb = SigLIPRotaryEmbedding(head_dim // 2)
         self.gradient_checkpointing = False
@@ -1733,20 +1733,20 @@ class SiglipEncoder(nn.Module):
         )
 
 
-class SiglipVisionTransformer(nn.Module):
+class PaddleOCRVisionTransformer(nn.Module):
     def __init__(self, config: PaddleOCRVisionConfig):
         super().__init__()
         self.config = config
         embed_dim = config.hidden_size
 
-        self.embeddings = SiglipVisionEmbeddings(config)
-        self.encoder = SiglipEncoder(config)
+        self.embeddings = PaddleOCRVisionEmbeddings(config)
+        self.encoder = PaddleOCREncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self.use_head = (
             True if not hasattr(config, "vision_use_head") else config.vision_use_head
         )
         if self.use_head:
-            self.head = SiglipMultiheadAttentionPoolingHead(config)
+            self.head = PaddleOCRMultiheadAttentionPoolingHead(config)
 
     # @can_return_tuple
     def forward(
@@ -1896,7 +1896,7 @@ class SiglipVisionTransformer(nn.Module):
         )
 
 
-class SiglipMultiheadAttentionPoolingHead(nn.Module):
+class PaddleOCRMultiheadAttentionPoolingHead(nn.Module):
     """Multihead Attention Pooling."""
 
     def __init__(self, config: PaddleOCRVisionConfig):
@@ -1907,7 +1907,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
             config.hidden_size, config.num_attention_heads, batch_first=True
         )
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp = SiglipMLP(config)
+        self.mlp = PaddleOCRMLP(config)
 
     def forward(self, hidden_state, key_padding_mask=None):
         batch_size = hidden_state.shape[0]
@@ -1924,14 +1924,14 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         return hidden_state[:, 0]
 
 
-class SiglipVisionModel(SiglipPreTrainedModel):
+class PaddleOCRVisionModel(PaddleOCRPreTrainedModel):
     config_class = PaddleOCRVisionConfig
     main_input_name = "pixel_values"
 
     def __init__(self, config: PaddleOCRVisionConfig):
         super().__init__(config)
 
-        self.vision_model = SiglipVisionTransformer(config)
+        self.vision_model = PaddleOCRVisionTransformer(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1959,28 +1959,6 @@ class SiglipVisionModel(SiglipPreTrainedModel):
         window_size: Optional[bool] = -1,
         rope_emb: Optional[torch.Tensor] = None,
     ) -> BaseModelOutputWithPooling:
-        r"""
-        Returns:
-
-        Examples:
-
-        ```python
-        >>> from PIL import Image
-        >>> import requests
-        >>> from transformers import AutoProcessor, SiglipVisionModel
-
-        >>> model = SiglipVisionModel.from_pretrained("google/siglip-base-patch16-224")
-        >>> processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
-
-        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-        >>> image = Image.open(requests.get(url, stream=True).raw)
-
-        >>> inputs = processor(images=image, return_tensors="pt")
-
-        >>> outputs = model(**inputs)
-        >>> last_hidden_state = outputs.last_hidden_state
-        >>> pooled_output = outputs.pooler_output  # pooled features
-        ```"""
         return self.vision_model(
             pixel_values=pixel_values,
             output_attentions=output_attentions,
@@ -2093,12 +2071,12 @@ class PaddleOCRVLCausalLMOutputWithPast(ModelOutput):
 class PaddleOCRVLForConditionalGeneration(Ernie4_5PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     config_class = PaddleOCRVLConfig
-    _no_split_modules = ["Ernie4_5_DecoderLayer", "SiglipEncoderLayer"]
+    _no_split_modules = ["Ernie4_5_DecoderLayer", "PaddleOCREncoderLayer"]
 
     def __init__(self, config):
         super().__init__(config)
         self.mlp_AR = Projector(config, config.vision_config)
-        self.visual = SiglipVisionModel(config.vision_config)
+        self.visual = PaddleOCRVisionModel(config.vision_config)
         self.model = Ernie4_5Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -2718,12 +2696,12 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5PreTrainedModel, GenerationMix
 class CustomPaddleOCRVLForConditionalGeneration(Ernie4_5PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     config_class = PaddleOCRVLConfig
-    _no_split_modules = ["Ernie4_5_DecoderLayer", "SiglipEncoderLayer"]
+    _no_split_modules = ["Ernie4_5_DecoderLayer", "PaddleOCREncoderLayer"]
 
     def __init__(self, config):
         super().__init__(config)
         self.mlp_AR = Projector(config, config.vision_config)
-        self.visual = SiglipVisionModel(config.vision_config)
+        self.visual = PaddleOCRVisionModel(config.vision_config)
         self.model = Ernie4_5Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)

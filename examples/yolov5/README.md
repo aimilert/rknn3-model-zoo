@@ -87,11 +87,22 @@
 下载完成后，参考其中的导出文档，按照步骤进行操作，即可生成适配 RK182x 的优化 ONNX 模型。
 
 ## 模型转换
+
+### 1. 标准模型（不带 `_rknn3` 后缀，配合模式 A/B 使用）
 ```bash
 cd python
-python convert.py ../model/yolov5n_rknn3.onnx RK1820 i8 
+python convert.py ../model/yolov5n.onnx RK1820 i8
 ```
-注意：由于坐标解码部分不适合量化因此`convert.py`采用了混合量化模式，具体配置在`rknn.config()`的`subgraph_dtype_target`参数，详细定义见《Rockchip_RKNPU3_API_Reference_RKNN3_Toolkit》
+
+### 2. `_rknn3` 优化模型（配合模式 C 使用）
+```bash
+cd python
+python convert.py ../model/yolov5n_rknn3.onnx RK1820 i8
+```
+
+注意：
+- 由于坐标解码部分不适合量化，因此`convert.py`采用了混合量化模式，具体配置在`rknn.config()`的`subgraph_dtype_target`参数，详细定义见《Rockchip_RKNPU3_API_Reference_RKNN3_Toolkit》
+- `convert.py` 中 `core_num` 默认为 `1`，即 `_rknn3` 模型默认按**单核**转换，运行时需使用 `0x01` 与之匹配（详见下文模式 C 说明）。
 
 
 ## C++ 示例编译和运行
@@ -193,10 +204,10 @@ install/rk3588_linux_aarch64/rknn_yolov5_demo/
 ```cpp
 if (postprocess_plugin_path != NULL) {
     app_ctx->use_postprocess_plugin = true;
-    
+
     // 注册后处理插件到 RKNN 运行时
     // 插件将在协处理器的 CPU 上执行后处理
-    ret = rknn3_register_custom_ops_plugins(ctx, postprocess_plugin_path, 
+    ret = rknn3_register_custom_ops_plugins(ctx, postprocess_plugin_path,
                                             strlen(postprocess_plugin_path));
     if (ret != RKNN3_SUCCESS) {
         printf("rknn3_register_custom_ops_plugins failed! ret=%d\n", ret);
@@ -321,9 +332,10 @@ export LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH
 
 **模式 C：带_rknn3模型（推荐多核）**
 ```bash
-# 使用内置后处理的模型（8核并行）
-./dataset_eval model/yolov5n_rknn3.rknn model/yolov5n_rknn3.weight 0xFF
+# 使用内置后处理的模型（与默认 core_num=1 转换匹配，使用单核 0x01 运行）
+./dataset_eval model/yolov5n_rknn3.rknn model/yolov5n_rknn3.weight 0x01
 ```
+> ⚠️ `convert.py` 中 `core_num` 默认为 `1`，即 `_rknn3` 模型按单核转换，因此运行时使用 `0x01` 与之匹配。若需以 8 核（`0xFF`）运行，请先将 `convert.py` 中的 `core_num` 改为 `8` 重新转换模型。
 
 推理结束后会在当前目录下生成 `results_rknn.json` 结果文件。
 

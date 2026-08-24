@@ -23,7 +23,7 @@ if __name__ == '__main__':
     # pre-process config
     print('--> config model')
     rknn.config(target_platform=args.platform, 
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
                 )
     print('done')
 

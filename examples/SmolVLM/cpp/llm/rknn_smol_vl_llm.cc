@@ -20,7 +20,7 @@
 
 #include "rknn_smol_vl_llm.h"
 
-int init_smol_vl_llm(rknn_smol_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t core_mask)
+int init_smol_vl_llm(rknn_smol_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t core_mask)
 {
     int ret;
     rknn3_context  ctx     = 0;

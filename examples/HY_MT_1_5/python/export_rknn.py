@@ -4,7 +4,7 @@ from rknn.api import RKNN
 ONNX_MODEL = '../model/llm/HY-MT1.5-1.8B.onnx'
 LLM_CONFIG = '../model/llm/HY-MT1.5-1.8B.config.pkl'
 RKNN_MODEL = '../model/llm/HY-MT1.5-1.8B.rknn'
-DATASET_PATH = '../data/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 
@@ -24,7 +24,7 @@ if __name__ == '__main__':
     # pre-process config
     print('--> config model')
     rknn.config(target_platform=args.platform, 
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32', core_num=args.core_num,
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32', core_num=args.core_num,
                 )
     print('done')
 

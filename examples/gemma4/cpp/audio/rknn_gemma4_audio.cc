@@ -17,35 +17,17 @@
 #include <string.h>
 #include <math.h>
 #include <algorithm>
-#include <memory>
+#include <complex>
 #include <string>
 #include <vector>
 
-#include <fftw3.h>
+#include "pocketfft_hdronly.h"
 
 #include "rknn_gemma4_audio.h"
 #include "common.h"
 #include "file_utils.h"
 #include "image_utils.h"
 #include "audio_utils.h"
-
-// ---------------------------------------------------------------------------
-// RAII wrappers for FFTW resources to prevent leaks in early-return paths.
-// ---------------------------------------------------------------------------
-struct FftwFloatDeleter {
-    void operator()(float* p) const { if (p) fftwf_free(p); }
-};
-struct FftwComplexDeleter {
-    void operator()(fftwf_complex* p) const { if (p) fftwf_free(p); }
-};
-struct FftwPlanDeleter {
-    void operator()(fftwf_plan p) const { if (p) fftwf_destroy_plan(p); }
-};
-
-using FftwFloatPtr   = std::unique_ptr<float[],        FftwFloatDeleter>;
-using FftwComplexPtr = std::unique_ptr<fftwf_complex[], FftwComplexDeleter>;
-using FftwPlanPtr    = std::unique_ptr<std::remove_pointer<fftwf_plan>::type,
-                                        FftwPlanDeleter>;
 
 #define DEBUG_AUDIO 0 // 0: no debug, 1: debug
 
@@ -696,10 +678,11 @@ static void gemma4_audio_preprocess(audio_buffer_t* audio,
         window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)frame_length));
     }
 
-    FftwFloatPtr   fft_in (fftwf_alloc_real(fft_length));
-    FftwComplexPtr fft_out(fftwf_alloc_complex(n_freqs));
-    fftwf_plan     plan_raw = fftwf_plan_dft_r2c_1d(fft_length, fft_in.get(), fft_out.get(), FFTW_ESTIMATE);
-    FftwPlanPtr    plan(plan_raw);
+    std::vector<float> fft_in(fft_length, 0.0f);
+    std::vector<std::complex<float>> fft_out(n_freqs);
+    pocketfft::shape_t fft_shape = {static_cast<size_t>(fft_length)};
+    pocketfft::stride_t fft_stride_in = {sizeof(float)};
+    pocketfft::stride_t fft_stride_out = {sizeof(std::complex<float>)};
 
     std::vector<float> magnitude(n_freqs);
 
@@ -719,11 +702,12 @@ static void gemma4_audio_preprocess(audio_buffer_t* audio,
             fft_in[k] = 0.0f;  // implicit np.fft.rfft(..., n=fft_length)
         }
 
-        fftwf_execute(plan.get());
+        pocketfft::r2c(fft_shape, fft_stride_in, fft_stride_out, 0, true,
+                       fft_in.data(), fft_out.data(), 1.0f);
 
         for (int k = 0; k < n_freqs; k++) {
-            const float re = fft_out[k][0];
-            const float im = fft_out[k][1];
+            const float re = fft_out[k].real();
+            const float im = fft_out[k].imag();
             magnitude[k] = sqrtf(re * re + im * im);  // |stft|, not power
         }
 
@@ -744,8 +728,6 @@ static void gemma4_audio_preprocess(audio_buffer_t* audio,
             padded_feature[row_off + (size_t)m] = logf(sum + mel_floor);
         }
     }
-
-    // FFTW resources are automatically freed by RAII wrappers (FftwPlanPtr, FftwFloatPtr, FftwComplexPtr).
 }
 
 int inference_gemma4_audio(rknn_gemma4_audio_context* audio_ctx, audio_buffer_t* audio, float16* audio_embeds, int* n_valid_audio)

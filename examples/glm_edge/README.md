@@ -14,7 +14,7 @@ pip install -r requirements.txt
 
 ```shell
 cd python
-python export_llm.py
+python export_llm.py --quant --modelscope
 ```
 
 ## 3.转换rknn模型
@@ -55,7 +55,7 @@ rknn_glm_edge_demo/
 
 ```bash
 # 推送 demo 目录
-adb push rknn_glm_edge_demo /data/
+adb push install/rk3588_linux_aarch64/rknn_glm_edge_demo /data/
 ```
 
 ### 3.3 运行示例
@@ -69,5 +69,5 @@ cd /data/rknn_glm_edge_demo
 
 输出示例：
 ```
-I am an artificial intelligence assistant named GLM-1.5, created by ZhiPu AI Company.<|im_end|>
+I am GLM-1.5, a language model trained by ZhiPu AI Company.<|im_end|>
 ```

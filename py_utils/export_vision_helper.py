@@ -18,6 +18,7 @@ def save_config(config_path: str, img_h: int, img_w: int, patch_size: int):
     config = {
         "img_h": img_h,
         "img_w": img_w,
+        "patch_size": patch_size,
         "grid_thw": grid_thw
     }
 

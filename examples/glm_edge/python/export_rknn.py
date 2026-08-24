@@ -4,7 +4,7 @@ from rknn.api import RKNN
 ONNX_MODEL = '../model/llm/glm-edge-1.5b-chat.onnx'
 LLM_CONFIG = '../model/llm/glm-edge-1.5b-chat.config.pkl'
 RKNN_MODEL = '../model/llm/glm-edge-1.5b-chat.rknn'
-DATASET_PATH = '../../../datasets/CMMLU/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 
@@ -23,7 +23,7 @@ if __name__ == '__main__':
     # pre-process config
     print('--> config model')
     rknn.config(target_platform=args.platform, 
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
                 )
     print('done')
 

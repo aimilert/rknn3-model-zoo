@@ -59,10 +59,10 @@ This example supports two pre-trained models:
 cd python
 
 # Convert LJSpeech Step1 model (Text Encoder + Duration Predictor)
-python convert_step1.py ../model/vits_ljs_step1_slid.onnx rk1820
+python convert_step1.py ../model/vits_ljs_step1_slid.onnx rk1820 fp
 
 # Convert LJSpeech Step2 model (Flow + Decoder)
-python convert_step2.py ../model/vits_ljs_step2_slid.onnx rk1820
+python convert_step2.py ../model/vits_ljs_step2_slid.onnx rk1820 fp
 ```
 
 **Output:**
@@ -75,10 +75,10 @@ python convert_step2.py ../model/vits_ljs_step2_slid.onnx rk1820
 cd python
 
 # Convert VCTK Step1 model (Text Encoder + Duration Predictor)
-python convert_step1.py ../model/vits_vctk_step1_slid.onnx rk1820
+python convert_step1.py ../model/vits_vctk_step1_slid.onnx rk1820 fp
 
 # Convert VCTK Step2 model (Flow + Decoder)
-python convert_step2.py ../model/vits_vctk_step2_slid.onnx rk1820
+python convert_step2.py ../model/vits_vctk_step2_slid.onnx rk1820 fp
 ```
 
 **Output:**
@@ -95,10 +95,9 @@ python convert_step2.py ../model/vits_vctk_step2_slid.onnx rk1820
 
 *Prerequisites:*
 
-```shell
-# Install RKNN3 toolkit
-pip install rknn3-toolkit
+安装最新版本的rknn3-toolkit
 
+```shell
 # Install dependencies
 pip install -r requirements.txt
 ```
@@ -325,7 +324,7 @@ Saved audio to output_audio_rknn.wav
 *Performance Metrics:*
 
 - **RTF (Real-Time Factor)**: ~0.15-0.17 (C++ demo), ~0.17-0.24 (Python demo)
-- **Memory Usage**: Optimized with RKNN3 FP16 quantization
+- **Memory Usage**: Optimized with RKNN3 W4A16 quantization
 - **Model Type Auto-Detection**: C++ demo automatically detects LJSpeech vs VCTK models
 - **Text Processing**: Full punctuation support (commas, periods, colons, semicolons, etc.)
 

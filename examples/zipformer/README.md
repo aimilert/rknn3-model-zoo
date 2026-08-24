@@ -80,14 +80,13 @@ python convert_joiner.py ../model/joiner-epoch-99-avg-1.onnx rk1820
 
 *Prerequisites:*
 
+安装最新版本的rknn3-toolkit
+
 ```shell
 # Install kaldifeat
 # Refer to https://csukuangfj.github.io/kaldifeat/installation/from_wheels.html for installation.
 # This python demo is tested under version: kaldifeat-1.25.5.dev20250807
 pip install kaldifeat==1.25.5.dev20250807+cpu.torch2.8.0 -f https://csukuangfj.github.io/kaldifeat/cpu-cn.html
-
-# Install RKNN3 toolkit
-pip install rknn3-toolkit
 
 # Install depends
 pip install -r requirements.txt

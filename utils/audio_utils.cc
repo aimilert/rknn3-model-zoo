@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <vector>
 #include <algorithm>
-#include <fftw3.h>
+#include <complex>
+#include <vector>
+
+#include "pocketfft_hdronly.h"
 
 #define MA_NO_DEVICE_IO
 #define MA_NO_THREADING
@@ -114,11 +116,13 @@ static void reflect_pad(const std::vector<float> &audio, std::vector<float> &pad
 }
 
 #if ENABLE_NEON
-static void stfts_neon(const std::vector<float> &audio, int audio_length, int window_length, int hop_length, const std::vector<float> &window, fftwf_complex *stft_result, int num_frames)
+static void stfts_neon(const std::vector<float> &audio, int audio_length, int window_length, int hop_length, const std::vector<float> &window, std::complex<float> *stft_result, int num_frames)
 {
-    float *input = (float *)fftwf_malloc(sizeof(float) * window_length);
-    fftwf_complex *output = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * (window_length / 2 + 1));
-    fftwf_plan plan = fftwf_plan_dft_r2c_1d(window_length, input, output, FFTW_ESTIMATE);
+    std::vector<float> input(window_length, 0.0f);
+    std::vector<std::complex<float>> output(window_length / 2 + 1);
+    pocketfft::shape_t shape = {static_cast<size_t>(window_length)};
+    pocketfft::stride_t stride_in = {sizeof(float)};
+    pocketfft::stride_t stride_out = {sizeof(std::complex<float>)};
     for (int i = 0; i < num_frames; i++)
     {
         int start = i * hop_length;
@@ -130,11 +134,11 @@ static void stfts_neon(const std::vector<float> &audio, int audio_length, int wi
                 float32x4_t in = vld1q_f32(audio.data() + start + j);
                 float32x4_t win = vld1q_f32(window.data() + j);
                 float32x4_t out = vmulq_f32(in, win);
-                vst1q_f32(input + j, out);
+                vst1q_f32(input.data() + j, out);
             }
             else
             {
-                vst1q_f32(input + j, vdupq_n_f32(0.0f));
+                vst1q_f32(input.data() + j, vdupq_n_f32(0.0f));
             }
         }
 
@@ -150,20 +154,18 @@ static void stfts_neon(const std::vector<float> &audio, int audio_length, int wi
             }
         }
 
-        fftwf_execute(plan);
-        memcpy(stft_result + i * (window_length / 2 + 1), output, sizeof(fftwf_complex) * (window_length / 2 + 1));
+        pocketfft::r2c(shape, stride_in, stride_out, 0, true, input.data(), output.data(), 1.0f);
+        memcpy(stft_result + i * (window_length / 2 + 1), output.data(), sizeof(std::complex<float>) * (window_length / 2 + 1));
     }
-
-    fftwf_free(input);
-    fftwf_free(output);
-    fftwf_destroy_plan(plan);
 }
 #else
-static void stfts(const std::vector<float> &audio, int audio_length, int window_length, int hop_length, const std::vector<float> &window, fftwf_complex *stft_result, int num_frames)
+static void stfts(const std::vector<float> &audio, int audio_length, int window_length, int hop_length, const std::vector<float> &window, std::complex<float> *stft_result, int num_frames)
 {
-    float *input = (float *)fftwf_malloc(sizeof(float) * window_length);
-    fftwf_complex *output = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * (window_length / 2 + 1));
-    fftwf_plan plan = fftwf_plan_dft_r2c_1d(window_length, input, output, FFTW_ESTIMATE);
+    std::vector<float> input(window_length, 0.0f);
+    std::vector<std::complex<float>> output(window_length / 2 + 1);
+    pocketfft::shape_t shape = {static_cast<size_t>(window_length)};
+    pocketfft::stride_t stride_in = {sizeof(float)};
+    pocketfft::stride_t stride_out = {sizeof(std::complex<float>)};
 
     for (int i = 0; i < num_frames; i++)
     {
@@ -182,22 +184,18 @@ static void stfts(const std::vector<float> &audio, int audio_length, int window_
             }
         }
 
-        fftwf_execute(plan);
-        memcpy(stft_result + i * (window_length / 2 + 1), output, sizeof(fftwf_complex) * (window_length / 2 + 1));
+        pocketfft::r2c(shape, stride_in, stride_out, 0, true, input.data(), output.data(), 1.0f);
+        memcpy(stft_result + i * (window_length / 2 + 1), output.data(), sizeof(std::complex<float>) * (window_length / 2 + 1));
     }
-
-    fftwf_free(input);
-    fftwf_free(output);
-    fftwf_destroy_plan(plan);
 }
 #endif
 
-static float compute_magnitude(const fftwf_complex &value)
+static float compute_magnitude(const std::complex<float> &value)
 {
-    return value[0] * value[0] + value[1] * value[1];
+    return value.real() * value.real() + value.imag() * value.imag();
 }
 
-static void compute_magnitudes(fftwf_complex *stft_result, int num_mel_filters, int num_frames, std::vector<float> &magnitudes)
+static void compute_magnitudes(std::complex<float> *stft_result, int num_mel_filters, int num_frames, std::vector<float> &magnitudes)
 {
     int k = 0;
     for (int i = 0; i < num_mel_filters; i++)
@@ -234,7 +232,7 @@ static void clamp_and_log_max(std::vector<float> &mel_spec, int rows, int cols)
     }
 }
 
-void transpose(fftwf_complex *input, int input_rows, int input_cols, fftwf_complex *output)
+void transpose(std::complex<float> *input, int input_rows, int input_cols, std::complex<float> *output)
 {
     for (int i = 0; i < input_rows; ++i)
     {
@@ -243,8 +241,7 @@ void transpose(fftwf_complex *input, int input_rows, int input_cols, fftwf_compl
             int input_index = i * input_cols + j;
             int output_index = j * input_rows + i;
 
-            output[output_index][0] = input[input_index][0];
-            output[output_index][1] = input[input_index][1];
+            output[output_index] = input[input_index];
         }
     }
 }
@@ -327,18 +324,18 @@ static void log_mel_spectrogram(float *audio_data, int audio_length, int cur_num
     std::vector<float> padded_audio(padded_size);
     reflect_pad(audio, padded_audio, n_fft / 2);
 
-    fftwf_complex *stfts_result = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * mels_filters_size * cur_num_frames_of_stfts);
+    std::vector<std::complex<float>> stfts_result(mels_filters_size * cur_num_frames_of_stfts);
 #if ENABLE_NEON
-    stfts_neon(padded_audio, audio_length + n_fft, n_fft, hop_length, window, stfts_result, cur_num_frames_of_stfts);
+    stfts_neon(padded_audio, audio_length + n_fft, n_fft, hop_length, window, stfts_result.data(), cur_num_frames_of_stfts);
 #else
-    stfts(padded_audio, audio_length + n_fft, n_fft, hop_length, window, stfts_result, cur_num_frames_of_stfts);
+    stfts(padded_audio, audio_length + n_fft, n_fft, hop_length, window, stfts_result.data(), cur_num_frames_of_stfts);
 #endif
 
-    fftwf_complex *stfts_result_t = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * mels_filters_size * cur_num_frames_of_stfts);
-    transpose(stfts_result, cur_num_frames_of_stfts, mels_filters_size, stfts_result_t);
+    std::vector<std::complex<float>> stfts_result_t(mels_filters_size * cur_num_frames_of_stfts);
+    transpose(stfts_result.data(), cur_num_frames_of_stfts, mels_filters_size, stfts_result_t.data());
 
     std::vector<float> magnitudes(mels_filters_size * (cur_num_frames_of_stfts - 1));
-    compute_magnitudes(stfts_result_t, mels_filters_size, cur_num_frames_of_stfts, magnitudes);
+    compute_magnitudes(stfts_result_t.data(), mels_filters_size, cur_num_frames_of_stfts, magnitudes);
 
     int ROWS_A = n_mels;
     int COLS_A = mels_filters_size;
@@ -351,8 +348,6 @@ static void log_mel_spectrogram(float *audio_data, int audio_length, int cur_num
 
     clamp_and_log_max(mel_spec, ROWS_A, COLS_B);
 
-    fftwf_free(stfts_result);
-    fftwf_free(stfts_result_t);
 }
 
 void audio_preprocess(audio_buffer_t *audio, float *mel_filters, int n_fft, int hop_length, int n_mels, int max_audio_length, std::vector<float> &x_mel, int *actual_len)

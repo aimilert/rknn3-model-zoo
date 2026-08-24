@@ -6,7 +6,7 @@ from py_utils.tools import gen_qwen_vl_vision_prune_quantize_dataset
 
 ONNX_MODEL = '../../model/vision/Qwen2.5-VL-3B-vision.onnx'
 RKNN_MODEL = '../../model/vision/Qwen2.5-VL-3B-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
+DATASET_PATH = None
 
 def load_config(config_path: str):
     import json

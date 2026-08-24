@@ -87,11 +87,22 @@
 下载完成后，参考其中的导出文档，按照步骤进行操作，即可生成适配 RK182x 的优化 ONNX 模型。
 
 ## 模型转换
+
+### 1. 标准模型（不带 `_rknn3` 后缀，配合模式 A/B 使用）
 ```bash
 cd python
-python convert.py ../model/yolov6n_rknn3.onnx RK1820 i8 
+python convert.py ../model/yolov6n.onnx RK1820 i8
 ```
-注意：由于坐标解码部分不适合量化因此`convert.py`采用了混合量化模式，具体配置在`rknn.config()`的`subgraph_dtype_target`参数，详细定义见《Rockchip_RKNPU3_API_Reference_RKNN3_Toolkit》
+
+### 2. `_rknn3` 优化模型（配合模式 C 使用）
+```bash
+cd python
+python convert.py ../model/yolov6n_rknn3.onnx RK1820 i8
+```
+
+注意：
+- 由于坐标解码部分不适合量化，因此`convert.py`采用了混合量化模式，具体配置在`rknn.config()`的`subgraph_dtype_target`参数，详细定义见《Rockchip_RKNPU3_API_Reference_RKNN3_Toolkit》
+- `convert.py` 中 `core_num` 默认为 `1`，即 `_rknn3` 模型默认按**单核**转换，运行时需使用 `0x01` 与之匹配（详见下文模式 C 说明）。
 
 ## C++ 示例编译和运行
 
@@ -122,9 +133,11 @@ cd examples/yolov5/cpp/libpostprocess_rk182x
 ./build-linux.sh -t rk3588 -a aarch64 -d yolov6 -b Release
 ```
 
-编译完成后，在 `build/build_rknn_yolov6_demo_rk3588_linux_aarch64_Release/` 目录下会生成：
+编译完成后，会在安装目录 `install/rk3588_linux_aarch64/rknn_yolov6_demo/`（需推送到板端的即此目录）下生成完整的运行包：
 - `rknn_yolov6_demo`：单张图片推理程序
 - `dataset_eval`：数据集批量测试程序
+- `model/`：模型和测试图片
+- `lib/`：依赖库和后处理插件
 
 ### 推理运行示例
 
@@ -147,19 +160,19 @@ cd examples/yolov5/cpp/libpostprocess_rk182x
 **模式 A：不带_rknn3模型 + 后处理插件（⭐ 推荐单核）**
 ```bash
 # 使用后处理插件，后处理在协处理器 CPU 执行
-./rknn_yolov6_demo yolov6s.rknn yolov6s.weight bus.jpg 0x1 libpostprocess_yolov6_rk182x.so
+./rknn_yolov6_demo model/yolov6n.rknn model/yolov6n.weight model/bus.jpg 0x1 lib/libpostprocess_yolov6_rk182x.so
 ```
 
 **模式 B：不带_rknn3模型，主控端后处理（❌ 不推荐）**
 ```bash
 # 不使用插件，后处理在主控端 CPU 执行
-./rknn_yolov6_demo yolov6s.rknn yolov6s.weight bus.jpg 0x1
+./rknn_yolov6_demo model/yolov6n.rknn model/yolov6n.weight model/bus.jpg 0x1
 ```
 
 **模式 C：带_rknn3模型（⭐ 推荐多核）**
 ```bash
 # 使用内置后处理的模型，不需要插件
-./rknn_yolov6_demo yolov6s_rknn3.rknn yolov6s_rknn3.weight bus.jpg 0x1
+./rknn_yolov6_demo model/yolov6n_rknn3.rknn model/yolov6n_rknn3.weight model/bus.jpg 0x1
 ```
 
 **核心代码说明（模式 A）：**
@@ -169,10 +182,10 @@ cd examples/yolov5/cpp/libpostprocess_rk182x
 ```cpp
 if (postprocess_plugin_path != NULL) {
     app_ctx->use_postprocess_plugin = true;
-    
+
     // 注册后处理插件到 RKNN 运行时
     // 插件将在协处理器的 CPU 上执行后处理
-    ret = rknn3_register_custom_ops_plugins(ctx, postprocess_plugin_path, 
+    ret = rknn3_register_custom_ops_plugins(ctx, postprocess_plugin_path,
                                             strlen(postprocess_plugin_path));
     if (ret != RKNN3_SUCCESS) {
         printf("rknn3_register_custom_ops_plugins failed! ret=%d\n", ret);
@@ -298,9 +311,10 @@ export LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH
 
 **模式 C：带_rknn3模型（推荐多核）**
 ```bash
-# 使用内置后处理的模型（8核并行）
-./dataset_eval model/yolov6n_rknn3.rknn model/yolov6n_rknn3.weight 0xFF
+# 使用内置后处理的模型（与默认 core_num=1 转换匹配，使用单核 0x01 运行）
+./dataset_eval model/yolov6n_rknn3.rknn model/yolov6n_rknn3.weight 0x01
 ```
+> ⚠️ `convert.py` 中 `core_num` 默认为 `1`，即 `_rknn3` 模型按单核转换，因此运行时使用 `0x01` 与之匹配。若需以 8 核（`0xFF`）运行，请先将 `convert.py` 中的 `core_num` 改为 `8` 重新转换模型。
 
 推理结束后会在当前目录下生成 `results_rknn.json` 结果文件。
 
@@ -494,7 +508,7 @@ ret = rknn3_query(ctx, RKNN3_QUERY_POSTPROCESS_OUTPUT_ATTR, &output_attr, sizeof
 在插件源码中取消注释 `printf` 语句可获取详细的调试信息：
 
 ```c
-// 在 yolov6_postprocess.c 中取消注释
+// 在 yolov8_postprocess.c 中取消注释
 printf("[PostProcess] Total objects before NMS: %d\n", validCount);
 printf("[PostProcess] Result[%d]: box=(%.1f, %.1f, %.1f, %.1f), score=%.3f, class=%d\n", ...);
 ```

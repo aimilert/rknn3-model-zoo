@@ -1,4 +1,5 @@
 import os
+os.environ['CUDA_VISIBLE_DEVICES']='0'
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com/"
 import sys
 import pickle
@@ -83,6 +84,8 @@ if __name__ == '__main__':
     parser.add_argument("--model_path", type=str, help="model path or name", required=False, default="Qwen/Qwen3-ASR-0.6B")
     parser.add_argument("--export_llm_path", type=str, help="export llm onnx model path", required=False, default="llm.onnx")
     parser.add_argument("--modelscope", action='store_true', help="Whether download model from www.modelscope.cn")
+    parser.add_argument("--quant", action='store_true', help="Whether use GRQ quantization")
+    parser.add_argument("--cali_dataset", default='quant_data/model_input.json', help="some samples for grq quantized_algorithm")
     args = parser.parse_args()
 
     if args.modelscope:
@@ -105,6 +108,24 @@ if __name__ == '__main__':
     thinker = qwen3_asr_model.model.thinker
     text_model = thinker.model
     lm_head = thinker.lm_head
+    
+    if args.quant and torch.cuda.is_available():
+        from rknn.quantization.api import RKQuantizer
+        ## 初始化量化工具
+        QuantTool = RKQuantizer(verbose=True)
+        
+        ## 量化工具加载模型
+        ret = QuantTool.load_model(model=text_model, tokenizer=None, device='cuda')
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        
+        ## 执行量化算法
+        dataset = args.cali_dataset
+        text_model = QuantTool.quantize(quantized_dtype="w4a16", quantized_method="group32", quantized_algorithm="grq", dataset=dataset)
+
+        text_model = text_model.cpu()
+        
     model = Qwen3TextOnlyCausalLM(text_model, lm_head, config)
     model.eval()
     
@@ -129,6 +150,7 @@ if __name__ == '__main__':
     if args.modelscope:
         from modelscope import snapshot_download
         qwen3_model_path = snapshot_download(qwen3_model_path)
+    # qwen3_model_path = '/mnt/nfs_client/public/data/CKPT/Qwen3-0.6B/'
     export_tokenizer(qwen3_model_path, os.path.splitext(args.export_llm_path)[0] + '.tokenizer.gguf')
 
     # Export embedding weight

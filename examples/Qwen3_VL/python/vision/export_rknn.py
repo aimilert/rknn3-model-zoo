@@ -1,12 +1,9 @@
 import numpy as np
 import os,sys
 from rknn.api import RKNN
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..')))
-from py_utils.tools import gen_qwen_vl_vision_prune_quantize_dataset
 
 ONNX_MODEL = 'Qwen3-VL-2B-vision.onnx'
 RKNN_MODEL = 'Qwen3-VL-2B-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
 
 def load_config(config_path: str):
     import json
@@ -33,7 +30,6 @@ if __name__ == '__main__':
     parser.add_argument("--onnx_path", type=str, help="onnx model path", required=False, default=ONNX_MODEL)
     parser.add_argument("--rknn_path", type=str, help="output rknn model path", required=False, default=RKNN_MODEL)
     parser.add_argument('--platform', type=str, default= "rk1820", help='Target platform (e.g. rk1820)')
-    parser.add_argument("--dataset_path", type=str, help="model quantization dataset path", required=False, default=DATASET_PATH)
     parser.add_argument("--no_prune_mode", dest="prune_mode", action="store_false", help="close prune mode")
     parser.set_defaults(prune_mode=True)
     parser.add_argument('--core_num', type=int, default=8, help='core_num (1-8)')
@@ -72,14 +68,9 @@ if __name__ == '__main__':
         exit(ret)
     print('done')
 
-    if args.prune_mode == True: 
-       ret =  gen_qwen_vl_vision_prune_quantize_dataset(args.dataset_path, "../../data/vision/datasets_npy.txt", img_h, img_w, [0.5 * 255, 0.5 * 255, 0.5 * 255], [0.5 * 255, 0.5 * 255, 0.5 * 255], 16)
-       if ret == 0:
-           args.dataset_path = "../../data/vision/datasets_npy.txt"
-
     # Build model
     print('--> Building model')
-    ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
+    ret = rknn.build(do_quantization=True)
     if ret != 0:
         print('Build model failed!')
         exit(ret)

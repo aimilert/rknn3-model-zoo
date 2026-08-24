@@ -106,6 +106,7 @@ enum llm_arch {
     LLM_ARCH_LLADA,
     LLM_ARCH_LLADA_MOE,
     LLM_ARCH_SEED_OSS,
+    LLM_ARCH_NANBEIGE,
     LLM_ARCH_UNKNOWN,
 };
 

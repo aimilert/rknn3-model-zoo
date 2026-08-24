@@ -49,6 +49,7 @@ target_link_libraries(${PROJECT_NAME}
     timeutils
     imageutils
     audioutils
+    pocketfft
     fileutils
     ${LIBRKNNAPI}
     ${LIBTOKENIZER}

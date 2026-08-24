@@ -2,7 +2,7 @@ from rknn.api import RKNN
 
 ONNX_MODEL = '../../model/vision/FastVLM-vision.onnx'
 RKNN_MODEL = '../../model/vision/FastVLM-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 

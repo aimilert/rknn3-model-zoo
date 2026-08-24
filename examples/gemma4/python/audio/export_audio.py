@@ -2,6 +2,7 @@ import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com/"
 import sys
 import torch
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..')))
 
 from py_utils.tools import clear_llm_external_weight_in_dir
 from py_utils.export_vision_helper import export_gemma4_audio

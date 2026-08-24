@@ -12,20 +12,7 @@ from py_utils.tools import clear_llm_external_weight_in_dir
 
 from transformers import AutoModelForCausalLM, AutoConfig
 
-# Get the custom module path
-custom_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../gemma4'))
-print(f"Custom gemma4 module path: {custom_path}")
 
-# Load our custom modeling_gemma4 module using importlib
-import importlib.util
-modeling_spec = importlib.util.spec_from_file_location(
-    'transformers.models.gemma4.modeling_gemma4',
-    os.path.join(custom_path, 'modeling_gemma4.py')
-)
-modeling_module = importlib.util.module_from_spec(modeling_spec)
-sys.modules['transformers.models.gemma4.modeling_gemma4'] = modeling_module
-modeling_spec.loader.exec_module(modeling_module)
-print(f"Loaded custom modeling_gemma4 from: {modeling_module.__file__}")
 
 
 def _relpath_from_file(path, json_path):
@@ -155,7 +142,6 @@ if __name__ == '__main__':
     from argparse import ArgumentParser
 
     parser = ArgumentParser(description="Export Gemma4 vision configuration and onnx model for RKNN")
-    parser.add_argument("--load_weight", type=int, help="Whether load model weight", required=False, default=1)
     parser.add_argument("--model_path", type=str, help="model path or name", required=False, default="google/gemma-4-vision")
     parser.add_argument("--export_vision_path", type=str, help="export vision onnx model path", required=False, default="../../model/vision/Gemma4-vision.onnx")
     parser.add_argument("--modelscope", action='store_true', help="Whether download model from www.modelscope.cn")
@@ -163,6 +149,8 @@ if __name__ == '__main__':
                         help="Path to save RKNN load_onnx json. Default: same dir as gemma4_vision_rknn_load.json")
     parser.add_argument("--pixel_position_ids_path", type=str, required=False, default="gemma4_pos_ids.npy",
                         help="Path to save pixel_position_ids npy. Default: same dir as gemma4_pos_ids_HxW.npy")
+    parser.add_argument("--quant", action='store_true', help="Whether use GRQ quantization")
+    parser.add_argument("--cali_dataset", default='./quant_data/model_inputs.json', help="some samples for grq quantized_algorithm")
     parser.add_argument("--img_h", type=int, help="Input image height. Must be a multiple of 48.", required=False, default=384)
     parser.add_argument("--img_w", type=int, help="Input image width. Must be a multiple of 48.", required=False, default=384)
     
@@ -172,21 +160,76 @@ if __name__ == '__main__':
         from modelscope import snapshot_download
         args.model_path = snapshot_download(args.model_path)
 
-    kwargs = {
-        'trust_remote_code': True,
-        'torch_dtype': torch.float32
-    }
-    config = AutoConfig.from_pretrained(args.model_path, **kwargs)
-    
-    # Py_utils 如果提供更新方法
-    
-    if args.load_weight:
+    fakeq_state = None
+    if args.quant and torch.cuda.is_available():
+        
+        kwargs = {
+            'trust_remote_code': True,
+        }
+        config = AutoConfig.from_pretrained(args.model_path, **kwargs)
         kwargs['config'] = config
         model = AutoModelForCausalLM.from_pretrained(args.model_path, **kwargs)
-    else:
-        kwargs.pop('trust_remote_code', True)
-        model = AutoModelForCausalLM._from_config(config, **kwargs)
+        
+        from rknn.quantization.api import RKQuantizer
 
+        ## 初始化量化工具
+        QuantTool = RKQuantizer(verbose=True)
+        
+        ## 量化工具加载模型
+        ret = QuantTool.load_model(model=model.model.vision_tower, tokenizer=None, device='cuda')
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        
+        ## 执行量化算法
+        dataset = args.cali_dataset
+        model.model.vision_tower = QuantTool.quantize(quantized_dtype="w4a16", quantized_method="group32", quantized_algorithm="grq", dataset=dataset)
+        
+        
+        model = model.cpu()
+        fakeq_state = model.state_dict()
+        del model
+        torch.cuda.empty_cache()
+        
+    # Get the custom module path
+    custom_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../gemma4'))
+    print(f"Custom gemma4 module path: {custom_path}")
+
+    # Load our custom modeling_gemma4 module using importlib
+    import importlib.util
+    modeling_spec = importlib.util.spec_from_file_location(
+        'transformers.models.gemma4.modeling_gemma4',
+        os.path.join(custom_path, 'modeling_gemma4.py')
+    )
+    modeling_module = importlib.util.module_from_spec(modeling_spec)
+    sys.modules['transformers.models.gemma4.modeling_gemma4'] = modeling_module
+    modeling_spec.loader.exec_module(modeling_module)
+    print(f"Loaded custom modeling_gemma4 from: {modeling_module.__file__}")
+
+    
+    import transformers.models.gemma4 as _gemma4_pkg
+    for _name in getattr(modeling_module, '__all__', []):
+        if hasattr(modeling_module, _name):
+            setattr(_gemma4_pkg, _name, getattr(modeling_module, _name))
+    import transformers.models.auto as _auto_pkg
+    for _attr in dir(_auto_pkg):
+        _mapping = getattr(_auto_pkg, _attr, None)
+        if hasattr(_mapping, '_modules') and isinstance(getattr(_mapping, '_modules', None), dict):
+            _mapping._modules.pop('gemma4', None)
+    
+    kwargs = {
+        'trust_remote_code': True,
+        "torch_dtype": torch.float32
+    }
+    config = AutoConfig.from_pretrained(args.model_path, **kwargs)
+    kwargs['config'] = config
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, **kwargs)
+    if fakeq_state is not None:
+        model.load_state_dict(
+                fakeq_state,
+                strict=False
+            )
+    
     export_vision_dirname = os.path.dirname(args.export_vision_path) or '.'
     if not os.path.exists(export_vision_dirname):
         os.makedirs(export_vision_dirname)
@@ -194,6 +237,3 @@ if __name__ == '__main__':
     # 导出 vision model (在Gemma4的架构中，vision module 为 model.model.vision_tower)
     # patch_size 指定为 16
     export_gemma4_vision(model.model.vision_tower, model.model.embed_vision, args, patch_size=16) 
-
-    if not args.load_weight:
-        clear_llm_external_weight_in_dir(export_vision_dirname)

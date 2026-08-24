@@ -194,12 +194,12 @@ python export_code_predictor_rknn.py
 
 ### 4. 导出 talker
 
-导出 ONNX：
+导出 ONNX （quantized_algorithm使用normal，并开启混合量化（比例为0.2））：
 
 ```bash
 cd examples/Qwen3_TTS/python/talker
 
-python export_talker_onnx.py
+python export_talker_onnx.py --quant
 ```
 
 导出 RKNN：
@@ -224,53 +224,6 @@ python export_speech_decoder_onnx.py
 ```bash
 python export_speech_decoder_rknn.py
 ```
-
-
-## 量化数据集准备
-
-当前 talker 量化数据集准备脚本位于：
-
-`examples/Qwen3_TTS/python/talker/prepare_talker_quant_data.py`
-
-脚本输入使用 `jsonl`，每行至少包含：
-
-- `text`
-- `language`
-- `ref_audio`
-
-其中：
-
-- `ref_audio` 支持本地 wav 路径
-- `ref_audio` 也支持 `http/https` 网络 wav
-- `ref_text` 默认按空字符串处理
-- `x_vector_only_mode` 默认按 `True` 处理
-
-示例：
-
-```jsonl
-{"text":"你好，这是一个测试。","language":"auto","ref_audio":"https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"}
-{"text":"Life is beautiful.","language":"english","ref_audio":"./ref_english.wav"}
-```
-
-执行：
-
-```bash
-cd examples/Qwen3_TTS/python/talker
-
-python prepare_talker_quant_data.py \
-    --inputs_jsonl ./input_cases.jsonl \
-    --output_dir ./quant_data
-```
-
-输出内容包括：
-
-- `inputs_embeds_*.npy`
-- `attention_mask_*.npy`
-- `position_ids_*.npy`
-- `num_logits_to_keep_*.npy`
-- `_dataset.txt`
-
-当前逻辑是 **一条条保存** talker 输入，不做拼接缓存。
 
 
 ## 板端部署
@@ -316,20 +269,27 @@ adb shell
 cd /data/rknn_Qwen3_TTS_demo
 
 export LD_LIBRARY_PATH=./lib
-./rknn_qwen3_tts_demo
+./rknn_qwen3_tts_demo <model_dir> <ref_speaker> <output_dir> <text...>
 ```
 
-**注意：** 当前 `cpp/main.cc` 是一个简化 demo，输入内容写死在代码内部，不需要命令行传参。
+**参数说明：**
 
-默认行为是：
+```
+Usage: rknn_qwen3_tts_demo <model_dir> <ref_speaker> <output_dir> <text...>
+```
 
-- `model_dir = "./model"`
-- 文本内容在 `main.cc` 中固定
-- 输出音频写到当前目录下的 `output.wav`
+| 参数           | 说明                                                                 |
+| -------------- | -------------------------------------------------------------------- |
+| `model_dir`    | 模型目录，例如 `./model`，需包含 `code_predictor`、`speech_decoder`、`talker`、`text_projector`、`embeds` 等子目录 |
+| `ref_speaker`  | 通过 export_speaker_embed_hpp.py 转换得到的 speaker_embed 的名称，即所传入的自定义的 speaker_name                          |
+| `output_dir`   | 输出音频目录，输出文件为该目录下的 `output.wav`                      |
+| `text...`      | 待合成的文本内容（可包含多段，从第 4 个参数起拼接）                  |
 
-如果需要自定义文本或模型目录，请直接修改：
+示例：
 
-`examples/Qwen3_TTS/cpp/main.cc`
+```bash
+./rknn_qwen3_tts_demo ./model girl_base ./output "你好，这是一个测试。"
+```
 
 
 ## 补充说明

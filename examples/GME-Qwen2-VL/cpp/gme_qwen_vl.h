@@ -32,7 +32,7 @@ typedef struct {
     rknn3_tensor_mem** internal_mems;
 } rknn_app_context_t;
 
-int init_gme_qwen_vl_model(rknn_app_context_t* app_ctx, const char* vision_model_path, const char* vision_weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t vision_core_mask, uint32_t llm_core_mask);
+int init_gme_qwen_vl_model(rknn_app_context_t* app_ctx, const char* vision_model_path, const char* vision_weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t vision_core_mask, uint32_t llm_core_mask);
 
 int release_gme_qwen_vl_model(rknn_app_context_t* app_ctx);
 

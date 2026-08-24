@@ -263,7 +263,7 @@ static int code_predictor_generate(Qwen3TTSTalkerContext* context, float16* inpu
 
     // code predictor 离线模式：不保留历史kv_cache
     llm_infer_param.keep_history = 0;
-    llm_infer_param.max_new_tokens = CODEC_MAX_CONTEXT_LEN;
+    llm_infer_param.max_new_tokens = CODEC_MAX_NEW_TOKENS;
 
     // Set Input Data
     inputs[0].input_type = RKNN3_LLM_INPUT_EMBED;

@@ -28,7 +28,7 @@ if __name__ == '__main__':
     rknn.config(mean_values=[[0]], std_values=[[1]], target_platform=args.platform,
                 input_attrs={'x': {'dtype': 'float32', 'layout': 'NCHW'}},
                 quantized_dtype='w4a16',
-                quantized_algorithm='grq',
+                quantized_algorithm='normal',
                 quantized_method='group32',
                 core_num=8,
                 )

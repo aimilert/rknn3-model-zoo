@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(rknn_model_zoo_utils)
+project(rknn_model_zoo_utils C CXX)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(fileutils STATIC
     file_utils.c
@@ -70,8 +73,7 @@ add_library(audioutils STATIC
 target_include_directories(audioutils PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${MINIAUDIO_INCLUDES}
-    ${LIBFFTW_INCLUDES}
 )
 target_link_libraries(audioutils
-    ${LIBFFTW}
+    pocketfft
 )

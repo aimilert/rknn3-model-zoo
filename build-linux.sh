@@ -147,6 +147,11 @@ if [ "${TARGET_SOC}" = "x86" ]; then
     DISABLE_RGA=ON
 fi
 
+# 当目标架构为x86_64时，禁用RGA（x86_64无RGA库）
+if [ "${TARGET_ARCH}" = "x86_64" ]; then
+    DISABLE_RGA=ON
+fi
+
 ROOT_PWD=$( cd "$( dirname $0 )" && cd -P "$( dirname "$SOURCE" )" && pwd )
 INSTALL_DIR=${ROOT_PWD}/install/${TARGET_PLATFORM}/${TARGET_SDK}
 BUILD_DIR=${ROOT_PWD}/build/build_${TARGET_SDK}_${TARGET_PLATFORM}_${BUILD_TYPE}

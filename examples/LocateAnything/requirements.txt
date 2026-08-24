@@ -1,0 +1,28 @@
+# LocateAnything-3B RKNN3 导出与推理依赖
+# Python 3.10
+# 安装: pip install -r requirements.txt
+
+# PyTorch (CUDA 12.6)
+torch==2.9.0
+torchvision==0.24.0
+
+# HuggingFace
+transformers==4.57.1
+peft==0.17.1
+
+# 图像处理
+Pillow==11.1.0
+opencv-python-headless==4.11.0.86
+decord==0.6.0
+
+# 数值计算
+numpy==1.25.0
+
+# LMDB 数据集
+lmdb==1.7.5
+
+# ONNX 导出与验证
+onnxruntime==1.23.2
+
+# 进度条
+tqdm==4.67.1

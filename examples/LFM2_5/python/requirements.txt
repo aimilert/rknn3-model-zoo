@@ -1,0 +1,21 @@
+# LFM2.5-1.2B-Instruct export dependencies
+# Versions pinned to the rknn3-toolkit 1.0.5b6 environment.
+# - export_onnx.py:  model -> ONNX (torch.onnx export, opset 19)
+# - export_rknn.py: ONNX -> RKNN, depends on the proprietary "rknn" package
+#   (rknn3-toolkit), not installable via pip; install it separately.
+
+# base
+torch==2.13.0
+transformers==5.13.1
+onnx==1.22.0
+onnxruntime==1.23.2
+numpy==2.2.6
+protobuf==6.33.6
+
+# model loading
+sentencepiece==0.2.2
+safetensors==0.8.0
+
+# optional: model download source (mutually exclusive, see --modelscope / --hf_download)
+modelscope==1.38.1
+huggingface_hub==1.23.0

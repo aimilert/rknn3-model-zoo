@@ -149,6 +149,58 @@ class BasicImageTransform(BaseTransform):
         x = self.transform(x)
         return x
 
+class PaddleVLVisionMLPAR(torch.nn.Module):
+    def __init__(self, vlm, static_image_grid_thw=None):
+        super(PaddleVLVisionMLPAR, self).__init__()
+        self.visual = vlm.visual
+        self.mlp_AR = vlm.mlp_AR
+        self.static_image_grid_thw = static_image_grid_thw
+
+    def forward(
+        self,
+        pixel_values,
+        position_embedding=None,
+        rope_emb=None,
+        image_grid_thw=None,
+        sample_indices=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        interpolate_pos_encoding=False,
+        position_ids=None,
+        cu_seqlens=None,
+        return_pooler_output=False,
+        use_rope=True,
+        window_size=-1,
+        **kwargs,
+    ):
+        if image_grid_thw is None:
+            image_grid_thw = self.static_image_grid_thw
+        kwargs.pop("vision_return_embed_list", None)
+
+        vision_outputs = self.visual(
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            sample_indices=sample_indices,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+            position_ids=position_ids,
+            position_embedding=position_embedding,
+            cu_seqlens=cu_seqlens,
+            vision_return_embed_list=True,
+            return_pooler_output=return_pooler_output,
+            use_rope=use_rope,
+            rope_emb=rope_emb,
+            window_size=window_size,
+            **kwargs,
+        )
+        image_embeds = self.mlp_AR(vision_outputs.last_hidden_state, image_grid_thw)
+        if isinstance(image_embeds, (list, tuple)):
+            if len(image_embeds) == 1:
+                return image_embeds[0]
+            return torch.cat(image_embeds, dim=0)
+        return image_embeds
+
 def export_vision(vlm, args):
     class paddle_vl_vision(torch.nn.Module):
         def __init__(self, vlm):
@@ -232,28 +284,28 @@ def export_vision(vlm, args):
     np.save("../../model/vision/vision_feature.npy", vision_feature.detach().numpy())
     
     dataset_for_mlpar = []
-    if args.quan_dataset:
-        with open(args.dataset, 'r', encoding='utf-8') as f:
-            dataset_list = f.readlines()
-            for i in range(len(dataset_list)):
-                dataset_list[i] = dataset_list[i].strip()
-                dir_path = os.path.dirname(args.dataset)
-                dataset_list[i] = os.path.join(dir_path, dataset_list[i])
-        dataset = make_quantized_dataset(model, dataset_list)
-        data_lines = []
-        os.makedirs("../../data/vision/vision/", exist_ok=True)
-        for i, data in enumerate(dataset):
-            pixel_values_, position_embedding_, rope_emb_, grid_thw_ = data
-            np.save(f"../../data/vision/vision/flatten_{i}.npy", pixel_values_.detach().numpy())
-            np.save(f"../../data/vision/vision/rope_{i}.npy", rope_emb_.detach().numpy())
-            np.save(f"../../data/vision/vision/position_{i}.npy", position_embedding_.detach().numpy())
-            np.save(f"../../data/vision/vision/grid_thw_{i}.npy", grid_thw_.detach().numpy())
-            vision_feature_ = model(pixel_values_, position_embedding_, rope_emb_)
-            np.save(f"../../data/vision/vision/vision_feature_{i}.npy", vision_feature_.detach().numpy())
-            data_lines.append(f"vision/flatten_{i}.npy vision/position_{i}.npy vision/rope_{i}.npy")
-            dataset_for_mlpar.append((grid_thw_, vision_feature_))
-        with open("../../data/vision/datasets_vision.txt", 'w', encoding='utf-8') as f:
-            f.write('\n'.join(data_lines))
+    # if args.quan_dataset:
+    #     with open(args.dataset, 'r', encoding='utf-8') as f:
+    #         dataset_list = f.readlines()
+    #         for i in range(len(dataset_list)):
+    #             dataset_list[i] = dataset_list[i].strip()
+    #             dir_path = os.path.dirname(args.dataset)
+    #             dataset_list[i] = os.path.join(dir_path, dataset_list[i])
+    #     dataset = make_quantized_dataset(model, dataset_list)
+    #     data_lines = []
+    #     os.makedirs("../../data/vision/vision/", exist_ok=True)
+    #     for i, data in enumerate(dataset):
+    #         pixel_values_, position_embedding_, rope_emb_, grid_thw_ = data
+    #         np.save(f"../../data/vision/vision/flatten_{i}.npy", pixel_values_.detach().numpy())
+    #         np.save(f"../../data/vision/vision/rope_{i}.npy", rope_emb_.detach().numpy())
+    #         np.save(f"../../data/vision/vision/position_{i}.npy", position_embedding_.detach().numpy())
+    #         np.save(f"../../data/vision/vision/grid_thw_{i}.npy", grid_thw_.detach().numpy())
+    #         vision_feature_ = model(pixel_values_, position_embedding_, rope_emb_)
+    #         np.save(f"../../data/vision/vision/vision_feature_{i}.npy", vision_feature_.detach().numpy())
+    #         data_lines.append(f"vision/flatten_{i}.npy vision/position_{i}.npy vision/rope_{i}.npy")
+    #         dataset_for_mlpar.append((grid_thw_, vision_feature_))
+    #     with open("../../data/vision/datasets_vision.txt", 'w', encoding='utf-8') as f:
+    #         f.write('\n'.join(data_lines))
 
     torch.onnx.export(model,
                      (pixel_values, position_embedding, rope_emb),
@@ -318,17 +370,17 @@ def export_mlp_AR(vlm, image_embeds, grid_thw, dataset, args):
     print("mlp_AR output: ", vision_embed.shape)
     np.save("../../model/vision/vision_embed.npy", vision_embed.detach().numpy())
     
-    if args.quan_dataset:
-        quantized_dataset = make_quantized_dataset(dataset)
-        data_lines = []
-        os.makedirs("../../data/vision/mlpar/", exist_ok=True)
-        for i, image_feature_ in enumerate(quantized_dataset):
-            np.save(f"../../data/vision/mlpar/mlp_input_{i}.npy", image_feature_.detach().numpy())
-            vision_embed_ = model(image_feature_)
-            np.save(f"../../data/vision/mlpar/vision_embed_{i}.npy", vision_embed_.detach().numpy())
-            data_lines.append(f"mlpar/mlp_input_{i}.npy")
-        with open("../../data/vision/datasets_mlpar.txt", 'w', encoding='utf-8') as f:
-            f.write('\n'.join(data_lines))
+    # if args.quan_dataset:
+    #     quantized_dataset = make_quantized_dataset(dataset)
+    #     data_lines = []
+    #     os.makedirs("../../data/vision/mlpar/", exist_ok=True)
+    #     for i, image_feature_ in enumerate(quantized_dataset):
+    #         np.save(f"../../data/vision/mlpar/mlp_input_{i}.npy", image_feature_.detach().numpy())
+    #         vision_embed_ = model(image_feature_)
+    #         np.save(f"../../data/vision/mlpar/vision_embed_{i}.npy", vision_embed_.detach().numpy())
+    #         data_lines.append(f"mlpar/mlp_input_{i}.npy")
+    #     with open("../../data/vision/datasets_mlpar.txt", 'w', encoding='utf-8') as f:
+    #         f.write('\n'.join(data_lines))
     
     torch.onnx.export(model,
                      (image_feature,),
@@ -346,12 +398,12 @@ if __name__ == '__main__':
     from argparse import ArgumentParser
 
     parser = ArgumentParser(description="Export paddle-vl vision configuration and onnx model for RKNN")
-    parser.add_argument("--load_weight", type=int, help="Whether load model weight", required=False, default=True)
-    parser.add_argument("--model_path", type=str, help="model path or name", required=False, default="PaddleOCR-VL/PaddleOCR-VL-0.9B/")
+    parser.add_argument("--model_path", type=str, help="model path or name", required=False, default="PaddlePaddle/PaddleOCR-VL")
     parser.add_argument("--export_vision_path", type=str, help="export vision onnx model path", required=False, default="../../model/vision/PaddleOCR-vision.onnx")
     parser.add_argument("--export_mlp_AR_path", type=str, help="export vision onnx model path", required=False, default="../../model/vision/PaddleOCR-vision-mlp_AR.onnx")
     parser.add_argument("--dataset", type=str, help="model quantization dataset list", required=False, default="../../../../datasets/OmniDocBench_ROI/vision/datasets.txt")
-    parser.add_argument("--quan_dataset", action="store_true", help="whether generate quantization dataset")
+    parser.add_argument("--quant", action='store_true', help="Whether use AWQ and GRQ quantization")
+    parser.add_argument("--cali_dataset", default='../../../../datasets/OmniDocBench_ROI/vision/model_inputs.json', help="some samples for grq quantized_algorithm")
     parser.add_argument("--img_h", type=int, help="Input image size (e.g., 224, 392, 448). Must be a multiple of 28.", required=False, default=504)
     parser.add_argument("--img_w", type=int, help="Input image size (e.g., 224, 392, 448). Must be a multiple of 28.", required=False, default=504)
     args = parser.parse_args()
@@ -361,14 +413,32 @@ if __name__ == '__main__':
     }
     config = AutoConfig.from_pretrained(args.model_path, **kwargs)
     update_config(config, ['use_cache'], False)
-    if args.load_weight:
-        # kwargs['config'] = config
-        model = PaddleOCRVLForConditionalGeneration.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.float32)
-        model = model.eval()
-    else:
-        kwargs.pop('trust_remote_code', True)
-        model = PaddleOCRVLForConditionalGeneration._from_config(config, **kwargs)
+    # kwargs['config'] = config
+    model = PaddleOCRVLForConditionalGeneration.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.float32)
+    model = model.eval()
+        
+    if args.quant and torch.cuda.is_available():
+        from rknn.quantization.api import RKQuantizer
 
+
+        ## 初始化量化工具
+        QuantTool = RKQuantizer(verbose=True)
+
+        combined_vision_mlp_AR = PaddleVLVisionMLPAR(model)
+        ## 量化工具加载模型
+        ret = QuantTool.load_model(model=combined_vision_mlp_AR, tokenizer=None, device='cuda')
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        
+        ## 执行量化算法
+        dataset = args.cali_dataset
+        combined_vision_mlp_AR = QuantTool.quantize(quantized_dtype="w4a16", quantized_method="group32", quantized_algorithm="grq", dataset=dataset)
+        model.visual = combined_vision_mlp_AR.visual
+        model.mlp_AR = combined_vision_mlp_AR.mlp_AR
+
+        model = model.cpu()
+        
     export_vision_dirname = os.path.dirname(args.export_vision_path)
     if not os.path.exists(export_vision_dirname):
             os.makedirs(export_vision_dirname)
@@ -377,6 +447,3 @@ if __name__ == '__main__':
     image_embeds, thw, dataset = export_vision(model, args) # 添加grid_thw对输入图片的patch
 
     export_mlp_AR(model, image_embeds, thw, dataset, args)
-
-    if not args.load_weight:
-        clear_llm_external_weight_in_dir(export_vision_dirname)

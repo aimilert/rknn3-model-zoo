@@ -185,9 +185,9 @@ void printf_perf(rknn_perf_metrics_t *p)
 -------------------------------------------*/
 int main(int argc, char **argv)
 {
-    if (argc != 13 && argc != 14)
+    if (argc != 15 && argc != 16)
     {
-        printf("%s <vision_model_path> <vision_weight_path> <llm_model_path> <llm_weight_path> <tokenizer_path> <embedding_path> <vision_core_mask> <llm_core_mask> <image_path> <prompt> <model_width> <model_height> [llm_lora_weight_path]\n", argv[0]);
+        printf("%s <vision_model_path> <vision_weight_path> <llm_model_path> <llm_weight_path> <tokenizer_path> <embedding_path> <vision_core_mask> <llm_core_mask> <image_path> <prompt> <model_width> <model_height> <max_context_len1> <max_context_len2> [llm_lora_weight_path]\n", argv[0]);
         return -1;
     }
 
@@ -204,12 +204,18 @@ int main(int argc, char **argv)
     const char *prompt             = argv[10];
     uint32_t    model_width        = strtoul(argv[11], nullptr, 0);
     uint32_t    model_height       = strtoul(argv[12], nullptr, 0);
+    int         max_context_len1   = strtol(argv[13], nullptr, 0);
+    int         max_context_len2   = strtol(argv[14], nullptr, 0);
     if (model_width == 0 || model_height == 0) {
         printf("model_width and model_height are required and must be non-zero.\n");
         return -1;
     }
-    if (argc == 14) {
-        llm_lora_weight_path = argv[13];
+    if (max_context_len1 <= 0 || max_context_len2 <= 0) {
+        printf("max_context_len1 and max_context_len2 are required and must be > 0.\n");
+        return -1;
+    }
+    if (argc == 16) {
+        llm_lora_weight_path = argv[15];
     }
     std::string prompt_with_image;
 
@@ -290,7 +296,7 @@ int main(int argc, char **argv)
 
     // Set LLM parameters
     params.logits_name               = "logits";
-    params.max_context_len           = MAX_CONTEXT_LEN;
+    params.max_context_len           = max_context_len1;
     // params.max_new_tokens            = MAX_NEW_TOKENS;
     params.sampling_param            = SAMPLE_PARAMS;
     params.vocab_info.vocab_size     = vocab_info.vocab_size;
@@ -308,7 +314,7 @@ int main(int argc, char **argv)
     callback.embed_callback     = embed_callback;
     callback.embed_userdata     = &embedding_info;
 
-    ret = init_qwen3_vl_model(&rknn_app_ctx, llm_model_path, llm_weight_path, vision_model_path, vision_weight_path, &params, n_params, callback, vision_core_mask, llm_core_mask, llm_lora_weight_path);
+    ret = init_qwen3_vl_model(&rknn_app_ctx, llm_model_path, llm_weight_path, vision_model_path, vision_weight_path, &params, n_params, callback, vision_core_mask, llm_core_mask, max_context_len1, max_context_len2, llm_lora_weight_path);
     if (ret != 0)
     {
         printf("init_qwen3_vl_model fail! ret=%d llm_model_path=%s vision_model_path=%s\n", ret, llm_model_path, vision_model_path);

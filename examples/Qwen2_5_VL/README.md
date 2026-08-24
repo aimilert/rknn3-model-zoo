@@ -37,18 +37,22 @@ python export_llm.py \
 python export_rknn.py \
     --onnx_path ../../model/llm/Qwen2.5-VL-7B-llm.onnx \
     --config ../../model/llm/Qwen2.5-VL-7B-llm.config.pkl \
-    --rknn_path ../../model/llm/Qwen2.5-VL-7B-llm.rknn
+    --rknn_path ../../model/llm/Qwen2.5-VL-7B-llm.rknn \
+    --platform rk1820
 
 # 导出 Vision ONNX 模型
 python export_vision.py \
     --model_path Qwen/Qwen2.5-VL-7B-Instruct \
     --export_vision_path ../../model/vision/Qwen2.5-VL-7B-vision.onnx \
-    --modelscope
+    --modelscope \
+    --img_h 392 \
+    --img_w 392
 
 # 导出 Vision RKNN 模型
 python export_rknn.py \
     --onnx_path ../../model/vision/Qwen2.5-VL-7B-vision.onnx \
-    --rknn_path ../../model/vision/Qwen2.5-VL-7B-vision.rknn
+    --rknn_path ../../model/vision/Qwen2.5-VL-7B-vision.rknn \
+    --platform rk1820
 ```
 
 ## 3. KV Cache INT4 量化
@@ -61,17 +65,28 @@ Cache 的存储带宽与内存访问开销，可以采用量化方式将其从 F
 Int8_to_F16（默认）：以 INT8 格式存储，计算时转换回 FP16；
 Int4_to_F16（适用于更长上下文场景,有一定精度损失）：以 INT4 格式存储，计算时转换回 FP16。
 若需支持更长的上下文长度并进一步压缩 KV Cache 内存，建议启用 Int4_to_F16 模式。
-启用 Int4_to_F16 的 RKNN 模型转换配置如下：
+
+> ⚠️ **注意**：当前 `python/llm/export_rknn.py` 的 `rknn.config()` 仅配置了 MRoPE 相关参数
+> （`mrope_type`、`mrope_section`、`mrope_new_id_name`），并未启用 KV Cache 量化。实际配置如下：
+
 ```python
-rknn.config(target_platform='rk1820', 
-          quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',
-          max_ctx_len           =2048,
-          max_position_embeddings=2048,
-          kvcache_store_method='GroupQuant', kvcache_dtype='Int4_to_F16', 
-          kvcache_group_size=16, kvcache_residual_depth=64,
-          )
+llm_config = DEFAULT_RKNN_LLM_CONFIG.copy()
+llm_config['attention_config'][0]['mrope_type'] = 'Qwen2.5-VL'
+llm_config['attention_config'][0]['mrope_section'] = [16, 24, 24]
+llm_config['attention_config'][0]['mrope_new_id_name'] = 'mrope_id_input'
+
+rknn.config(target_platform=args.platform,
+            quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',
+            llm_config=llm_config)
 ```
-- 注意：上述配置位于 python/llm/export_rknn.py 文件中，请根据实际需求调整相关参数。
+
+若需启用 Int4_to_F16 以支持更长上下文，可在 `llm_config['attention_config'][0]` 中增加：
+
+```python
+llm_config['attention_config'][0]['kvcache_dtype'] = 'Int4_to_F16'
+```
+
+修改后需重新执行 RKNN 转换。
 
 
 ## 4. Vision 模型分辨率调整

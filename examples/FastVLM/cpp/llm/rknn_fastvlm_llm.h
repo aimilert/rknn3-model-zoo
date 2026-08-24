@@ -33,7 +33,7 @@ typedef struct {
 
 } rknn_fastvlm_llm_context;
 
-int init_fastvlm_llm(rknn_fastvlm_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t core_mask);
+int init_fastvlm_llm(rknn_fastvlm_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t core_mask);
 
 int release_fastvlm_llm(rknn_fastvlm_llm_context* llm_ctx);
 

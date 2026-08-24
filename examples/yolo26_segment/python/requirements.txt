@@ -1,0 +1,19 @@
+# Core dependencies for YOLO26 ONNX export and RKNN conversion
+# Python 3.10+
+
+numpy==1.26.4
+Pillow==12.2.0
+onnx==1.18.0
+onnxruntime==1.23.2
+onnxsim==0.6.5
+ultralytics==8.4.69
+
+# RKNN3 Toolkit (非 PyPI 包，需手动从 Rockchip 官方获取 whl 安装)
+# rknn3-toolkit==1.0.5b2
+
+# Optional but recommended
+opencv-python==4.11.0.86
+pycocotools==2.0.11
+requests==2.34.2
+tqdm==4.68.2
+pyyaml==6.0.3

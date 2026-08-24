@@ -4,7 +4,7 @@ from rknn.api import RKNN, DEFAULT_RKNN_LLM_CONFIG
 ONNX_MODEL = '../../model/llm/Qwen2.5-VL-3B-llm.onnx'
 LLM_CONFIG = '../../model/llm/Qwen2.5-VL-3B-llm.config.pkl'
 RKNN_MODEL = '../../model/llm/Qwen2.5-VL-3B-llm.rknn'
-DATASET_PATH = '../../data/llm/dataset.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 
@@ -31,7 +31,7 @@ if __name__ == '__main__':
     # pre-process config
     print('--> config model')
     rknn.config(target_platform=args.platform, 
-                quantized_dtype='w4a16', quantized_algorithm='grq', quantized_method='group32',llm_config=llm_config
+                quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32',llm_config=llm_config
                 )
     print('done')
 

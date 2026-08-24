@@ -35,7 +35,7 @@ typedef struct {
 
 int load_gme_qwen_vl_llm_model(rknn_gme_qwen_vl_llm_context* llm_ctx, const char* model_path, const char* weight_path, uint32_t core_mask);
 
-int init_gme_qwen_vl_llm_session(rknn_gme_qwen_vl_llm_context* llm_ctx, rknn3_llm_param* params, int n_params, RKLLMCallback callback);
+int init_gme_qwen_vl_llm_session(rknn_gme_qwen_vl_llm_context* llm_ctx, rknn3_llm_param* params, int n_params, RKLLMCallback& callback);
 
 int inference_gme_qwen_vl_llm(rknn_gme_qwen_vl_llm_context* llm_ctx, rknn3_llm_multimodal_tensor tensor, int n_inputs, rknn_perf_metrics_t* perf);
 

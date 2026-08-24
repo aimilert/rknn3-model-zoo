@@ -18,7 +18,7 @@ python环境参考 `requirements.txt`
 
 ### 2.3 完整模型模式（无裁剪）
 
-RK1828 等内存较大的设备可直接使用完整模型，导出时添加 `--no_prune_mode` 参数：
+RK1828 等内存较大的设备可直接使用完整模型。Vision 模型导出时添加 `--no_prune_mode` 参数即可关闭裁剪：
 
 ```bash
 python export_rknn.py --no_prune_mode
@@ -55,26 +55,40 @@ python export_llm.py \
     --export_llm_path Qwen3-VL-4B-llm.onnx \
     --modelscope
 
-# 导出 RKNN 模型
+# 导出 RKNN 模型（不含 LoRA）
 python export_rknn.py \
     --onnx_path Qwen3-VL-4B-llm.onnx \
     --config Qwen3-VL-4B-llm.config.pkl \
     --rknn_path Qwen3-VL-4B-llm.rknn
+
+# 导出 RKNN 模型（含 LoRA）
+python export_rknn.py \
+    --onnx_path Qwen3-VL-4B-llm.onnx \
+    --config Qwen3-VL-4B-llm.config.pkl \
+    --rknn_path Qwen3-VL-4B-llm-lora.rknn \
+    --lora_path /path/to/lora/adapter_model.safetensors \
+    --lora_config_path /path/to/lora/adapter_config.json
 ```
+
+> ⚠️ **注意**：
+> - LoRA 权重（如 `adapter_model.safetensors`）**无需**单独转换为 ONNX 模型，只需在 `export_rknn.py` 中通过 `--lora_path` 传入权重路径、`--lora_config_path` 传入配置文件路径，脚本内部会调用 `rknn.load_lora()` 直接加载 `.safetensors` 文件，无需中间格式转换。
+> - 导出含 LoRA 的 RKNN 模型时，除 `.rknn` 文件外还会额外生成一个 `.lora_weight` 文件。C++ 推理时需同时提供这两个文件（`.rknn` 作为模型路径，`.lora_weight` 作为 LoRA 权重路径）。
+> - 导出时需确保 `--lora_path` 指向正确的 LoRA 权重文件（如 `.safetensors`），`--lora_config_path` 指向对应的配置文件（如 `adapter_config.json`）。
+> - 如果模型结构和量化参数未变，仅需重新导出 `.rknn` 文件，可使用 `--rebuild` 快速重建。重建依赖上次 `build` 阶段在 `./tmp` 目录下生成的中间产物。
 
 ## 4. Vision 模型分辨率调整
 
 可通过 `--img_h` 和 `--img_w` 参数调整输入分辨率（必须为 32 的倍数）：
 
 ```bash
-# 导出 Vision ONNX 模型
+# 导出 Vision ONNX 模型（分辨率通过 --img_h/--img_w 指定）
 python export_vision.py \
     --model_path Qwen/Qwen3-VL-4B-Instruct \
     --export_vision_path Qwen3-VL-4B-vision.onnx \
     --img_h 384 --img_w 384 \
     --modelscope
 
-# 导出 Vision RKNN 模型
+# 导出 Vision RKNN 模型（分辨率从 vision_config.json 自动读取）
 python export_rknn.py \
     --onnx_path Qwen3-VL-4B-vision.onnx \
     --rknn_path Qwen3-VL-4B-vision.rknn
@@ -83,6 +97,7 @@ python export_rknn.py \
 > ⚠️ **注意**：
 > - 分辨率越大，内存占用越高，会影响 LLM 的最大上下文长度
 > - 部分分辨率可能与 RKNN 推理框架不兼容，如遇报错请联系 RKNPU 团队
+> - Vision RKNN 导出时分辨率由 `vision_config.json` 控制，无需再次传入 `--img_h`/`--img_w`
 
 ## 5. C++ 部署说明
 
@@ -107,21 +122,30 @@ C++ 推理代码已实现模型格式自动识别，无需修改代码即可兼�
 ```text
 ./rknn_qwen3_vl_demo <vision_model_path> <vision_weight_path> <llm_model_path> <llm_weight_path> \
     <tokenizer_path> <embedding_path> <vision_core_mask> <llm_core_mask> <image_path> <prompt> \
-    <model_width> <model_height> [llm_lora_weight_path]
+    <model_width> <model_height> <max_context_len1> <max_context_len2> [llm_lora_weight_path]
 ```
 
 | 参数个数 | 含义 |
 |----------|------|
-| **13**   | 必选 12 个参数（含 `model_width`、`model_height`），与 Vision 导出分辨率一致。 |
-| **14**   | 在 13 参数基础上增加 `llm_lora_weight_path`，用于 LoRA 权重路径。 |
+| **15**   | 必选 14 个参数（含 `model_width`、`model_height`、`max_context_len1`、`max_context_len2`）。 |
+| **16**   | 在 15 参数基础上增加 `llm_lora_weight_path`，用于 LoRA 权重路径。 |
 
-**示例（13 参数，分辨率需与导出 Vision 时一致，如 384×384）**：
+新增上下文长度参数说明：
+
+| 参数 | 说明 |
+|------|------|
+| `max_context_len1` | **Base session** 的最大上下文长度（`session_base params.max_context_len`）。 |
+| `max_context_len2` | **LoRA session** 的最大上下文长度（`session_lora params.max_context_len`）。 |
+
+> 两个参数均为必填，且必须大于 0。可根据设备内存情况分别设置，例如 Base 设为 2048、LoRA 设为 3072。
+
+**示例（15 参数，分辨率需与导出 Vision 时一致，如 384×384）**：
 
 ```bash
-./rknn_qwen3_vl_demo ... 384 384
+./rknn_qwen3_vl_demo ... 384 384 2048 3072
 ```
 
-**同时对比 Base 与 LoRA（14 参数，传入 LoRA 权重）**：
+**同时对比 Base 与 LoRA（16 参数，传入 LoRA 权重）**：
 
 ```bash
 ./rknn_qwen3_vl_demo \
@@ -131,6 +155,7 @@ C++ 推理代码已实现模型格式自动识别，无需修改代码即可兼�
     0x3 0x3 \
     ./model/demo.jpg "描述这张图片" \
     384 384 \
+    2048 3072 \
     ./model/llm_lora.weight
 ```
 

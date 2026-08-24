@@ -22,15 +22,40 @@ onnxruntime >= 1.23.2
 
 ### 2.2 LLM 模型裁剪
 
-将 LLM Head 独立出来，在主控设备上单独运行，从而减少协处理器的内存占用。（可选）
+将 LM Head 独立出来在主控设备上单独运行以减少协处理器内存占用，此为可选模式且**默认关闭**，导出时添加 `--prune_mode` 参数即可开启：
+
+```bash
+python export_rknn.py --prune_mode --platform rk1820
+```
 
 ### 2.3 完整模型模式（无裁剪）
 
-RK1828 等内存较大的设备可直接使用完整模型，导出时添加 `--no_prune_mode` 参数：
+默认即为完整模型模式，无需额外参数。RK1828 等内存较大的设备可直接使用：
 
 ```bash
-python export_rknn.py --no_prune_mode
+python export_rknn.py --platform rk1820
 ```
+
+### 2.4 KVCache 量化
+
+如需进一步降低内存占用，可开启 KVCache INT 量化（将 KVCache 从 F16 量化为 Int4）。在 `export_rknn.py` 中取消以下行的注释即可：
+
+```python
+llm_config['attention_config'][0]['kvcache_dtype'] = 'Int4_to_F16'
+```
+
+修改后需重新导出 RKNN 模型。若仅修改了 kvcache 相关参数，可使用 `--rebuild` 跳过 ONNX 加载步骤加速导出：
+
+```bash
+python export_rknn.py \
+    --onnx_path Qwen3-VL-2B-llm.onnx \
+    --config Qwen3-VL-2B-llm.config.pkl \
+    --rknn_path Qwen3-VL-2B-llm.rknn \
+    --platform rk1820 \
+    --rebuild
+```
+
+> ⚠️ 开启 KVCache 量化后精度可能有所下降，请根据实际效果决定是否启用。
 
 ## 3. 支持的模型
 
@@ -39,8 +64,11 @@ python export_rknn.py --no_prune_mode
 以 **Qwen3-VL-4B** 为例：
 
 ```bash
+# 生成 LLM 模型量化校准数据
+python make_calidata.py --model_path Qwen/Qwen3-VL-4B-Instruct
+
 # 导出 ONNX 模型
-python export_llm.py \
+python export_llm.py --quant\
     --model_path Qwen/Qwen3-VL-4B-Instruct \
     --export_llm_path Qwen3-VL-4B-llm.onnx \
     --modelscope
@@ -49,16 +77,40 @@ python export_llm.py \
 python export_rknn.py \
     --onnx_path Qwen3-VL-4B-llm.onnx \
     --config Qwen3-VL-4B-llm.config.pkl \
-    --rknn_path Qwen3-VL-4B-llm.rknn
+    --rknn_path Qwen3-VL-4B-llm.rknn \
+    --platform rk1820
+
+# 如需重新导出（仅修改 profile_mode 或 kvcache 相关参数），可使用 --rebuild 跳过 ONNX 加载和图优化等步骤，加速模型导出：
+python export_rknn.py \
+    --onnx_path Qwen3-VL-4B-llm.onnx \
+    --config Qwen3-VL-4B-llm.config.pkl \
+    --rknn_path Qwen3-VL-4B-llm.rknn \
+    --platform rk1820 \
+    --rebuild
 ```
+
+> ⚠️ **`--rebuild` 说明**：当前仅支持重置 `profile_mode` 和 `llm_config` 中 kvcache 相关参数（如 `kvcache_buffer_len`、`max_position_embeddings`、`kvcache_dtype` 等）。其他参数变更需走完整导出流程。
+
+`make_calidata.py` 参数说明：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--model_path` | HuggingFace 模型路径或名称 | `Qwen/Qwen3-VL-2B-Instruct` |
+| `--datapath` | 校准数据集 JSON 路径（含图片路径和文本输入） | `../../../../datasets/MMBench/llm/dataset.json` |
+| `--export_datapath` | 生成的量化校准数据输出路径 | `./quant_data/model_inputs.json` |
+
+> ⚠️ `make_calidata.py` 会加载完整模型并捕获模块输入，需要较大内存。生成的校准数据用于 `export_llm.py --quant` 时的 GRQ 量化。
 
 ## 4. Vision 模型分辨率调整
 
 可通过 `--img_h` 和 `--img_w` 参数调整输入分辨率（必须为 32 的倍数）：
 
 ```bash
+# 生成 Vision 模型量化校准数据
+python make_calidata.py --model_path Qwen/Qwen3-VL-4B-Instruct
+
 # 导出 Vision ONNX 模型
-python export_vision.py \
+python export_vision.py --quant \
     --model_path Qwen/Qwen3-VL-4B-Instruct \
     --export_vision_path Qwen3-VL-4B-vision.onnx \
     --img_h 384 --img_w 384 \
@@ -67,14 +119,41 @@ python export_vision.py \
 # 导出 Vision RKNN 模型
 python export_rknn.py \
     --onnx_path Qwen3-VL-4B-vision.onnx \
-    --rknn_path Qwen3-VL-4B-vision.rknn
+    --rknn_path Qwen3-VL-4B-vision.rknn \
+    --platform rk1820
 ```
 
 > ⚠️ **注意**：
 > - 分辨率越大，内存占用越高，会影响 LLM 的最大上下文长度
 > - 部分分辨率可能与 RKNN 推理框架不兼容，如遇报错请联系 RKNPU 团队
 
+`make_calidata.py` 参数说明：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--model_path` | HuggingFace 模型路径或名称 | `Qwen/Qwen3-VL-2B-Instruct` |
+| `--datapath` | 校准数据集 JSON 路径（含图片路径和文本输入） | `../../../../datasets/MMBench/llm/dataset.json` |
+| `--export_datapath` | 生成的量化校准数据输出路径 | `./quant_data/model_inputs.json` |
+
+> ⚠️ `make_calidata.py` 会加载完整模型并捕获模块输入，需要较大内存。生成的校准数据用于 `export_vision.py --quant` 时的 GRQ 量化。
+
 ## 5. C++ 部署说明
+
+### 5.1 编译
+
+```bash
+cd rknn3_model_zoo/
+
+# 设置交叉编译工具链
+export GCC_COMPILER=/path/to/aarch64-linux-gnu
+
+# 编译
+./build-linux.sh -t rk3588 -a aarch64 -d Qwen3_VL
+```
+
+编译完成后，文件生成在 `install/rk3588_linux_aarch64/rknn_Qwen3_VL_demo/` 目录。
+
+### 5.2 运行
 
 C++ 推理代码已实现模型格式自动识别，无需修改代码即可兼容裁剪版与完整版模型。
 

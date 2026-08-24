@@ -127,7 +127,7 @@ int init_internal_share(rknn_app_context_t* app_ctx, uint32_t core_mask_vision, 
             internal_mems_llm[i] = internal_mems_vision[llm_to_vision[i]];
             continue;
         }
-        internal_mems_llm[i] = rknn3_create_mem(app_ctx->llm.rknn_ctx, core_mem_sizes_llm[i].internal_size, core_mem_sizes_llm[i].core_id, RKNN3_FLAG_MEMORY_CACHEABLE); 
+        internal_mems_llm[i] = rknn3_create_mem(app_ctx->vision.rknn_ctx, core_mem_sizes_llm[i].internal_size, core_mem_sizes_llm[i].core_id, RKNN3_FLAG_MEMORY_CACHEABLE); 
         if (!internal_mems_llm[i]) {
             return -1;
         }
@@ -161,7 +161,7 @@ int release_internal_share(rknn_app_context_t* app_ctx)
     if (app_ctx->internal_mems) {
         for (int i = 0; i < app_ctx->n_internal_mems; i++) {
             if (app_ctx->internal_mems[i]) {
-                rknn3_destroy_mem(app_ctx->llm.rknn_ctx, app_ctx->internal_mems[i]);
+                rknn3_destroy_mem(app_ctx->vision.rknn_ctx, app_ctx->internal_mems[i]);
                 app_ctx->internal_mems[i] = NULL;
             }
         }
@@ -177,7 +177,7 @@ int init_paddleocr_vl_model(rknn_app_context_t* app_ctx,
     const char* llm_model_path, const char* llm_weight_path, 
     const char* vision_model_path, const char* vision_weight_path, const char* position_embedding_path, 
     const char* mlpar_model_path, const char* mlpar_weight_path, 
-    rknn3_llm_param* params, int n_params, RKLLMCallback callback, 
+    rknn3_llm_param* params, int n_params, RKLLMCallback& callback, 
     uint32_t vision_core_mask, uint32_t mlpar_core_mask, uint32_t llm_core_mask)
 {
     int ret = 0;
@@ -198,13 +198,13 @@ int init_paddleocr_vl_model(rknn_app_context_t* app_ctx,
         return ret;
     }
 
-    printf("--> init internal share\n");
-    ret = init_internal_share(app_ctx, vision_core_mask, llm_core_mask);
-    if (ret < 0)
-    {
-        printf("paddleocr_vl llm/vision internal memeory share fail! ret=%d\n", ret);
-        return ret;
-    }
+    // printf("--> init internal share\n");
+    // ret = init_internal_share(app_ctx, vision_core_mask, llm_core_mask);
+    // if (ret < 0)
+    // {
+    //     printf("paddleocr_vl llm/vision internal memeory share fail! ret=%d\n", ret);
+    //     return ret;
+    // }
 
     printf(" --> init paddleocr_vl mlpar model\n");
     ret = init_paddleocr_vl_mlpar(&(app_ctx->mlpar), mlpar_model_path, mlpar_weight_path, mlpar_core_mask);

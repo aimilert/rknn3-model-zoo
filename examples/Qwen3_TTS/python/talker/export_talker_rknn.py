@@ -6,7 +6,7 @@ LLM_CONFIG = '../../models/talker/talker.config.pkl'
 RKNN_MODEL = '../../models/talker/talker.rknn'
 TARGET_PLATFORM = 'rk1820'
 DO_QUANT = True
-DATASET_PATH = "./quant_data/_dataset.txt"
+DATASET_PATH = None
 
 if __name__ == '__main__':
 
@@ -41,10 +41,11 @@ if __name__ == '__main__':
     rknn.config(target_platform=args.platform, 
                 llm_config=llm_config, 
                 quantized_dtype='w4a16', 
-                quantized_algorithm='grq', 
+                quantized_algorithm='normal', 
                 quantized_method='group32',
                 core_num=8,
                 dynamic_input=dynamic_input,
+                linear_attn_out_project_dtype=None, op_quantized_dtype='./layer_bit.json'
                 )
     print('done')
 

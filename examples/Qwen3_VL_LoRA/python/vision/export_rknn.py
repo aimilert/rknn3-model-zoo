@@ -6,7 +6,7 @@ from py_utils.tools import gen_qwen_vl_vision_prune_quantize_dataset
 
 ONNX_MODEL = 'Qwen3-VL-2B-vision.onnx'
 RKNN_MODEL = 'Qwen3-VL-2B-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
+DATASET_PATH = None
 
 def load_config(config_path: str):
     import json
@@ -36,6 +36,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_path", type=str, help="model quantization dataset path", required=False, default=DATASET_PATH)
     parser.add_argument("--no_prune_mode", dest="prune_mode", action="store_false", help="close prune mode")
     parser.set_defaults(prune_mode=True)
+    parser.add_argument('--rebuild', action='store_true', required=False, default=False, help='Whether to rebuild the model')
     args = parser.parse_args()
 
     # Create RKNN object
@@ -54,35 +55,46 @@ if __name__ == '__main__':
                     )
     print('done')
 
-    # Load model
-    print('--> Loading model')
-    if args.prune_mode == True:
-        ret = rknn.load_onnx(model=args.onnx_path,
-                         inputs=['/Reshape_1_output_0', 'grid_thw'], #裁剪版
-                         input_size_list = [[int(grid_thw[0][1] * grid_thw[0][2]),1536],[1,3]],
-                         input_initial_val=[None, grid_thw])
+    if args.rebuild:
+        print('--> Rebuilding model')
+        ret = rknn.rebuild("./tmp")
+        if ret != 0:
+            print('Rebuild rknn model failed!')
+            exit(ret)
+        print('done')
     else:
-        ret = rknn.load_onnx(model=args.onnx_path,
-                         inputs=['pixel', 'grid_thw'], #完整版
-                         input_size_list = [[1,3,img_h,img_w],[1,3]],
-                         input_initial_val=[None, grid_thw])
-    if ret != 0:
-        print('Load model failed!')
-        exit(ret)
-    print('done')
+        # Load model
+        print('--> Loading model')
+        if args.prune_mode == True:
+            ret = rknn.load_onnx(model=args.onnx_path,
+                             inputs=['/Reshape_1_output_0', 'grid_thw'], #裁剪版
+                             input_size_list = [[int(grid_thw[0][1] * grid_thw[0][2]),1536],[1,3]],
+                             input_initial_val=[None, grid_thw])
+        else:
+            ret = rknn.load_onnx(model=args.onnx_path,
+                             inputs=['pixel', 'grid_thw'], #完整版
+                             input_size_list = [[1,3,img_h,img_w],[1,3]],
+                             input_initial_val=[None, grid_thw])
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+        print('done')
 
-    if args.prune_mode == True: 
-       ret =  gen_qwen_vl_vision_prune_quantize_dataset(args.dataset_path, "../../data/vision/datasets_npy.txt", img_h, img_w, [0.5 * 255, 0.5 * 255, 0.5 * 255], [0.5 * 255, 0.5 * 255, 0.5 * 255], 16)
-       if ret == 0:
-           args.dataset_path = "../../data/vision/datasets_npy.txt"
+        if args.prune_mode == True:
+            if args.dataset_path is not None:
+                ret = gen_qwen_vl_vision_prune_quantize_dataset(args.dataset_path, "../../data/vision/datasets_npy.txt", img_h, img_w, [0.5 * 255, 0.5 * 255, 0.5 * 255], [0.5 * 255, 0.5 * 255, 0.5 * 255], 16)
+                if ret == 0:
+                    args.dataset_path = "../../data/vision/datasets_npy.txt"
+            else:
+                args.dataset_path = "../../data/vision/datasets_npy.txt"
 
-    # Build model
-    print('--> Building model')
-    ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
-    if ret != 0:
-        print('Build model failed!')
-        exit(ret)
-    print('done')
+        # Build model
+        print('--> Building model')
+        ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
+        if ret != 0:
+            print('Build model failed!')
+            exit(ret)
+        print('done')
 
     # Export rknn model
     print('--> Export rknn model')

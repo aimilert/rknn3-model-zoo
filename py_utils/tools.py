@@ -7,7 +7,150 @@ import json
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from PIL import Image
+from onnx import numpy_helper
 
+def load_onnx_tensor(init):
+    return torch.from_numpy(numpy_helper.to_array(init))
+
+
+def onnx_fingerprint(init, n=1024):
+    t = load_onnx_tensor(init).reshape(-1)
+    if t.numel() > n:
+        t = t[:n]
+    if not t.is_floating_point():
+        t = t.float()
+    return t.abs().sum().item()
+
+
+def torch_fingerprint(t, n=1024):
+    t = t.reshape(-1)
+    if t.numel() > n:
+        t = t[:n]
+    return t.abs().sum().item()
+
+def l1_streaming(a, b, best, block=4096):
+    a = a.reshape(-1)
+    b = b.reshape(-1)
+    s = 0.0
+    for i in range(0, a.numel(), block):
+        s += (a[i:i+block] - b[i:i+block]).abs().sum().item()
+        if s > best:
+            return s
+    return s
+
+
+def replace_keys_greedy(A: dict, B: dict):
+    MAP_DICT = {}
+    wrong_LIST = []
+    for b_key, b_val in tqdm(B.items()):
+        best_sim = float("inf")
+        best_a_key = None
+        need_transpose = False
+
+        # ---- 2. 遍历当前剩余的 A ----
+        for a_key, a_info in A.items():
+            # if 'Gather' in a_info["op_type"] and len(a_info["op_type"]) == 1:
+            #     continue
+            
+            a_shape = a_info["shape"]
+            b_shape = tuple(b_val.shape)
+            match = False
+            transpose = False
+            if a_shape == b_shape:## 注意这里并不能保证无需转置
+                match = True
+            elif len(a_shape) == 2 and a_shape[::-1] == b_shape:
+                match = True
+                transpose = True
+
+            if not match:
+                continue
+            
+            a_fp = a_info["fp"]
+            if len(b_shape) == 1:
+                b_val_fp = torch_fingerprint(b_val)
+                fingerprint_sim = abs(a_fp - b_val_fp)
+                if fingerprint_sim > 1:
+                    continue
+            else:
+                b_val_fp = torch_fingerprint(b_val)
+                b_val_fp_T = torch_fingerprint(b_val.transpose(0, 1))
+                fingerprint_sim = abs(a_fp - b_val_fp)
+                fingerprint_sim_T = abs(a_fp - b_val_fp_T)
+                if min(fingerprint_sim, fingerprint_sim_T) > 1:
+                    continue
+                if fingerprint_sim_T < fingerprint_sim and not transpose:
+                    transpose = True
+            
+            a_tensor = load_onnx_tensor(a_info["init"])
+            if transpose:
+                a_tensor = a_tensor.transpose(0, 1)
+
+            # ---- 3. 避免中间大 tensor ----
+            sim = l1_streaming(a_tensor, b_val, best_sim)
+
+
+            if sim < best_sim:
+                best_sim = sim
+                best_a_key = a_key
+                need_transpose = transpose
+
+            if best_sim < 0.1:
+                break
+
+        # if 'Gather' not in A[best_a_key]["op_type"]: ## 不要扔掉onnx中的embedding weight
+        if best_a_key is not None:
+            A.pop(best_a_key)
+            
+        if best_sim > 1:
+            wrong_LIST.append([b_key, best_a_key, best_sim])
+        else:
+            # MAP_DICT[b_key] = [best_a_key, need_transpose]
+            MAP_DICT[b_key] = best_a_key
+
+        
+    return MAP_DICT, wrong_LIST
+
+def get_map(onnx_model, torch_model_dict, save_map_path, filter=None):
+
+    onnx_dict = {}
+    for init in onnx_model.graph.initializer:
+        onnx_dict[init.name] = {
+        "init": init,
+        "shape": tuple(init.dims),
+        "op_type": [],
+        "fp": onnx_fingerprint(init)
+    }
+
+        
+    init_to_op_type = {}
+    for node in onnx_model.graph.node:
+        for input_name in node.input:
+            if input_name in onnx_dict:
+                if input_name not in init_to_op_type:
+                    init_to_op_type[input_name] = []
+                init_to_op_type[input_name].append(node.op_type)
+    for name, info in onnx_dict.items():
+        onnx_dict[name]["op_type"] = init_to_op_type[name]
+        
+    if filter is not None:
+        for key in list(torch_model_dict.keys()):
+            if not key.startswith(filter):
+                torch_model_dict.pop(key)
+
+    MAP_DICT, wrong_LIST = replace_keys_greedy(onnx_dict, torch_model_dict)
+    # if len(wrong_LIST) > 0:
+    #     print('some error occurs when generate namemap dict !')
+    #     print(wrong_LIST)
+
+    with open(save_map_path, 'w', encoding='utf-8') as f:
+        json.dump(
+            MAP_DICT,
+            f,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True
+        )
+    
 def gen_grq_input_embeds_dataset(datasets, dataset_out_path_np, grq_data_path):
     with open(grq_data_path, 'w') as json_file:
         json_file.write('[\n')
@@ -83,6 +226,91 @@ def gen_quantize_dataset(model_path, embed_layer, dataset_path, dataset_out_path
                 + os.path.abspath(path_num_logits_to_keep) + ' ')            
             f.write('\n')
 
+def gen_qwen3_5_quantize_dataset(model, tokenizer, embed_layer, dataset_path, dataset_out_path, dataset_out_path_np):
+    if os.path.exists(dataset_out_path_np):
+        shutil.rmtree(dataset_out_path_np)
+    os.makedirs(dataset_out_path_np)
+
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    base_model = model.model if hasattr(model, "model") else model
+    base_model = base_model.to(dev)
+    base_model.eval()
+    
+    # 确保 embed_layer 也在同样的设备上（如果它是独立传入的模型层）
+    if hasattr(embed_layer, 'to'):
+        embed_layer = embed_layer.to(dev)
+
+    with open(dataset_path, 'r', encoding='utf-8') as fr:
+        datasets = json.load(fr)
+
+    with open(dataset_out_path, 'w', encoding='utf-8') as f:
+        for i, data in enumerate(datasets):
+            text = data['input'] + (data['target'] if 'target' in data else '')
+
+            model_inputs = tokenizer([text], return_tensors="pt")
+            # 将输入数据送入 CUDA
+            input_ids = model_inputs['input_ids'].to(dev)
+
+            if 'attention_mask' in model_inputs:
+                attention_mask = model_inputs['attention_mask'].to(dev).to(torch.float32)
+            else:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.float32, device=dev)
+
+            src_len = input_ids.shape[1]
+            # 这里的辅助 tensor 直接在 dev 上创建
+            position_ids = torch.arange(src_len, dtype=torch.long, device=dev).unsqueeze(0)
+            num_logits_to_keep = torch.tensor([src_len - 1], dtype=torch.long, device=dev)
+            tc_in = torch.tensor([src_len], dtype=torch.int64, device=dev)
+
+            with torch.no_grad():
+                input_embeds = embed_layer(input_ids).to(torch.float32)
+
+            with torch.no_grad():
+                model_out = base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    num_logits_to_keep=num_logits_to_keep,
+                    Tc=tc_in
+                )
+
+            past_key_values = model_out.past_key_values
+            conv_states_list = [v for v in past_key_values.conv_states if v is not None]
+            if len(conv_states_list) == 0:
+                raise RuntimeError(f"sample {i}: past_key_values.conv_states is empty")
+
+            # concat 操作由于输入是 GPU tensor，结果也会在 GPU 上
+            conv_state = torch.cat(conv_states_list, dim=0).to(torch.float32)
+
+            # 2. 保存时强制将数据脱离计算图 (detach)、转回 CPU (cpu)，再转 numpy
+            path_input_embeds = os.path.join(dataset_out_path_np, f'input_embeds_{i}.npy')
+            np.save(path_input_embeds, input_embeds.detach().cpu().numpy().astype(np.float32))
+
+            path_position_ids = os.path.join(dataset_out_path_np, f'position_ids_{i}.npy')
+            np.save(path_position_ids, position_ids.detach().cpu().numpy().astype(np.int64))
+
+            path_attention_mask = os.path.join(dataset_out_path_np, f'attention_mask_{i}.npy')
+            np.save(path_attention_mask, attention_mask.detach().cpu().numpy().astype(np.float32))
+
+            path_linear_tc = os.path.join(dataset_out_path_np, f'Linear_Tc_{i}.npy')
+            np.save(path_linear_tc, tc_in.detach().cpu().numpy().astype(np.int64))
+
+            path_num_logits_to_keep = os.path.join(dataset_out_path_np, f'num_logits_to_keep_{i}.npy')
+            np.save(path_num_logits_to_keep, num_logits_to_keep.detach().cpu().numpy().astype(np.int64))
+
+            path_conv_state = os.path.join(dataset_out_path_np, f'conv_state_{i}.npy')
+            np.save(path_conv_state, conv_state.detach().cpu().numpy().astype(np.float32))
+
+            f.write(
+                os.path.abspath(path_input_embeds) + ' ' +
+                os.path.abspath(path_position_ids) + ' ' +
+                os.path.abspath(path_attention_mask) + ' ' +
+                os.path.abspath(path_linear_tc) + ' ' +
+                os.path.abspath(path_num_logits_to_keep) + ' ' +
+                os.path.abspath(path_conv_state)
+            )
+            f.write('\n')
 
 
 
@@ -363,7 +591,159 @@ def gen_qwen2_5_vl_quantize_dataset(model_path, model, embed_layer, dataset_path
     if grq_data:
         grq_data_path = '../../../../datasets/MMBench/llm/grq_inputs.json'
         gen_grq_input_embeds_dataset(datasets, dataset_out_path_np, grq_data_path)
+    
+def gen_qwen3_5_vl_quantize_dataset(
+    model_path,
+    model,
+    embed_layer,
+    dataset_path,
+    dataset_out_path,
+    dataset_out_path_np,
+):
+    import os
+    import json
+    import shutil
+    import numpy as np
+    import torch
+    from PIL import Image
+    from tqdm import tqdm
+    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
+    if os.path.exists(dataset_out_path_np):
+        shutil.rmtree(dataset_out_path_np)
+    os.makedirs(dataset_out_path_np, exist_ok=True)
+
+    out_dir = os.path.dirname(dataset_out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    dev = "cpu"
+
+    model = model.to(dev).eval()
+    embed_layer = embed_layer.to(dev).eval()
+
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+
+    # 只从 VLM 里取 visual / image_token_id / get_rope_index
+    vlm = Qwen3_5ForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        _attn_implementation="eager",
+        trust_remote_code=True,
+    ).to(dev).eval()
+
+    visual = vlm.model.visual
+    image_token_id = vlm.config.image_token_id
+
+    datasets = json.load(open(dataset_path, "r", encoding="utf-8"))
+
+    with open(dataset_out_path, "w", encoding="utf-8") as f:
+        for i, data in enumerate(tqdm(datasets, desc="Make VLM dataset", ncols=100)):
+            img_path = os.path.join(
+                os.path.dirname(dataset_path),
+                data["image_path"],
+                data["image"],
+            )
+            image = Image.open(img_path).convert("RGB")
+
+            text = data["input"] + data.get("target", "")
+
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": text},
+                    ],
+                }
+            ]
+
+            prompt = processor.apply_chat_template(
+                conversation,
+                add_generation_prompt=True,
+            )
+
+            inputs = processor(
+                text=[prompt],
+                images=[image],
+                padding=True,
+                return_tensors="pt",
+            ).to(dev)
+
+            input_ids = inputs["input_ids"]
+            attention_mask_i64 = inputs["attention_mask"]
+            attention_mask = attention_mask_i64.to(torch.float32)
+            pixel_values = inputs["pixel_values"]
+            image_grid_thw = inputs["image_grid_thw"]
+
+            with torch.no_grad():
+                input_embeds = embed_layer(input_ids).to(torch.float32)
+
+                image_embeds = visual(
+                    pixel_values,
+                    grid_thw=image_grid_thw,
+                    return_dict=True,
+                ).pooler_output.to(torch.float32)
+
+                image_mask = input_ids == image_token_id
+                input_embeds[image_mask] = image_embeds.reshape(-1, input_embeds.shape[-1])
+
+                mm_token_type_ids = inputs.get("mm_token_type_ids", None)
+                if mm_token_type_ids is None:
+                    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
+                    mm_token_type_ids[image_mask] = 1
+
+                # 注意：get_rope_index 在 vlm.model 上，不在 vlm 上
+                position_ids = vlm.model.get_rope_index(
+                    input_ids=input_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=image_grid_thw,
+                    attention_mask=attention_mask_i64,
+                )[0].to(torch.int64)
+
+                seq_len = input_ids.shape[1]
+                tc_in = torch.tensor([seq_len], dtype=torch.int64, device=dev)
+                num_logits_to_keep = torch.tensor([seq_len - 1], dtype=torch.long, device=dev)
+
+                model_out = model(
+                    inputs_embeds=input_embeds,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    Tc=tc_in,
+                    logits_to_keep=num_logits_to_keep,
+                    use_cache=True,
+                )
+
+                conv_state = torch.cat(
+                    [v for v in model_out.past_key_values.conv_states if v is not None],
+                    dim=0,
+                ).to(torch.float32)
+
+            paths = [
+                os.path.join(dataset_out_path_np, f"input_embeds_{i}.npy"),
+                os.path.join(dataset_out_path_np, f"position_ids_{i}.npy"),
+                os.path.join(dataset_out_path_np, f"attention_mask_{i}.npy"),
+                os.path.join(dataset_out_path_np, f"Linear_Tc_{i}.npy"),
+                os.path.join(dataset_out_path_np, f"num_logits_to_keep_{i}.npy"),
+                os.path.join(dataset_out_path_np, f"conv_state_{i}.npy"),
+            ]
+
+            n_token = position_ids.shape[-1]
+            position_ids = np.arange(n_token, dtype=np.int64).reshape(1, -1)
+            arrays = [
+                input_embeds.cpu().numpy().astype(np.float32),
+                position_ids,
+                attention_mask.cpu().numpy().astype(np.float32),
+                tc_in.cpu().numpy().astype(np.int64),
+                num_logits_to_keep.cpu().numpy().astype(np.int64),
+                conv_state.cpu().numpy().astype(np.float32),
+            ]
+
+            for p, arr in zip(paths, arrays):
+                np.save(p, arr)
+
+            f.write(" ".join(os.path.abspath(p) for p in paths) + "\n")
 
 def gen_qwen2_vl_quantize_dataset(model_path, model, embed_layer, dataset_path, dataset_out_path, dataset_out_path_np, grq_data=False):
     from transformers import AutoProcessor

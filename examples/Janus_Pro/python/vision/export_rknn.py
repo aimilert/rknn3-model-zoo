@@ -2,7 +2,7 @@ from rknn.api import RKNN
 
 ONNX_MODEL = '../../model/vision/Janus-Pro-1B-vision.onnx'
 RKNN_MODEL = '../../model/vision/Janus-Pro-1B-vision.rknn'
-DATASET_PATH = '../../../../datasets/MMBench/vision/datasets.txt'
+DATASET_PATH = None
 
 if __name__ == '__main__':
 

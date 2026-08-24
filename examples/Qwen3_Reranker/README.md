@@ -25,6 +25,7 @@
 python export_llm.py \
     --model_path Qwen/Qwen3-Reranker-0.6B \
     --export_llm_path ../model/llm/Qwen3-Reranker-0.6B.onnx \
+    --quant \
     --modelscope
 ```
 
@@ -53,7 +54,8 @@ export_llm_config(args.model_path, os.path.splitext(args.export_llm_path)[0] + '
 python export_rknn.py \
     --onnx_path ../model/llm/Qwen3-Reranker-0.6B.onnx \
     --config ../model/llm/Qwen3-Reranker-0.6B.config.pkl \
-    --rknn_path ../model/llm/Qwen3-Reranker-0.6B.rknn
+    --rknn_path ../model/llm/Qwen3-Reranker-0.6B.rknn \
+    --platform rk1820
 ```
 用户可在 `rknn.config` 中设置 `max_ctx_len` 参数，以调整模型支持的最大输入 token 长度（即最大上下文长度）。
 

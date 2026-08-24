@@ -3,7 +3,7 @@ import pickle
 
 ONNX_MODEL = 'llm.onnx'
 LLM_CONFIG = 'llm.config.pkl'
-RKNN_MODEL = '../../models/llm.rknn'
+RKNN_MODEL = 'llm.rknn'
 
 if __name__ == '__main__':
 
@@ -38,7 +38,7 @@ if __name__ == '__main__':
     hidden_size = loaded_config['hidden_size']
 
     dynamic_input = [[[1, 1, hidden_size],   [1, 1],   [1, 1, 1]], [[1, 128, hidden_size], [1, 128], [1, 1, 128]]]
-    rknn.config(target_platform='rk1820', dynamic_input = dynamic_input,
+    rknn.config(target_platform=args.platform, dynamic_input = dynamic_input,
                 quantized_dtype='w4a16', quantized_algorithm='normal', quantized_method='group32', 
                 llm_config=my_config, 
                 )
@@ -54,7 +54,7 @@ if __name__ == '__main__':
 
     # Build model
     print('--> Building model')
-    ret = rknn.build(do_quantization=True, dataset=args.dataset_path)
+    ret = rknn.build(do_quantization=True)
     if ret != 0:
         print('Build model failed!')
         exit(ret)

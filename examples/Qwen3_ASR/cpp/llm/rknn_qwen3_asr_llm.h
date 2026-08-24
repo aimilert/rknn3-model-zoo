@@ -33,7 +33,7 @@ typedef struct {
 
 } rknn_qwen3_asr_llm_context;
 
-int init_qwen3_asr_llm(rknn_qwen3_asr_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback callback, uint32_t core_mask);
+int init_qwen3_asr_llm(rknn_qwen3_asr_llm_context* llm_ctx, const char* model_path, const char* weight_path, rknn3_llm_param* params, int n_params, RKLLMCallback& callback, uint32_t core_mask);
 
 int release_qwen3_asr_llm(rknn_qwen3_asr_llm_context* llm_ctx);
 

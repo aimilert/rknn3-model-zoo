@@ -51,7 +51,7 @@ int init_qwen3_vl_model(rknn_app_context_t* app_ctx,
                         const char* vision_weight_path,
                         rknn3_llm_param* params,
                         int n_params,
-                        RKLLMCallback callback,
+                        RKLLMCallback& callback,
                         uint32_t vision_core_mask,
                         uint32_t llm_core_mask);
 

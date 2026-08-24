@@ -63,8 +63,8 @@ def check_and_download_origin_model():
 def parse_arg():
     if len(sys.argv) < 3:
         print("Usage: python3 {} [onnx_model_path] [platform] [dtype(optional)] [output_rknn_path(optional)]".format(sys.argv[0]))
-        print("       platform choose from [rk1820]")
-        print("       dtype choose from [i8, fp] for [rk1820]")
+        print("       platform choose from [rk1820, rk1828]")
+        print("       dtype choose from [i8, fp] for [rk1820, rk1828]")
         exit(1)
 
     model_path = sys.argv[1]
