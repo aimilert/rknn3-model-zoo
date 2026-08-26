@@ -66,7 +66,7 @@ if __name__ == '__main__':
                 lora_config_paths=[[args.lora_config_path]],
                 lora_patterns=[["lora0_pattern0"]],
                 lora_quantized_dtype="float16",
-                lora_quantized_method="",
+                lora_quantized_method=None,
                 lora_prefix="base_model.model.model.",
                 lora_postfix_a=".lora_A.weight",
                 lora_postfix_b=".lora_B.weight"

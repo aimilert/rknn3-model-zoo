@@ -15,6 +15,7 @@
   - [2.7 翻译](#27-翻译)
   - [2.8 OCR](#28-ocr)
   - [2.9 CV（计算机视觉）](#29-cv计算机视觉)
+  - [2.10 预转换 RKNN 模型](#210-预转换-rknn-模型)
 - [3. 支持的平台](#3-支持的平台)
 - [4. 快速开始](#4-快速开始)
   - [4.1 环境准备](#41-环境准备)
@@ -134,6 +135,10 @@ RKNN3 SDK 提供了将 AI 模型部署到 RK1820/RK1828 协处理器所需的完
 | [YOLO26-Pose](examples/yolo26_pose/README.md) | `examples/yolo26_pose` | Ultralytics YOLO26 人体姿态估计模型 |
 | [QA-CLIP](examples/QAClip/README.md) | `examples/QAClip` | 中英文图文相似度模型 |
 | [Depth Anything V3](examples/depth_anything_v3/README.md) | `examples/depth_anything_v3` | 立体深度估计模型 |
+
+### 2.10 预转换 RKNN 模型
+
+用户可以从 [RKNN3_SDK 网盘](https://console.box.lenovo.com/l/H1fig1) 下载预先转换好的 RKNN 模型（提取码：`rknn`）。本次发布的模型位于 `RKNN3_SDK/rknn3_models/v1.1.0` 目录。
 
 ## 3. 支持的平台
 

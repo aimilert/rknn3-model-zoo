@@ -15,6 +15,7 @@
   - [2.7 Translation](#27-translation)
   - [2.8 OCR](#28-ocr)
   - [2.9 CV (Computer Vision)](#29-cv-computer-vision)
+  - [2.10 Pre-converted RKNN Models](#210-pre-converted-rknn-models)
 - [3. Supported Platforms](#3-supported-platforms)
 - [4. Quick Start](#4-quick-start)
   - [4.1 Environment Setup](#41-environment-setup)
@@ -134,6 +135,10 @@ This repository provides a complete model deployment workflow:
 | [YOLO26-Pose](examples/yolo26_pose/README.md) | `examples/yolo26_pose` | Ultralytics YOLO26 human pose estimation model |
 | [QA-CLIP](examples/QAClip/README.md) | `examples/QAClip` | Chinese-English image-text similarity model |
 | [Depth Anything V3](examples/depth_anything_v3/README.md) | `examples/depth_anything_v3` | Multi-view stereo depth estimation model |
+
+### 2.10 Pre-converted RKNN Models
+
+Users can download pre-converted RKNN models from the [RKNN3_SDK cloud drive](https://console.box.lenovo.com/l/H1fig1) (access code: `rknn`). The models for this release are available under `RKNN3_SDK/rknn3_models/v1.1.0`.
 
 ## 3. Supported Platforms
 
