@@ -32,6 +32,7 @@
 #include <deque>
 #include <functional>
 #include <inttypes.h>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -46,6 +47,7 @@ static size_t g_stage_count = 2;
 static uint64_t g_bucket_size = 128;
 static bool g_verbose = false;
 static bool g_ignore_eos = false;
+static bool g_interactive = false;
 static bool g_performance_mode = false;
 static bool g_tensor_dump_enabled = false;
 static std::string g_tensor_dump_dir;
@@ -540,6 +542,7 @@ struct CommandLineOptions
   int         max_new_tokens = 512;
   bool        verbose = false;
   bool        ignore_eos = false;
+  bool        interactive = false;
   const char* rope_path = nullptr;
   const char* tensor_dump_dir = nullptr;
   std::vector<std::string> device_ids;
@@ -562,6 +565,7 @@ static void print_usage(const char* program)
   printf("  -n/--predict/--n-predict <count>  maximum generated tokens (default: 512)\n");
   printf("  --verbose                     enable verbose logs\n");
   printf("  --ignore-eos                  ignore EOS during generation\n");
+  printf("  --interactive, -i             interactive multi-turn chat mode (reads stdin)\n");
   printf("  --rope-tensor <safetensors>   external rope cache\n");
   printf("  --device-id <id[#id...]>      device IDs separated by '#'; optional\n");
   printf("  --perf <input> <output>       performance test mode\n");
@@ -699,6 +703,8 @@ static bool parse_named_command_line(int argc, char** argv, CommandLineOptions* 
       options->ignore_eos = true;
     } else if (strcmp(arg, "--no-ignore-eos") == 0) {
       options->ignore_eos = false;
+    } else if (strcmp(arg, "--interactive") == 0 || strcmp(arg, "-i") == 0) {
+      options->interactive = true;
     } else if (strcmp(arg, "--rope-tensor") == 0 || strcmp(arg, "--rope") == 0 ||
                strcmp(arg, "--rope-path") == 0) {
       if (!take_option_value(argc, argv, &i, arg, &options->rope_path)) return false;
@@ -1864,6 +1870,63 @@ static bool run_pipeline_once(std::vector<StageRuntime>& stages, PipelineState& 
   return ret == RKNN3_SUCCESS && !pipeline_failed(pipeline);
 }
 
+struct ChatTurnResult
+{
+  uint64_t prefill_tokens = 0;
+  uint64_t decode_tokens = 0;
+};
+
+// 运行一轮完整的对话：以 prompt 做 prefill，再逐 token decode 生成本轮回复。
+// 历史通过 run_pipeline_once 内部的 keep_history=1 自动累积，本函数不清理 KV cache。
+static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+                          const VocabInfo& vocab_info, const char* prompt,
+                          int max_new_tokens, ChatTurnResult* result)
+{
+  uint64_t prefill_tokens = 0;
+  if (!run_pipeline_once(stages, pipeline, prompt, nullptr,
+                         InferencePhase::PREFILL, &prefill_tokens)) {
+    printf("prefill failed\n");
+    return false;
+  }
+
+  int next_token = -1;
+  get_last_stage_token(&next_token);
+  if (next_token < 0) {
+    printf("prefill did not return token from result_callback\n");
+    return false;
+  }
+
+  uint64_t decode_tokens = 0;
+  uint64_t decode_steps = max_new_tokens > 0 ? (uint64_t)max_new_tokens : 0;
+  for (uint64_t step = 0; step < decode_steps && next_token >= 0; ++step) {
+    std::vector<int32_t> token_vec(1, next_token);
+    VLOG("[Decode %llu] token=%d\n", (unsigned long long)(step + 1), next_token);
+
+    if (!run_pipeline_once(stages, pipeline, nullptr, &token_vec,
+                           InferencePhase::DECODE, nullptr)) {
+      printf("decode step %llu failed\n", (unsigned long long)(step + 1));
+      break;
+    }
+
+    if (!get_last_stage_token(&next_token)) {
+      printf("decode step %llu did not return token from result_callback\n",
+             (unsigned long long)(step + 1));
+      break;
+    }
+    decode_tokens += 1;
+    if (!g_ignore_eos && next_token == vocab_info.special_eos_id[0]) {
+      VLOG("\ndecode step %llu reached EOS token\n", (unsigned long long)(step + 1));
+      break;
+    }
+  }
+
+  if (result) {
+    result->prefill_tokens = prefill_tokens;
+    result->decode_tokens = decode_tokens;
+  }
+  return true;
+}
+
 int main(int argc, char** argv)
 {
   if (argc == 2 && strcmp(argv[1], "--help") == 0) {
@@ -1885,6 +1948,7 @@ int main(int argc, char** argv)
   uint32_t run_core_mask = options.run_core_mask;
   g_stage_count = options.stage_count;
   g_bucket_size = options.bucket_size;
+  g_interactive = options.interactive;
   g_performance_mode = options.performance_mode;
 
   uint64_t performance_input_length = options.performance_input_length;
@@ -2130,72 +2194,122 @@ int main(int argc, char** argv)
            (unsigned long long)performance_output_length);
   }
 
-  printf("\n=== Prefill Pipeline ===\n");
-  timeval prefill_start;
-  timeval prefill_end;
-  gettimeofday(&prefill_start, NULL);
-  uint64_t prefill_tokens = 0;
-  const char* prefill_prompt = g_performance_mode ? nullptr : prompt;
-  const std::vector<int32_t>* prefill_input_tokens =
-      g_performance_mode ? &performance_input_tokens : nullptr;
-  if (!run_pipeline_once(stages, pipeline, prefill_prompt, prefill_input_tokens,
-                         InferencePhase::PREFILL, &prefill_tokens)) {
-    printf("prefill failed\n");
-    release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
-    return -1;
-  }
-  gettimeofday(&prefill_end, NULL);
+  if (g_interactive) {
+    // 多轮交互：keep_history=1 已让 runtime 累积历史 KV cache，
+    // 每轮只需把新用户输入拼成 Qwen chat 格式作为 prefill 传入。
+    static const char* SYSTEM_PROMPT =
+        "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n";
+    static const char* USER_PREFIX = "<|im_start|>user\n";
+    static const char* USER_POSTFIX = "<|im_end|>\n<|im_start|>assistant\n";
 
-  int next_token = -1;
-  get_last_stage_token(&next_token);
+    printf("\n=== Interactive Chat Mode ===\n");
+    printf("Type your message and press Enter (Ctrl-D to exit).\n");
 
-  printf("\n=== Decode Loop ===\n");
-  if (next_token < 0) {
-    printf("prefill did not return token from result_callback\n");
-    release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
-    return -1;
-  }
-  timeval decode_start;
-  timeval decode_end;
-  gettimeofday(&decode_start, NULL);
-  uint64_t decode_tokens = 0;
-  uint64_t decode_steps = g_performance_mode
-                              ? performance_output_length - 1
-                              : (max_new_tokens > 0 ? (uint64_t)max_new_tokens : 0);
-  for (uint64_t step = 0; step < decode_steps && next_token >= 0; ++step) {
-    std::vector<int32_t> token_vec(1, next_token);
-    VLOG("[Decode %llu] token=%d\n", (unsigned long long)(step + 1), next_token);
+    bool first_turn = true;
+    std::string user_input;
+    while (true) {
+      printf("\nUser: ");
+      fflush(stdout);
+      if (!std::getline(std::cin, user_input)) {
+        printf("\n");
+        break;
+      }
+      if (user_input.empty()) {
+        continue;
+      }
 
-    if (!run_pipeline_once(stages, pipeline, nullptr, &token_vec,
-                           InferencePhase::DECODE, nullptr)) {
-      printf("decode step %llu failed\n", (unsigned long long)(step + 1));
-      break;
+      std::string chat_prompt;
+      if (first_turn) {
+        chat_prompt = SYSTEM_PROMPT;
+        chat_prompt += USER_PREFIX;
+        chat_prompt += user_input;
+        chat_prompt += USER_POSTFIX;
+        first_turn = false;
+      } else {
+        chat_prompt = USER_PREFIX;
+        chat_prompt += user_input;
+        chat_prompt += USER_POSTFIX;
+      }
+
+      printf("Assistant: ");
+      fflush(stdout);
+      ChatTurnResult turn;
+      if (!run_chat_turn(stages, pipeline, vocab_info, chat_prompt.c_str(),
+                         max_new_tokens, &turn)) {
+        printf("\n[interactive] inference failed, stopping\n");
+        break;
+      }
+      printf("\n");
     }
-
-    if (!get_last_stage_token(&next_token)) {
-      printf("decode step %llu did not return token from result_callback\n",
-             (unsigned long long)(step + 1));
-      break;
+  } else {
+    printf("\n=== Prefill Pipeline ===\n");
+    timeval prefill_start;
+    timeval prefill_end;
+    gettimeofday(&prefill_start, NULL);
+    uint64_t prefill_tokens = 0;
+    const char* prefill_prompt = g_performance_mode ? nullptr : prompt;
+    const std::vector<int32_t>* prefill_input_tokens =
+        g_performance_mode ? &performance_input_tokens : nullptr;
+    if (!run_pipeline_once(stages, pipeline, prefill_prompt, prefill_input_tokens,
+                           InferencePhase::PREFILL, &prefill_tokens)) {
+      printf("prefill failed\n");
+      release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+      return -1;
     }
-    decode_tokens += 1;
-    if (!g_performance_mode && !g_ignore_eos &&
-        next_token == vocab_info.special_eos_id[0]) {
-      VLOG("\ndecode step %llu reached EOS token\n", (unsigned long long)(step + 1));
-      break;
-    }
-  }
-  gettimeofday(&decode_end, NULL);
+    gettimeofday(&prefill_end, NULL);
 
-  float prefill_ms = elapsed_us(prefill_start, prefill_end) / 1e3f;
-  float decode_ms  = elapsed_us(decode_start, decode_end) / 1e3f;
-  if (g_performance_mode) {
-    printf("\nPerformance Test Lengths: input=%llu/%llu, output=%llu/%llu\n",
-           (unsigned long long)prefill_tokens,
-           (unsigned long long)performance_input_length,
-           (unsigned long long)(decode_tokens + 1),
-           (unsigned long long)performance_output_length);
+    int next_token = -1;
+    get_last_stage_token(&next_token);
+
+    printf("\n=== Decode Loop ===\n");
+    if (next_token < 0) {
+      printf("prefill did not return token from result_callback\n");
+      release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+      return -1;
+    }
+    timeval decode_start;
+    timeval decode_end;
+    gettimeofday(&decode_start, NULL);
+    uint64_t decode_tokens = 0;
+    uint64_t decode_steps = g_performance_mode
+                                ? performance_output_length - 1
+                                : (max_new_tokens > 0 ? (uint64_t)max_new_tokens : 0);
+    for (uint64_t step = 0; step < decode_steps && next_token >= 0; ++step) {
+      std::vector<int32_t> token_vec(1, next_token);
+      VLOG("[Decode %llu] token=%d\n", (unsigned long long)(step + 1), next_token);
+
+      if (!run_pipeline_once(stages, pipeline, nullptr, &token_vec,
+                             InferencePhase::DECODE, nullptr)) {
+        printf("decode step %llu failed\n", (unsigned long long)(step + 1));
+        break;
+      }
+
+      if (!get_last_stage_token(&next_token)) {
+        printf("decode step %llu did not return token from result_callback\n",
+               (unsigned long long)(step + 1));
+        break;
+      }
+      decode_tokens += 1;
+      if (!g_performance_mode && !g_ignore_eos &&
+          next_token == vocab_info.special_eos_id[0]) {
+        VLOG("\ndecode step %llu reached EOS token\n", (unsigned long long)(step + 1));
+        break;
+      }
+    }
+    gettimeofday(&decode_end, NULL);
+
+    float prefill_ms = elapsed_us(prefill_start, prefill_end) / 1e3f;
+    float decode_ms  = elapsed_us(decode_start, decode_end) / 1e3f;
+    if (g_performance_mode) {
+      printf("\nPerformance Test Lengths: input=%llu/%llu, output=%llu/%llu\n",
+             (unsigned long long)prefill_tokens,
+             (unsigned long long)performance_input_length,
+             (unsigned long long)(decode_tokens + 1),
+             (unsigned long long)performance_output_length);
+    }
+    print_performance_statistics(prefill_tokens, prefill_ms, decode_tokens, decode_ms);
   }
-  print_performance_statistics(prefill_tokens, prefill_ms, decode_tokens, decode_ms);
+
   print_stage_performance_statistics(stages);
   for (size_t i = 0; i < stages.size(); ++i) {
     rknn3_session_clear_kvcache(stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
