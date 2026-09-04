@@ -1189,7 +1189,15 @@ static int result_callback(void* userdata, RKLLMResult* result, LLMCallState sta
   LastStageResultState* result_state = (LastStageResultState*)userdata;
   Tokenizer* tokenizer = result_state ? result_state->tokenizer : nullptr;
 
-  if (state == RKLLM_RUN_NORMAL && result && tokenizer) {
+  if (state != RKLLM_RUN_NORMAL) {
+    // 诊断：非 NORMAL 状态不会设置 token，正是 "did not return token" 的来源。
+    printf("\n[result_callback] non-normal state=%d (0=NORMAL,1=WAITING,2=FINISH,3=STOP,4=MAX_NEW_TOKEN,5=ERROR,6=PAUSE,7=RESUME)\n",
+           (int)state);
+    fflush(stdout);
+    return 0;
+  }
+
+  if (result && tokenizer) {
     int32_t next_token = -1;
     if (result->num_tokens > 0) {
       next_token = result->token_ids[result->num_tokens - 1];
@@ -1941,6 +1949,28 @@ struct ChatTurnResult
   double   decode_ms = 0.0;
 };
 
+// 诊断：查询各 stage 的 KV cache 运行时状态，打印当前 token 数与上限。
+static void dump_run_state(std::vector<StageRuntime>& stages)
+{
+  for (auto& stage : stages) {
+    RKLLMRunState st;
+    memset(&st, 0, sizeof(st));
+    int q = rknn3_session_query_state(stage.session, &st);
+    if (q == RKNN3_SUCCESS) {
+      printf("[%s] n_total_tokens=%llu n_reuse_tokens=%llu n_max_tokens=%llu "
+             "n_prefill_tokens=%llu n_decode_tokens=%llu\n",
+             stage.name.c_str(),
+             (unsigned long long)st.n_total_tokens,
+             (unsigned long long)st.n_reuse_tokens,
+             (unsigned long long)st.n_max_tokens,
+             (unsigned long long)st.n_prefill_tokens,
+             (unsigned long long)st.n_decode_tokens);
+    } else {
+      printf("[%s] query_state failed ret=%d\n", stage.name.c_str(), q);
+    }
+  }
+}
+
 // 运行一轮完整的对话：以 prompt 做 prefill，再逐 token decode 生成本轮回复。
 // 历史通过 run_pipeline_once 内部的 keep_history=1 自动累积，本函数不清理 KV cache。
 static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipeline,
@@ -1962,6 +1992,7 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
   get_last_stage_token(&next_token);
   if (next_token < 0) {
     printf("prefill did not return token from result_callback\n");
+    dump_run_state(stages);
     return false;
   }
 
@@ -1983,6 +2014,7 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
     if (!get_last_stage_token(&next_token)) {
       printf("decode step %llu did not return token from result_callback\n",
              (unsigned long long)(step + 1));
+      dump_run_state(stages);
       break;
     }
     decode_tokens += 1;
