@@ -1874,6 +1874,8 @@ struct ChatTurnResult
 {
   uint64_t prefill_tokens = 0;
   uint64_t decode_tokens = 0;
+  double   prefill_ms = 0.0;
+  double   decode_ms = 0.0;
 };
 
 // 运行一轮完整的对话：以 prompt 做 prefill，再逐 token decode 生成本轮回复。
@@ -1882,12 +1884,16 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
                           const VocabInfo& vocab_info, const char* prompt,
                           int max_new_tokens, ChatTurnResult* result)
 {
+  timeval prefill_start;
+  timeval prefill_end;
+  gettimeofday(&prefill_start, NULL);
   uint64_t prefill_tokens = 0;
   if (!run_pipeline_once(stages, pipeline, prompt, nullptr,
                          InferencePhase::PREFILL, &prefill_tokens)) {
     printf("prefill failed\n");
     return false;
   }
+  gettimeofday(&prefill_end, NULL);
 
   int next_token = -1;
   get_last_stage_token(&next_token);
@@ -1896,6 +1902,9 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
     return false;
   }
 
+  timeval decode_start;
+  timeval decode_end;
+  gettimeofday(&decode_start, NULL);
   uint64_t decode_tokens = 0;
   uint64_t decode_steps = max_new_tokens > 0 ? (uint64_t)max_new_tokens : 0;
   for (uint64_t step = 0; step < decode_steps && next_token >= 0; ++step) {
@@ -1919,10 +1928,13 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
       break;
     }
   }
+  gettimeofday(&decode_end, NULL);
 
   if (result) {
     result->prefill_tokens = prefill_tokens;
     result->decode_tokens = decode_tokens;
+    result->prefill_ms = elapsed_us(prefill_start, prefill_end) / 1e3f;
+    result->decode_ms = elapsed_us(decode_start, decode_end) / 1e3f;
   }
   return true;
 }
@@ -2207,6 +2219,12 @@ int main(int argc, char** argv)
 
     bool first_turn = true;
     std::string user_input;
+    uint64_t total_prefill_tokens = 0;
+    uint64_t total_decode_tokens = 0;
+    double total_prefill_ms = 0.0;
+    double total_decode_ms = 0.0;
+    // 当前对话累计占用上下文 token 数（prefill + decode），用于在接近上限时主动清空 KV cache。
+    uint64_t context_tokens = 0;
     while (true) {
       printf("\nUser: ");
       fflush(stdout);
@@ -2216,6 +2234,20 @@ int main(int argc, char** argv)
       }
       if (user_input.empty()) {
         continue;
+      }
+
+      // 预留本轮 decode（max_new_tokens）+ 下一轮 prefill（chat 模板）的余量。
+      // 当剩余上下文不足以再容纳一轮时，主动清空 KV cache 开启新对话，避免 runtime 静默失败。
+      const uint64_t context_limit = (uint64_t)max_context_len;
+      const uint64_t turn_reserve = (uint64_t)max_new_tokens + 512;
+      if (context_tokens > 0 && context_tokens + turn_reserve >= context_limit) {
+        printf("\n[warning] context %llu/%llu tokens nearly full, clearing KV cache to start a fresh conversation\n",
+               (unsigned long long)context_tokens, (unsigned long long)context_limit);
+        for (size_t i = 0; i < stages.size(); ++i) {
+          rknn3_session_clear_kvcache(stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+        }
+        context_tokens = 0;
+        first_turn = true;
       }
 
       std::string chat_prompt;
@@ -2240,7 +2272,16 @@ int main(int argc, char** argv)
         break;
       }
       printf("\n");
+
+      total_prefill_tokens += turn.prefill_tokens;
+      total_decode_tokens += turn.decode_tokens;
+      total_prefill_ms += turn.prefill_ms;
+      total_decode_ms += turn.decode_ms;
+      context_tokens += turn.prefill_tokens + turn.decode_tokens;
     }
+
+    print_performance_statistics(total_prefill_tokens, (float)total_prefill_ms,
+                                 total_decode_tokens, (float)total_decode_ms);
   } else {
     printf("\n=== Prefill Pipeline ===\n");
     timeval prefill_start;

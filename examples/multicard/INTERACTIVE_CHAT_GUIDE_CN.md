@@ -177,7 +177,9 @@ Per-Stage Performance Statistics:
    - 首轮：`<|im_start|>system\n...<|im_end|>\n<|im_start|>user\n{输入}<|im_end|>\n<|im_start|>assistant\n`
    - 后续轮：`<|im_start|>user\n{输入}<|im_end|>\n<|im_start|>assistant\n`
 4. **`keep_history=1`**（在 `run_pipeline_once` 内设置）：让 runtime 在每次 `rknn3_session_run` 之间保留历史 KV cache，因此每轮只传新增用户输入即可。
-5. **资源生命周期**：循环内不调用 `release_resources` 与 `rknn3_session_clear_kvcache`，两者都移到循环退出后统一执行。
+5. **性能统计**：多轮结束后会打印两部分统计——`Performance Statistics`（整段对话累计的 prefill/decode 总耗时、总 token、tokens/s）与 `Per-Stage Performance Statistics`（各 stage 分阶段明细）。
+6. **上下文溢出保护**：循环内累计当前上下文 token 数（prefill + decode），当剩余上下文不足以再容纳一轮时，会打印 `[warning] ... clearing KV cache to start a fresh conversation` 并自动清空 KV cache 开启新对话，避免因上下文写满导致 runtime 静默失败（表现为 `prefill/decode did not return token`）。
+7. **资源生命周期**：循环内不调用 `release_resources`；仅在「主动清空上下文」时调用 `rknn3_session_clear_kvcache`，其余资源统一在循环退出后释放。
 
 ---
 
@@ -190,7 +192,7 @@ Per-Stage Performance Statistics:
 可以，用 `--predict <count>` 设置每轮最大生成 token 数；命中 EOS 会提前结束。
 
 **Q3：历史能累积多少轮？**
-受 `--ctx-size`（`max_context_len`）限制。累计 token 超过上下文上限后，早期内容会被截断/丢弃，具体由 runtime 的 KV cache 管理策略决定。
+受 `--ctx-size`（`max_context_len`）限制。累计 token 接近上限后，程序会**自动清空 KV cache 并开启一段新对话**（会打印 warning），而不是让 runtime 静默失败。若需保留更长的上下文，请增大 `--ctx-size`（受模型导出时的 `kvcache_buffer_len` 约束）。
 
 **Q4：多轮模式会不会比单次慢？**
 首轮 prefill 与单次一致；后续轮次因历史 KV cache 已存在，prefill 只需处理新增输入，但总上下文越长，decode 阶段注意力计算开销越大。
@@ -203,3 +205,6 @@ printf '第一句话\n第二句话\n' | taskset f0 ./rknn_multicard_demo ... --i
 ```
 
 程序读到 EOF 后自动结束并打印性能统计。
+
+**Q6：为什么多轮后报 `prefill/decode did not return token`？**
+这是上下文写满的典型症状：累计 token（prefill + decode）达到 `--ctx-size` 上限后，runtime 无法继续写入 KV cache，于是不再产出 token。新版 demo 会在接近上限时主动清空 KV cache（见第 8 节第 6 点），避免该错误；若仍出现，请确认 `--ctx-size` 与模型 `kvcache_buffer_len` 是否匹配。
