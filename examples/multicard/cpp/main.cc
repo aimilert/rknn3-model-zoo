@@ -2333,15 +2333,18 @@ int main(int argc, char** argv)
         continue;
       }
 
-      // 预留本轮 decode（max_new_tokens）+ 下一轮 prefill（chat 模板）的余量。
-      // 当剩余上下文不足以再容纳一轮时，主动清空 KV cache 开启新对话，避免 runtime 静默失败。
-      // 注意：实际生效的上限是模型导出时内建的 kvcache_buffer_len（stages[0].max_ctx_len），
-      // 而非命令行请求的 --ctx-size（后者若超过内建长度会被 runtime 就近回退）。
+      // 仅为「下一轮 prefill」（用户输入 + chat 模板）预留固定余量。
+      // 注意：
+      //   1) 实际生效上限是模型内建 kvcache_buffer_len（stages[0].max_ctx_len），
+      //      而非命令行 --ctx-size（超出会被 runtime 就近回退）。
+      //   2) 不能用 max_new_tokens 做余量——decode 通常遇 EOS 就停，实际远用不满；
+      //      否则 --predict 较大时会误判“上下文已满”。真正的 decode 溢出由下面
+      //      的 context_tokens 累计 + 下一轮 guard 兜底。
       const uint64_t context_limit = stages[0].max_ctx_len > 0
                                          ? (uint64_t)stages[0].max_ctx_len
                                          : (uint64_t)max_context_len;
-      const uint64_t turn_reserve = (uint64_t)max_new_tokens + 512;
-      if (context_tokens > 0 && context_tokens + turn_reserve >= context_limit) {
+      const uint64_t prefill_reserve = 512;
+      if (context_tokens > 0 && context_tokens + prefill_reserve >= context_limit) {
         printf("\n[warning] context %llu/%llu tokens nearly full, clearing KV cache to start a fresh conversation\n",
                (unsigned long long)context_tokens, (unsigned long long)context_limit);
         for (size_t i = 0; i < stages.size(); ++i) {
