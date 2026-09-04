@@ -179,20 +179,21 @@ Per-Stage Performance Statistics:
 4. **`keep_history=1`**（在 `run_pipeline_once` 内设置）：让 runtime 在每次 `rknn3_session_run` 之间保留历史 KV cache，因此每轮只传新增用户输入即可。
 5. **性能统计**：多轮结束后会打印两部分统计——`Performance Statistics`（整段对话累计的 prefill/decode 总耗时、总 token、tokens/s）与 `Per-Stage Performance Statistics`（各 stage 分阶段明细）。
 6. **上下文溢出保护**：循环内累计当前上下文 token 数（prefill + decode），当剩余上下文不足以再容纳一轮时，会打印 `[warning] ... clearing KV cache to start a fresh conversation` 并自动清空 KV cache 开启新对话，避免因上下文写满导致 runtime 静默失败（表现为 `prefill/decode did not return token`）。
-7. **资源生命周期**：循环内不调用 `release_resources`；仅在「主动清空上下文」时调用 `rknn3_session_clear_kvcache`，其余资源统一在循环退出后释放。
+7. **UTF-8 行编辑**：交互输入使用自实现的 raw 模式行读取（`read_line_utf8`），退格按「完整 UTF-8 字符」删除并正确回显，避免终端按字节删导致中文（3 字节 UTF-8）删半个字符而乱码。仅在 stdin 为终端时启用；管道/重定向时自动回退到 `std::getline`。
+8. **资源生命周期**：循环内不调用 `release_resources`；仅在「主动清空上下文」时调用 `rknn3_session_clear_kvcache`，其余资源统一在循环退出后释放。
 
 ---
 
 ## 9. 常见问题
 
 **Q1：如何在一行里输入中文/空格？**
-直接输入即可，程序按整行读取（`std::getline`），内部使用 UTF-8 编码的 tokenizer。
+直接输入即可。程序用 `read_line_utf8` 按行读取（终端下为 UTF-8 感知的 raw 模式），内部 tokenizer 使用 UTF-8 编码。
 
 **Q2：能设置每轮回复长度吗？**
 可以，用 `--predict <count>` 设置每轮最大生成 token 数；命中 EOS 会提前结束。
 
-**Q3：历史能累积多少轮？**
-受 `--ctx-size`（`max_context_len`）限制。累计 token 接近上限后，程序会**自动清空 KV cache 并开启一段新对话**（会打印 warning），而不是让 runtime 静默失败。若需保留更长的上下文，请增大 `--ctx-size`（受模型导出时的 `kvcache_buffer_len` 约束）。
+**Q3：历史能累积多少轮？上下文长度如何设置？**
+受**模型内建的 `kvcache_buffer_len`** 限制，而非仅靠命令行 `--ctx-size`。累计 token 接近上限后，程序会**自动清空 KV cache 并开启一段新对话**（会打印 warning），而不是让 runtime 静默失败。要支持更长上下文，必须**从模型转换时开始**修改（见第 10 节）。
 
 **Q4：多轮模式会不会比单次慢？**
 首轮 prefill 与单次一致；后续轮次因历史 KV cache 已存在，prefill 只需处理新增输入，但总上下文越长，decode 阶段注意力计算开销越大。
@@ -207,4 +208,35 @@ printf '第一句话\n第二句话\n' | taskset f0 ./rknn_multicard_demo ... --i
 程序读到 EOF 后自动结束并打印性能统计。
 
 **Q6：为什么多轮后报 `prefill/decode did not return token`？**
-这是上下文写满的典型症状：累计 token（prefill + decode）达到 `--ctx-size` 上限后，runtime 无法继续写入 KV cache，于是不再产出 token。新版 demo 会在接近上限时主动清空 KV cache（见第 8 节第 6 点），避免该错误；若仍出现，请确认 `--ctx-size` 与模型 `kvcache_buffer_len` 是否匹配。
+这是上下文写满的典型症状：累计 token（prefill + decode）达到实际生效的上限后，runtime 无法继续写入 KV cache，于是不再产出 token。新版 demo 会在接近上限时主动清空 KV cache（见第 8 节第 6 点），避免该错误。
+
+**Q7：为什么 MobaXterm 里输入中文后按退格会乱码？**
+这是终端「按字节删字符」导致的：`std::getline` 依赖终端的行编辑（canonical 模式），退格一次只删 1 个字节，而一个中文是 3 字节 UTF-8，删半个字符就会乱码。新版 demo 已改用 UTF-8 感知的 raw 行读取（`read_line_utf8`），退格会删除完整字符并正确回显，可解决该问题。
+
+---
+
+## 10. 如何修改上下文长度（模型侧）
+
+**上下文长度是在模型转换（导出 .rknn）时由 `kvcache_buffer_len` 与 `max_position_embeddings` 决定的**，运行时只能从模型内建的长度里选择最接近的值，无法靠 `--ctx-size` 突破内建上限。
+
+当前 Qwen3.5/Gemma-4 的默认配置为 `4096`（见 `examples/multicard/python/qwen3_5/export_rknn_segment.py` 的 `_build_llm_config`）：
+
+```python
+llm_config['attention_config'][0]['kvcache_buffer_len'] = 4 * 1024
+llm_config['attention_config'][0]['max_position_embeddings'] = 4 * 1024
+```
+
+要支持更长的上下文（例如 8192），步骤：
+
+1. 修改 `kvcache_buffer_len` 与 `max_position_embeddings`（两者通常保持一致），例如改为 `8 * 1024`。
+2. 若之前已完整导出过（存在 `tmp_segN/`），可用 `--rebuild` 快速重建，否则重新完整导出：
+   ```bash
+   cd examples/multicard/python/qwen3_5
+   python export_rknn_segment.py --multi_segment --num_segments 4 --rebuild
+   ```
+3. 重新部署新导出的 `.rknn` / `.weight` 到开发板。
+4. 运行时把 `--ctx-size` 设为与新内建长度匹配的值（如 `8192`）。
+
+> 注意：
+> - `kvcache_buffer_len` 越大，KVCache 与内部显存占用越大（见各段 `model_report.html`），需确认板端内存充足。
+> - 若运行时 `--ctx-size` 超过内建长度，程序会打印 `[warning] --ctx-size ... exceeds ... kvcache_buffer_len`，且 runtime 会就近回退到内建长度。

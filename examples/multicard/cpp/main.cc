@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -33,11 +34,13 @@
 #include <functional>
 #include <inttypes.h>
 #include <iostream>
+#include <locale.h>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#include <wchar.h>
 #include "nlohmann/json.hpp"
 
 #define LOGW(fmt, ...) printf("\033[33m" fmt "\033[0m", ##__VA_ARGS__)
@@ -1939,8 +1942,93 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
   return true;
 }
 
+// 返回字符串 s 中从 start 开始的一个 UTF-8 字符的终端显示列宽（中文等宽字符为 2，ASCII 为 1）。
+static int utf8_char_width(const std::string& s, size_t start)
+{
+  if (start >= s.size()) {
+    return 1;
+  }
+  mbstate_t state;
+  memset(&state, 0, sizeof(state));
+  wchar_t wc = 0;
+  size_t n = mbrtowc(&wc, s.data() + start, s.size() - start, &state);
+  if (n == (size_t)-1 || n == (size_t)-2) {
+    return 1;
+  }
+  int w = wcwidth(wc);
+  return w < 0 ? 1 : w;
+}
+
+// 从 stdin 读取一行，支持 UTF-8 多字节字符的正确退格删除。
+// 仅当 stdin 是终端时启用 raw 模式；管道/重定向时回退到 std::getline。
+// 返回 true 表示读到一行；false 表示 EOF（Ctrl-D 空行或输入流结束）。
+static bool read_line_utf8(std::string& line)
+{
+  if (!isatty(STDIN_FILENO)) {
+    return static_cast<bool>(std::getline(std::cin, line));
+  }
+
+  struct termios old_tio;
+  struct termios new_tio;
+  if (tcgetattr(STDIN_FILENO, &old_tio) != 0) {
+    return static_cast<bool>(std::getline(std::cin, line));
+  }
+  new_tio = old_tio;
+  new_tio.c_lflag &= ~(tcflag_t)(ICANON | ECHO | ISIG);
+  new_tio.c_cc[VMIN] = 1;
+  new_tio.c_cc[VTIME] = 0;
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &new_tio) != 0) {
+    return static_cast<bool>(std::getline(std::cin, line));
+  }
+
+  line.clear();
+  char ch;
+  ssize_t n;
+  bool eof = false;
+  while ((n = read(STDIN_FILENO, &ch, 1)) > 0) {
+    unsigned char c = (unsigned char)ch;
+    if (c == '\n' || c == '\r') {
+      printf("\n");
+      fflush(stdout);
+      break;
+    }
+    if (c == 0x03 || (c == 0x04 && line.empty())) {
+      // Ctrl-C，或空行时的 Ctrl-D：当作 EOF
+      eof = true;
+      printf("\n");
+      fflush(stdout);
+      break;
+    }
+    if (c == 0x7f || c == 0x08) {
+      // 退格：删除最后一个完整 UTF-8 字符（跳过续字节 0x80-0xBF）
+      if (!line.empty()) {
+        size_t pos = line.size() - 1;
+        while (pos > 0 && ((unsigned char)line[pos] & 0xC0) == 0x80) {
+          --pos;
+        }
+        int w = utf8_char_width(line, pos);
+        line.erase(pos);
+        for (int i = 0; i < w; ++i) printf("\b");
+        for (int i = 0; i < w; ++i) printf(" ");
+        for (int i = 0; i < w; ++i) printf("\b");
+        fflush(stdout);
+      }
+      continue;
+    }
+    line.push_back(ch);
+    printf("%c", ch);
+    fflush(stdout);
+  }
+
+  tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+  return !eof;
+}
+
 int main(int argc, char** argv)
 {
+  // 让 wcwidth/mbrtowc 按当前 locale（UTF-8）正确计算宽字符列宽。
+  setlocale(LC_ALL, "");
+
   if (argc == 2 && strcmp(argv[1], "--help") == 0) {
     print_usage(argv[0]);
     return 0;
@@ -2184,6 +2272,15 @@ int main(int argc, char** argv)
     return -1;
   }
 
+  // 检查命令行请求的上下文长度是否超过模型内建的 kvcache_buffer_len。
+  if (stages[0].max_ctx_len > 0 && max_context_len > stages[0].max_ctx_len) {
+    printf("\n[warning] --ctx-size %d exceeds the model's built-in kvcache_buffer_len %d; "
+           "the runtime will fall back to %d.\n"
+           "          To use a longer context, re-export the model with a larger "
+           "kvcache_buffer_len / max_position_embeddings.\n",
+           max_context_len, stages[0].max_ctx_len, stages[0].max_ctx_len);
+  }
+
   std::vector<int32_t> performance_input_tokens;
   if (g_performance_mode) {
     uint64_t required_context_tokens = performance_input_length + performance_output_length - 1;
@@ -2228,7 +2325,7 @@ int main(int argc, char** argv)
     while (true) {
       printf("\nUser: ");
       fflush(stdout);
-      if (!std::getline(std::cin, user_input)) {
+      if (!read_line_utf8(user_input)) {
         printf("\n");
         break;
       }
@@ -2238,7 +2335,11 @@ int main(int argc, char** argv)
 
       // 预留本轮 decode（max_new_tokens）+ 下一轮 prefill（chat 模板）的余量。
       // 当剩余上下文不足以再容纳一轮时，主动清空 KV cache 开启新对话，避免 runtime 静默失败。
-      const uint64_t context_limit = (uint64_t)max_context_len;
+      // 注意：实际生效的上限是模型导出时内建的 kvcache_buffer_len（stages[0].max_ctx_len），
+      // 而非命令行请求的 --ctx-size（后者若超过内建长度会被 runtime 就近回退）。
+      const uint64_t context_limit = stages[0].max_ctx_len > 0
+                                         ? (uint64_t)stages[0].max_ctx_len
+                                         : (uint64_t)max_context_len;
       const uint64_t turn_reserve = (uint64_t)max_new_tokens + 512;
       if (context_tokens > 0 && context_tokens + turn_reserve >= context_limit) {
         printf("\n[warning] context %llu/%llu tokens nearly full, clearing KV cache to start a fresh conversation\n",
