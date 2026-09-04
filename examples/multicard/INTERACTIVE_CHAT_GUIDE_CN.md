@@ -161,8 +161,6 @@ Per-Stage Performance Statistics:
 | `--rope-tensor <safetensors>` | 外置 Rope Cache（Qwen3.5/Gemma-4 必填） | `${MODEL_DIR}/..._seg0.safetensors` |
 | `-i, --interactive` | **开启多轮对话模式** | （开关） |
 | `-n, --predict <count>` | 每轮最多生成的 token 数 | `128`（按需调整） |
-| `--kvcache-policy <p>` | KV cache 策略：`normal` 或 `recurrent` | 默认不显式设置 |
-| `--kvcache-keep <n>` | recurrent 策略下保留的 cache 数 | 按需设置 |
 | `--device-id <id0#id1#...>` | 手动指定设备 ID（可选，默认自动分配） | 通常省略 |
 
 > 若不传 `--interactive`，则保持原有单次推理行为（`--prompt` 或 `--perf`）。
@@ -242,30 +240,3 @@ llm_config['attention_config'][0]['max_position_embeddings'] = 4 * 1024
 > 注意：
 > - `kvcache_buffer_len` 越大，KVCache 与内部显存占用越大（见各段 `model_report.html`），需确认板端内存充足。
 > - 若运行时 `--ctx-size` 超过内建长度，程序会打印 `[warning] --ctx-size ... exceeds ... kvcache_buffer_len`，且 runtime 会就近回退到内建长度。
-
----
-
-## 11. KV cache 策略（内存受限时的长上下文方案）
-
-在协处理器（RK1828）本地内存有限、又不希望频繁清空对话历史的情况下，可用 **recurrent KV cache 策略**：KV cache 只保留最近的 N 个 token，超出部分循环覆盖，从而在固定内存下支持更长对话。
-
-```bash
-taskset f0 ./rknn_multicard_demo \
-    --model ..._seg0.rknn --weight ..._seg0.weight \
-    --vocab ...tokenizer.gguf --embed ...embed.bin \
-    --ctx-size 4096 --core-mask 0xff \
-    --stage-count 4 --bucket-size 128 \
-    --rope-tensor ..._seg0.safetensors \
-    --interactive --predict 128 \
-    --kvcache-policy recurrent --kvcache-keep 2048
-```
-
-- `--kvcache-policy recurrent`：启用循环缓存策略。
-- `--kvcache-keep 2048`：只保留最近 2048 个 token 的 KV（配合模型内建的 `kvcache_buffer_len`，实际对齐到 `kvcache_group_size`）。
-
-> 说明：
-> - 该能力来自 `rknn3_session_set_kvcache_policy`（`RKNN3_KVCACHE_POLICY_RECURRENT`）。
-> - 官方头文件注释指出，recurrent/checkpoint 策略**仅对含 linear attention 或 sliding attention 的模型（Qwen3.5 / Gemma4 系列）生效**，其他模型无效果。
-> - `n_keep` 越小，保留的上下文越短、内存占用越低，但会遗忘更早的历史。
-> - 若模型已通过 chat template 固定了 system prompt，`n_keep`/`n_keep_aligned` 会被忽略而自动使用 system prompt 长度。
-> - 是否真的能降低 KVCache 物理内存占用，取决于运行时对 `kvcache_buffer_len` 的分组实现；建议在板端用 `--kvcache-policy recurrent --kvcache-keep <n>` 实测内存占用与效果。
