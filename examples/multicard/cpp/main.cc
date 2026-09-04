@@ -2402,18 +2402,22 @@ int main(int argc, char** argv)
       //   2) 不能用 max_new_tokens 做余量——decode 通常遇 EOS 就停，实际远用不满；
       //      否则 --predict 较大时会误判“上下文已满”。真正的 decode 溢出由下面
       //      的 context_tokens 累计 + 下一轮 guard 兜底。
-      const uint64_t context_limit = stages[0].max_ctx_len > 0
-                                         ? (uint64_t)stages[0].max_ctx_len
-                                         : (uint64_t)max_context_len;
-      const uint64_t prefill_reserve = 512;
-      if (context_tokens > 0 && context_tokens + prefill_reserve >= context_limit) {
-        printf("\n[warning] context %llu/%llu tokens nearly full, clearing KV cache to start a fresh conversation\n",
-               (unsigned long long)context_tokens, (unsigned long long)context_limit);
-        for (size_t i = 0; i < stages.size(); ++i) {
-          rknn3_session_clear_kvcache(stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+      //   3) 启用 recurrent 策略时，KV cache 由 runtime 自行循环覆盖，不需要、
+      //      也不应该由应用层主动清空（否则会打断循环，且感知不到 recurrent 效果）。
+      if (g_kvcache_policy != RKNN3_KVCACHE_POLICY_RECURRENT) {
+        const uint64_t context_limit = stages[0].max_ctx_len > 0
+                                           ? (uint64_t)stages[0].max_ctx_len
+                                           : (uint64_t)max_context_len;
+        const uint64_t prefill_reserve = 512;
+        if (context_tokens > 0 && context_tokens + prefill_reserve >= context_limit) {
+          printf("\n[warning] context %llu/%llu tokens nearly full, clearing KV cache to start a fresh conversation\n",
+                 (unsigned long long)context_tokens, (unsigned long long)context_limit);
+          for (size_t i = 0; i < stages.size(); ++i) {
+            rknn3_session_clear_kvcache(stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+          }
+          context_tokens = 0;
+          first_turn = true;
         }
-        context_tokens = 0;
-        first_turn = true;
       }
 
       std::string chat_prompt;
