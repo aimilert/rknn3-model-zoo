@@ -52,6 +52,8 @@ static bool g_verbose = false;
 static bool g_ignore_eos = false;
 static bool g_interactive = false;
 static bool g_performance_mode = false;
+static int  g_kvcache_policy = -1;   // -1 = 未显式设置，使用 runtime 默认策略
+static int64_t g_kvcache_keep = 0;   // recurrent 策略保留的 cache 数（0 = 不指定）
 static bool g_tensor_dump_enabled = false;
 static std::string g_tensor_dump_dir;
 static std::mutex g_tensor_dump_mutex;
@@ -488,6 +490,16 @@ static bool parse_positive_i32(const char* value, int32_t* result)
   return true;
 }
 
+static bool parse_positive_i64(const char* value, int64_t* result)
+{
+  uint64_t parsed = 0;
+  if (!result || !parse_positive_u64(value, &parsed) || parsed > 0x7fffffffffffffffULL) {
+    return false;
+  }
+  *result = (int64_t)parsed;
+  return true;
+}
+
 static bool parse_bool01(const char* value, bool* result)
 {
   if (!value || !result) {
@@ -546,6 +558,8 @@ struct CommandLineOptions
   bool        verbose = false;
   bool        ignore_eos = false;
   bool        interactive = false;
+  int         kvcache_policy = -1;   // -1 = 未设置
+  int64_t     kvcache_keep = 0;
   const char* rope_path = nullptr;
   const char* tensor_dump_dir = nullptr;
   std::vector<std::string> device_ids;
@@ -569,6 +583,8 @@ static void print_usage(const char* program)
   printf("  --verbose                     enable verbose logs\n");
   printf("  --ignore-eos                  ignore EOS during generation\n");
   printf("  --interactive, -i             interactive multi-turn chat mode (reads stdin)\n");
+  printf("  --kvcache-policy <p>          KV cache policy: normal | recurrent (default: runtime default)\n");
+  printf("  --kvcache-keep <n>            recurrent policy: number of caches to keep\n");
   printf("  --rope-tensor <safetensors>   external rope cache\n");
   printf("  --device-id <id[#id...]>      device IDs separated by '#'; optional\n");
   printf("  --perf <input> <output>       performance test mode\n");
@@ -708,6 +724,24 @@ static bool parse_named_command_line(int argc, char** argv, CommandLineOptions* 
       options->ignore_eos = false;
     } else if (strcmp(arg, "--interactive") == 0 || strcmp(arg, "-i") == 0) {
       options->interactive = true;
+    } else if (strcmp(arg, "--kvcache-policy") == 0) {
+      if (!take_option_value(argc, argv, &i, arg, &value)) return false;
+      if (strcmp(value, "normal") == 0) {
+        options->kvcache_policy = RKNN3_KVCACHE_POLICY_NORMAL;
+      } else if (strcmp(value, "recurrent") == 0) {
+        options->kvcache_policy = RKNN3_KVCACHE_POLICY_RECURRENT;
+      } else {
+        printf("%s requires normal or recurrent\n", arg);
+        return false;
+      }
+    } else if (strcmp(arg, "--kvcache-keep") == 0) {
+      int64_t parsed = 0;
+      if (!take_option_value(argc, argv, &i, arg, &value) ||
+          !parse_positive_i64(value, &parsed)) {
+        printf("%s requires a positive integer\n", arg);
+        return false;
+      }
+      options->kvcache_keep = parsed;
     } else if (strcmp(arg, "--rope-tensor") == 0 || strcmp(arg, "--rope") == 0 ||
                strcmp(arg, "--rope-path") == 0) {
       if (!take_option_value(argc, argv, &i, arg, &options->rope_path)) return false;
@@ -1651,6 +1685,32 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
     return false;
   }
   rknn3_session_set_chat_template(stage.session, "", "", "");
+
+  // 设置 KV cache 策略（仅在显式指定时调用）。
+  if (g_kvcache_policy >= 0) {
+    rknn3_kvcache_policy_param policy_param;
+    memset(&policy_param, 0, sizeof(policy_param));
+    if (g_kvcache_policy == RKNN3_KVCACHE_POLICY_RECURRENT && g_kvcache_keep > 0) {
+      policy_param.recurrent.n_keep = g_kvcache_keep;
+      policy_param.recurrent.n_keep_aligned = g_kvcache_keep;
+    }
+    int pret = rknn3_session_set_kvcache_policy(stage.session,
+                                                (rknn3_kvcache_policy)g_kvcache_policy,
+                                                &policy_param);
+    if (pret != RKNN3_SUCCESS) {
+      printf("[%s] rknn3_session_set_kvcache_policy failed, ret=%d\n", stage.name.c_str(), pret);
+      destroy_stage(stage);
+      return false;
+    }
+    if (g_kvcache_policy == RKNN3_KVCACHE_POLICY_RECURRENT) {
+      printf("[%s] KV cache policy: recurrent (n_keep=%lld, n_keep_aligned=%lld)\n",
+             stage.name.c_str(), (long long)policy_param.recurrent.n_keep,
+             (long long)policy_param.recurrent.n_keep_aligned);
+    } else {
+      printf("[%s] KV cache policy: normal\n", stage.name.c_str());
+    }
+  }
+
   RKLLMCallback callback;
   memset(&callback, 0, sizeof(callback));
 
@@ -2050,6 +2110,8 @@ int main(int argc, char** argv)
   g_bucket_size = options.bucket_size;
   g_interactive = options.interactive;
   g_performance_mode = options.performance_mode;
+  g_kvcache_policy = options.kvcache_policy;
+  g_kvcache_keep = options.kvcache_keep;
 
   uint64_t performance_input_length = options.performance_input_length;
   uint64_t performance_output_length = options.performance_output_length;
