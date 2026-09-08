@@ -1,0 +1,34 @@
+# 默认：所有文本文件自动识别并统一用 LF
+* text=auto eol=lf
+
+# C/C++ 源文件
+*.c   text eol=lf
+*.cc  text eol=lf
+*.cpp text eol=lf
+*.h   text eol=lf
+*.hpp text eol=lf
+
+# 脚本文件
+*.sh  text eol=lf
+*.py  text eol=lf
+
+# 文档
+*.md  text eol=lf
+*.txt text eol=lf
+
+# 配置文件
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.cmake text eol=lf
+Makefile text eol=lf
+
+# 二进制文件不做换行符转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.so   binary
+*.a    binary
+*.o    binary
+*.bin  binary
+*.rknn binary
