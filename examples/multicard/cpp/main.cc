@@ -68,6 +68,14 @@ static bool g_suppress_generation_output = false;
 // 里的 TokenToPiece/Decode 由 N 个会话线程同时调用，这里串行化，代价可忽略
 // （一次调用是微秒级，相比 80ms/token 的推理可以不计）。
 static std::mutex g_tokenizer_mutex;
+// 交互式多会话把整段回复一次性打到 stdout。这把锁把 printf 与紧跟的 fflush 绑成
+// 一个整体，保证「一块回复」在一次持锁内完整落地，块与块之间的先后是可预期的。
+// （严格说，glibc 的 printf 本身对同一个 FILE 也持锁，单次调用不会被另一条线程从
+// 中间切开；这里加锁是为了把 printf+fflush 绑在一起、并让顺序确定，不是为了修
+// 一个已被证实存在的撕裂。）
+// 注意它挡不住 run_chat_turn 内部那几处裸 printf 的诊断信息插在块与块之间，
+// 那是失败路径，见交互驱动里的说明。
+static std::mutex g_output_mutex;
 
 enum class InferencePhase
 {
@@ -208,6 +216,23 @@ struct LastStageResultState
   // 会话私有的 token dump 文件。非空时优先于全局 g_token_dump。
   // 并发模式下每会话一个文件，避免 N 路 token 交错成一个文件。
   FILE*      token_dump = nullptr;
+  // 交互式多会话的「整段成块」输出缓冲。非空时回调把本会话这一轮生成的文本
+  // 追加到这里，而不是逐 token 打到 stdout（N 路并发的逐 token 打印会互相穿插）。
+  //
+  // 它指向对话驱动线程栈上的一个 std::string，跨线程传递，所以这里必须写清楚
+  // 为什么不会用到已析构的对象——**注意不是"同一个线程"**：
+  //   · 每个 stage 的 result_callback 都挂着同一个 &conv.result（init 里统一赋值），
+  //     而 stage 1..N-1 跑在 run_pipeline_once 临时起的 worker 线程上，不是驱动线程。
+  //   · 但只有最后一级会真正产出采样 token：infer_param.disable_sampling 默认为 true，
+  //     run_stage_worker 里只有 is_last_stage 才在最后一个桶上把它打开。所以真正
+  //     会 append 的只有最后一级那一条线程。
+  //   · 驱动线程在调用 run_pipeline_once **之前**写 block_out（创建 worker 线程之前，
+  //     写操作对它们可见）；run_pipeline_once 返回**之前** join 了所有 worker 线程，
+  //     驱动线程之后才清空它。两侧各有一条 happens-before 边。
+  // 也就是说这个安全性的前提是：回调是同步的、stage worker 不跨轮复用、
+  // run_pipeline_once 不会提前返回。这三条任何一条被改掉，block_out 立刻变成
+  // 指向已析构栈对象的悬垂指针——改动这条路径时请先回来看这段注释。
+  std::string* block_out = nullptr;
 };
 
 // 一个独立会话：自己的一整套 session、流水线队列、结果槽与统计。
@@ -230,6 +255,8 @@ struct Conversation
   int                       index = 0;
   bool                      failed = false;
   double                    wall_ms = 0.0;
+  // 交互式多会话专用：本会话处理完成的轮数。
+  int                       turns_done = 0;
 
   explicit Conversation(size_t stage_count) : stages(stage_count), pipeline(stage_count) {}
 };
@@ -711,7 +738,9 @@ static void print_usage(const char* program)
   printf("  -n/--predict/--n-predict <count>  maximum generated tokens (default: 512)\n");
   printf("  --verbose                     enable verbose logs\n");
   printf("  --ignore-eos                  ignore EOS during generation\n");
-  printf("  --interactive, -i             interactive multi-turn chat mode (reads stdin)\n");
+  printf("  --interactive, -i             interactive multi-turn chat mode (reads stdin)\n"
+         "                                with --sessions N: each stdin line is dispatched to\n"
+         "                                an idle session; replies print as [s<i>] blocks\n");
   printf("  --rope-tensor <safetensors>   external rope cache\n");
   printf("  --chat-template <auto|qwen|gemma>  multi-turn chat markers; auto (default)\n"
          "                                detects the model family from the rope cache\n");
@@ -790,15 +819,8 @@ static bool validate_command_line_options(const CommandLineOptions& options)
     return false;
   }
   if (options.has_sessions) {
-    // 并发执行器目前只覆盖「--prompt + --rounds」这条路径。interactive 需要在一份
-    // stdin 上给 N 个会话分派输入、并把 N 路输出各自成行，那是独立的一步；
-    // --perf 用它自己的长度驱动的循环，也还没并进来。这里直接拒绝，
+    // --perf 用它自己的长度驱动的循环，还没并进并发执行器；这里直接拒绝，
     // 免得出现「参数接受了但行为没测过」的组合。
-    if (options.interactive) {
-      printf("--sessions cannot be combined with --interactive yet; "
-             "use the default single-session path for interactive chat\n");
-      return false;
-    }
     if (options.performance_mode) {
       printf("--sessions cannot be combined with --perf yet; "
              "use the default single-session path for --perf\n");
@@ -808,7 +830,13 @@ static bool validate_command_line_options(const CommandLineOptions& options)
       printf("--sessions cannot be combined with --probe-sessions\n");
       return false;
     }
-    if (options.rounds > 1 && !options.prompt) {
+    // --interactive 与 --rounds 是两种不同的驱动方式：前者由 stdin 决定轮数，
+    // 后者由 --rounds 决定。同时给出来只会让人以为两个都生效。
+    if (options.interactive && options.rounds > 1) {
+      printf("--rounds does not apply to --interactive; each stdin line is one turn\n");
+      return false;
+    }
+    if (!options.interactive && options.rounds > 1 && !options.prompt) {
       printf("--rounds requires --prompt as the first turn's input\n");
       return false;
     }
@@ -1397,6 +1425,22 @@ static int result_callback(void* userdata, RKLLMResult* result, LLMCallState sta
         fprintf(token_dump, "%d\n", result->token_ids[i]);
       }
       fflush(token_dump);
+    }
+
+    // 交互式多会话：把这一轮的文本攒进会话自己的 buffer，跑完整段再打。
+    // 放在静音判断之前——并发交互模式正是靠这个取代逐 token 的 stdout 流。
+    if (result_state->block_out) {
+      std::string piece;
+      {
+        std::lock_guard<std::mutex> tokenizer_lock(g_tokenizer_mutex);
+        if (result->num_tokens == 1) {
+          piece = tokenizer->TokenToPiece(result->token_ids[0]);
+        } else {
+          piece = tokenizer->Decode(result->token_ids, result->num_tokens);
+        }
+      }
+      result_state->block_out->append(piece);
+      return 0;
     }
 
     if (g_performance_mode || g_suppress_generation_output) {
@@ -2328,6 +2372,263 @@ static void run_conversation_worker(Conversation& conv, std::vector<StageContext
 static uint64_t timeval_to_us(const timeval& tv)
 {
   return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+// ============================================================================
+// 交互式多会话（--sessions N --interactive）
+//
+// 与 --rounds 路径的区别只有一处：输入来自 stdin，而且是**不定时**来的。
+//
+// 分发策略「谁空闲给谁」：N 个会话驱动线程共用一条待办队列，谁先从队列里取到输入，
+// 谁就处理这一轮——"当时空闲"由「能从队列里取到活」直接定义，不需要另外维护一张
+// 忙/闲状态表。额外的状态表反而有窗口：某个会话刚跑完、还没来得及把自己标回空闲时，
+// 输入会被误分给一个其实不空闲的会话。
+//
+// 输出策略「整段成块 + 前缀」：一轮回复的全部文本先攒在会话私有的 buffer 里
+// （LastStageResultState::block_out），跑完再整体加 `[s<i>]` 前缀一次性打出。
+// 逐 token 直接打 stdout 在 N 路并发下必然互相穿插，读不出哪句属于哪个会话。
+// ============================================================================
+
+// 待办输入的容量上限。不设上限的话，往 stdin 里灌一大段文本会让待办无限膨胀，
+// 而每个会话的 KV 只装得下有限轮上下文。满了就让输入线程等一会（反压）。
+static const size_t kInteractivePendingCap = 32;
+
+struct InteractiveDispatcher
+{
+  std::mutex              mutex;
+  std::condition_variable cv_work;   // 会话线程等：有待办可取，或输入已结束
+  std::condition_variable cv_space;  // 输入线程等：待办队列没满
+  std::deque<std::string> pending;
+  bool                    input_eof = false;
+  // 输入线程自己读到 EOF 而退出。与 input_eof 分开：input_eof 也会被「会话全部
+  // 退出」这种情况置位，两者的语义不同，混用会误判输入线程是否还卡在 getline 上。
+  bool                    input_finished = false;
+  // 还活着的会话线程数。用于兜住一种会挂死的收尾情况：所有会话都因推理失败
+  // 提前退出，而输入线程正卡在「待办队列满了」的反压等待上——没人会再来消费
+  // 队列，它就永远等下去。归零时把输入线程一并放行。
+  int                     active_workers = 0;
+};
+
+// 整段输出（回复块、或本会话的系统提示）都走这里，保证不会两段撞在一行中间。
+static void print_session_block(int index, const std::string& text)
+{
+  std::lock_guard<std::mutex> lock(g_output_mutex);
+  printf("[s%d] %s\n", index, text.c_str());
+  fflush(stdout);
+}
+
+// 一个会话的交互驱动循环：取到一行输入 → 跑完整一轮 → 整段打出 → 回去接着等。
+static void run_interactive_session_worker(int index, Conversation& conv,
+                                           std::vector<StageContext>& stages,
+                                           const VocabInfo& vocab_info,
+                                           const ChatTemplateSpec* tpl,
+                                           int max_new_tokens, uint64_t context_limit,
+                                           InteractiveDispatcher* dispatcher,
+                                           SessionTiming* timing)
+{
+  // 计时从**第一轮真正开工**起算，而不是本线程启动的那一刻。交互模式下输入是不
+  // 定时来的，从线程启动起算会把用户思考/打字的时间算进并发窗口，聚合出来的
+  // tok/s 就会随人多想几秒而变——那个数就不是吞吐了。
+  bool           timing_started = false;
+  const uint64_t prefill_reserve = 512;
+  std::string    user_input;
+
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lock(dispatcher->mutex);
+      dispatcher->cv_work.wait(lock, [dispatcher]() {
+        return !dispatcher->pending.empty() || dispatcher->input_eof;
+      });
+      if (dispatcher->pending.empty()) {
+        break;  // 输入已结束且待办已空
+      }
+      user_input = dispatcher->pending.front();
+      dispatcher->pending.pop_front();
+      dispatcher->cv_space.notify_one();  // 队列腾出位置，放行输入线程
+    }
+
+    if (!timing_started) {
+      gettimeofday(&timing->start, NULL);
+      timing_started = true;
+    }
+
+    // 与单会话交互模式同一条策略：上下文快满了就清 KV 重开一段对话，
+    // 只影响本会话。context_tokens/first_turn 都是会话私有的。
+    //
+    // 注意这里**没有**取卡级 run_mutex：清 KV 只动本会话自己的 KV 缓冲（P0 探针已证
+    // KV 隔离），但这毕竟是同一张卡 context 上的一次 SDK 调用，而另一路会话可能正在
+    // 同一 context 里跑 session_run。这条写法是从 --rounds 路径原样继承的（那一路的
+    // token 已逐字节验收过），当前没有证据说它有问题，也**没有验证过它一定安全**。
+    // 列为待确认项，不要因为"从别处抄的"就当它已经验过。
+    if (conv.context_tokens > 0 && context_limit > 0 &&
+        conv.context_tokens + prefill_reserve >= context_limit) {
+      print_session_block(index,
+          "(context " + std::to_string(conv.context_tokens) + "/" +
+          std::to_string(context_limit) +
+          " tokens nearly full, clearing KV cache to start a fresh conversation)");
+      for (size_t i = 0; i < stages.size(); ++i) {
+        rknn3_session_clear_kvcache(conv.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+      }
+      conv.context_tokens = 0;
+      conv.first_turn = true;
+    }
+
+    std::string chat_prompt;
+    if (conv.first_turn) {
+      // Gemma-4 没有 system role，其 system_prompt 为空串，这里自然退化为不带 system 轮。
+      chat_prompt = tpl->system_prompt;
+      chat_prompt += tpl->user_prefix;
+      chat_prompt += user_input;
+      chat_prompt += tpl->user_postfix;
+      conv.first_turn = false;
+    } else {
+      chat_prompt = tpl->user_prefix;
+      chat_prompt += user_input;
+      chat_prompt += tpl->user_postfix;
+    }
+
+    std::string block;
+    conv.result.block_out = &block;
+    ChatTurnResult turn;
+    const bool ok = run_chat_turn(stages, conv, vocab_info, chat_prompt.c_str(),
+                                 max_new_tokens, &turn);
+    conv.result.block_out = nullptr;
+
+    // 注意：run_chat_turn 内部的失败诊断（"prefill failed" 等）仍是裸 printf，
+    // 会插在别人的回复块之间——那是终止性错误路径，不值得为它把共享函数改复杂。
+    // 这里再补一条带前缀的、明确属于本会话的记录。
+    if (!ok) {
+      conv.failed = true;
+      print_session_block(index, block.empty() ? "*** turn failed"
+                                               : block + "\n*** turn failed");
+      break;
+    }
+
+    print_session_block(index, block);
+    conv.turns_done += 1;
+    conv.total_prefill_tokens += turn.prefill_tokens;
+    conv.total_decode_tokens += turn.decode_tokens;
+    conv.total_prefill_ms += turn.prefill_ms;
+    conv.total_decode_ms += turn.decode_ms;
+    conv.context_tokens += turn.prefill_tokens + turn.decode_tokens;
+  }
+
+  gettimeofday(&timing->end, NULL);
+  timing->valid = true;
+  conv.wall_ms = elapsed_us(timing->start, timing->end) / 1e3;
+
+  // 会话线程退出登记（正常收工与推理失败两条路径都会走到这里，因为两个出口都是
+  // break 出循环）。最后一个退出的人负责把输入线程也放行，见 active_workers 注释。
+  bool all_gone = false;
+  bool input_still_reading = false;
+  {
+    std::lock_guard<std::mutex> lock(dispatcher->mutex);
+    if (--dispatcher->active_workers == 0) {
+      dispatcher->input_eof = true;
+      all_gone = true;
+      // 输入线程若正阻塞在 getline 上（只有终端会这样），上面那个 notify 是叫不醒
+      // 它的——stdin 上的阻塞读没法被条件变量打断。此时进程会在 main 的
+      // input_thread.join() 上一直等到用户敲一下回车或 Ctrl-D，看上去像卡死。
+      // 管道/重定向输入不会走到这里：那种情况下输入线程会在下一次醒来时看到
+      // active_workers == 0 主动退出。所以这里只对终端提示一句，让它不像卡死。
+      input_still_reading = !dispatcher->input_finished;
+    }
+    dispatcher->cv_space.notify_all();
+    dispatcher->cv_work.notify_all();
+  }
+  if (all_gone && input_still_reading && isatty(STDIN_FILENO)) {
+    std::lock_guard<std::mutex> lock(g_output_mutex);
+    printf("[interactive] all sessions have exited; "
+           "press Enter or Ctrl-D to finish\n");
+    fflush(stdout);
+  }
+}
+
+// 输入线程：把 stdin 的每一行放进待办队列，满了就等。
+static void run_interactive_input_worker(InteractiveDispatcher* dispatcher)
+{
+  std::string line;
+  // 这里刻意不用 read_line_utf8：它自己逐字符回显并处理退格，而此刻 N 路回复
+  // 正在往同一个 stdout 上打，回显会把行内容插进别人的回复块中间。改用规范模式下的
+  // std::getline，行编辑与回显交给终端驱动，谁也干扰不到谁。
+  while (std::getline(std::cin, line)) {
+    if (!line.empty() && line[line.size() - 1] == '\r') {
+      line.erase(line.size() - 1);  // stdin 若是 CRLF（管道/文件）就去掉行尾 \r
+    }
+    if (line.empty()) {
+      continue;  // 与单会话交互模式一致：空行不当作一轮输入
+    }
+    std::unique_lock<std::mutex> lock(dispatcher->mutex);
+    dispatcher->cv_space.wait(lock, [dispatcher]() {
+      return dispatcher->pending.size() < kInteractivePendingCap ||
+             dispatcher->active_workers == 0;
+    });
+    if (dispatcher->active_workers == 0) {
+      break;  // 会话已全部退出（推理失败），再收输入也没人消费了
+    }
+    dispatcher->pending.push_back(line);
+    dispatcher->cv_work.notify_one();
+  }
+
+  std::lock_guard<std::mutex> lock(dispatcher->mutex);
+  dispatcher->input_eof = true;
+  dispatcher->input_finished = true;
+  dispatcher->cv_work.notify_all();
+}
+
+// 交互式多会话的收尾统计。吞吐用与 --rounds 路径相同的「并发窗口」口径，
+// 不把各会话的时间相加（并发下那会重复计时）。
+static void report_interactive_sessions(
+    const std::vector<std::unique_ptr<Conversation>>& convs,
+    const std::vector<SessionTiming>& timings, int max_new_tokens)
+{
+  printf("\n=== Multi-Session Interactive Summary ===\n");
+  printf(" max tokens per turn: %d\n\n", max_new_tokens);
+  printf(" %-6s | %-6s | %-11s | %-10s | %-13s | %-8s\n",
+         "Session", "Turns", "Prefill tok", "Decode tok", "Decode tok/s", "Status");
+  printf("---------------------------------------------------------------------------\n");
+
+  uint64_t total_decode_tokens = 0;
+  for (size_t i = 0; i < convs.size(); ++i) {
+    const Conversation& conv = *convs[i];
+    const double decode_s = conv.total_decode_ms / 1e3;
+    const double decode_tps = decode_s > 0.0 ? (double)conv.total_decode_tokens / decode_s : 0.0;
+    total_decode_tokens += conv.total_decode_tokens;
+    printf(" s%-5zu | %-6d | %-11llu | %-10llu | %-13.2f | %-8s\n",
+           i, conv.turns_done,
+           (unsigned long long)conv.total_prefill_tokens,
+           (unsigned long long)conv.total_decode_tokens,
+           decode_tps,
+           conv.failed ? "FAILED" : "ok");
+  }
+  printf("---------------------------------------------------------------------------\n");
+
+  uint64_t window_start_us = 0;
+  uint64_t window_end_us = 0;
+  bool     window_valid = false;
+  for (const auto& t : timings) {
+    if (!t.valid) {
+      continue;
+    }
+    const uint64_t s = timeval_to_us(t.start);
+    const uint64_t e = timeval_to_us(t.end);
+    if (!window_valid) {
+      window_start_us = s;
+      window_end_us = e;
+      window_valid = true;
+    } else {
+      if (s < window_start_us) window_start_us = s;
+      if (e > window_end_us) window_end_us = e;
+    }
+  }
+  if (window_valid && window_end_us > window_start_us) {
+    const double window_s = (window_end_us - window_start_us) / 1e6;
+    printf(" total decode tokens: %llu over %.3f s (first turn start -> last turn end) = %.2f tok/s\n",
+           (unsigned long long)total_decode_tokens, window_s,
+           (double)total_decode_tokens / window_s);
+    printf(" (口径说明：窗口取各会话「第一轮开工」到「最后一轮结束」的并集，\n"
+           "  不包含纯等待输入的时间；与 --rounds 路径的聚合口径同源，可直接对比)\n");
+  }
 }
 
 // 并发模式的结果汇总。返回 0 表示所有会话都正常跑完。
@@ -3674,7 +3975,9 @@ int main(int argc, char** argv)
 
     // 逐 token 的 stdout 打印在 N 路并发下必然交错，且 printf 在热路径上会污染
     // 吞吐测量——并发模式一律静音，token 走每个会话自己的 dump 文件。
-    g_suppress_generation_output = true;
+    // 交互模式例外：它不静音，改用「整段成块」接管输出（见 block_out），
+    // 静音掉的话就什么都看不见了。
+    g_suppress_generation_output = !options.interactive;
 
     // 每个会话一个 token dump 文件：N=1 时就是 --dump-tokens 给的原路径（保持与
     // 单会话路径同一份文件、同样内容），N>1 时是 <path>.s<i>。
@@ -3698,32 +4001,70 @@ int main(int argc, char** argv)
     }
     if (dump_ok) {
       printf("\n=== Multi-Session Mode ===\n");
-      printf("concurrent conversations: %d, rounds per conversation: %d\n",
-             session_count, options.rounds);
+      const uint64_t context_limit = stages[0].max_ctx_len > 0
+                                         ? (uint64_t)stages[0].max_ctx_len
+                                         : (uint64_t)max_context_len;
+      std::vector<SessionTiming> timings(session_count);
+      std::vector<std::thread>   drivers;
+      drivers.reserve(session_count);
+
+      if (options.interactive) {
+        printf("concurrent conversations: %d, interactive (stdin)\n", session_count);
+      } else {
+        printf("concurrent conversations: %d, rounds per conversation: %d\n",
+               session_count, options.rounds);
+      }
       for (size_t i = 0; i < dump_paths.size(); ++i) {
         printf("[dump] session %zu token ids -> %s\n", i, dump_paths[i].c_str());
       }
 
-      StartGate gate(session_count);
-      std::vector<SessionTiming> timings(session_count);
-      const uint64_t context_limit = stages[0].max_ctx_len > 0
-                                         ? (uint64_t)stages[0].max_ctx_len
-                                         : (uint64_t)max_context_len;
+      int rc = 0;
+      if (options.interactive) {
+        // 交互式：一条 stdin 输入流 + N 个会话线程共用一条待办队列（谁空闲谁接）。
+        printf("Type a message and press Enter; each line goes to an idle session.\n");
+        printf("Output is printed as whole blocks prefixed with [s<i>]. Ctrl-D to exit.\n");
+        fflush(stdout);
 
-      std::vector<std::thread> drivers;
-      drivers.reserve(session_count);
-      for (int s = 0; s < session_count; ++s) {
-        drivers.emplace_back(run_conversation_worker,
-                             std::ref(*multi_conversations[s]), std::ref(stages),
-                             std::cref(vocab_info), chat_tpl, prompt, max_new_tokens,
-                             options.rounds, context_limit, &gate, &timings[s]);
-      }
-      for (auto& driver : drivers) {
-        driver.join();
-      }
+        InteractiveDispatcher dispatcher;
+        dispatcher.active_workers = session_count;
+        for (int s = 0; s < session_count; ++s) {
+          drivers.emplace_back(run_interactive_session_worker, s,
+                               std::ref(*multi_conversations[s]), std::ref(stages),
+                               std::cref(vocab_info), chat_tpl, max_new_tokens,
+                               context_limit, &dispatcher, &timings[s]);
+        }
+        // 输入线程与上面 N 个会话线程并发跑；stdin 结束时它会唤醒所有会话线程，
+        // 待办队列里剩下的输入仍会被处理完，全部退出后 join 才返回。
+        std::thread input_thread(run_interactive_input_worker, &dispatcher);
+        for (auto& driver : drivers) {
+          driver.join();
+        }
+        input_thread.join();
 
-      int rc = report_concurrent_sessions(multi_conversations, timings, prompt,
-                                          options.rounds, max_new_tokens);
+        report_interactive_sessions(multi_conversations, timings, max_new_tokens);
+        rc = 0;
+        for (const auto& conv : multi_conversations) {
+          if (conv->failed) {
+            rc = 1;
+            break;
+          }
+        }
+      } else {
+        // 同时起跑闸门：不设的话先起的会话会白跑一段，量出来的吞吐虚高。
+        StartGate gate(session_count);
+        for (int s = 0; s < session_count; ++s) {
+          drivers.emplace_back(run_conversation_worker,
+                               std::ref(*multi_conversations[s]), std::ref(stages),
+                               std::cref(vocab_info), chat_tpl, prompt, max_new_tokens,
+                               options.rounds, context_limit, &gate, &timings[s]);
+        }
+        for (auto& driver : drivers) {
+          driver.join();
+        }
+
+        rc = report_concurrent_sessions(multi_conversations, timings, prompt,
+                                        options.rounds, max_new_tokens);
+      }
       print_stage_performance_statistics(stages);
       for (auto& conv : multi_conversations) {
         for (size_t i = 0; i < stages.size(); ++i) {
