@@ -22,6 +22,9 @@
 6. **模型文件不需要重新转换。** 多会话是纯运行时改造，`.rknn`/`.weight`/`.safetensors`/`embed.bin`/`.tokenizer.gguf` 全部不动。这让版本管理简单很多（见 §8）。
 7. **内存不是瓶颈，不需要重新导出模型。** 实测每会话 KV 仅 **64.4–70.7 MB/卡**，且**在 `rknn3_session_init` 时按满上下文一次性预分配**——填入 3894 token 上下文后新增分配为 **0.0 MB**。所以容量只与「会话数」有关，与实际用掉多少上下文**完全解耦**；4 会话总开销固定在 ~283 MB/卡（4×70.7），与上下文填满与否无关。
    > ⚠️ **第 8 点的退路已作废**：卡内上限 5 个 session **不由内存决定**（失败时最紧 node 仍剩 93.7 MB，占基线 74%，够再放约 11 个会话的 KV）。因此**调小 `kvcache_len` 提高并发数这条路是无效的**——它降低的是每会话内存，而限制并发的不是内存。详见 §4.4。
+8. **P3（交互式多会话）已实现并验收**（见 §5 的 P3 完成记录）。`--sessions N --interactive` 解开了 P2 时期写死的互斥：一条输入线程 + 每会话一个 worker 抢同一个待办队列（**"谁空闲给谁"**），输出按**整段成块 + `[s<i>]` 前缀**打印，N 路不互相穿插。
+   > ✅ **实测（2026-09-14）**：N=1 时与 P1 交互黄金**逐 token 等价**（1539/1539、跨清 KV 3078/3078，清 KV 仍在 3826/4096）；N=4 + 12 行输入 → **恰好 12 个块、无穿插、4 个会话各分到 3 轮**（"谁空闲给谁"的正面证据），聚合 **37.70 tok/s**。
+   > 同批补齐了 §9.3 的 **30 分钟稳定性**（通过）与 §9.4 的 **TSan 跑一轮**（我们代码干净；SDK 内部有报告，边界见 §9.4）。**`--perf` 仍与 `--sessions` 互斥。**
 
 ---
 
@@ -512,25 +515,94 @@ P2 必须靠它——N 路会话并发时 stdout 会交错，文本对比不再�
 
 **P2 没做的事情（明确记账，别当成已完成）**
 
-1. **`--sessions` 与 `--interactive` 互斥。** 单线程 `read_line_utf8` 没法喂 N 路会话，
-   需要一输入线程 + 按会话分发 + N 路输出各自成行。参数校验里直接拒绝了这个组合。
-2. **`--sessions` 与 `--perf` 互斥**，同理。
-3. **没有测 30 分钟稳定性**（验收标准的第 3 条）。目前最长的单次运行是 6 轮交互
-   （3078 token，约 4 分钟）和 N=4 的 1024 token 压测（约 29 秒）。
+> 括号内为 2026-09-14 的更新状态；未标注的仍是欠账。
+
+1. ~~**`--sessions` 与 `--interactive` 互斥。** 单线程 `read_line_utf8` 没法喂 N 路会话，
+   需要一输入线程 + 按会话分发 + N 路输出各自成行。参数校验里直接拒绝了这个组合。~~
+   → ✅ **已在 P3 解开**（§5 的 P3 完成记录）。
+2. **`--sessions` 与 `--perf` 互斥**，同理。→ **仍然保留**（perf 模式是单会话标定用途）。
+3. ~~**没有测 30 分钟稳定性**（验收标准的第 3 条）。目前最长的单次运行是 6 轮交互
+   （3078 token，约 4 分钟）和 N=4 的 1024 token 压测（约 29 秒）。~~
+   → ✅ **已测，通过**（§9.3）。
 4. **没有验证方案 B**（每会话一份 `output_tensors`，每份约 1.3 MB，可去掉卡锁）。
    卡级锁已经拿到 83% 效率，方案 B 的潜在收益只有那剩下的 17%，而它要赌
-   "runtime 支持同 context 真并发"——不值得先做。
-5. 卡级统计仍是多会话混在一起（见表中 2.6 的 ⚠️）。
+   "runtime 支持同 context 真并发"——不值得先做。→ **仍然没做**。
+5. 卡级统计仍是多会话混在一起（见表中 2.6 的 ⚠️）。→ **仍然没做**。
+6. **没有跑 ASan/TSan** → ✅ TSan 已跑（§9.4）；**ASan 仍未跑**。
 
 ### P3：可选增强
 
-| # | 动作 | 依赖 |
-|---|---|---|
-| 3.1 | `rknn3_session_run_async` + `rknn3_session_pause/resume` 替换同步 `session_run` | 需先确认 async 语义与 callback 时序 |
-| 3.2 | 会话持久化：`rknn3_session_save_kvcache` / `load_kvcache_from_path`（`rknn3_api.h:1610-1633`） | 让会话可挂起/恢复/迁移 |
-| 3.3 | 前端服务化（HTTP/WebSocket），每连接一个 `Conversation` | 需先有 P2 的调度 |
-| 3.4 | 常驻 worker 线程池（§3.3 方案 B） | 若线程抖动成为瓶颈 |
-| 3.5 | 动态会话数（按负载创建/回收） | 受 KV cache 总容量硬约束 |
+| # | 动作 | 依赖 | 状态 |
+|---|---|---|---|
+| 3.0 | **交互式多会话**：`--sessions N --interactive`，stdin 分发到 N 路 | 无（P2 已完成调度） | ✅ **已完成（2026-09-14）**，见下 |
+| 3.1 | `rknn3_session_run_async` + `rknn3_session_pause/resume` 替换同步 `session_run` | 需先确认 async 语义与 callback 时序 | 未做 |
+| 3.2 | 会话持久化：`rknn3_session_save_kvcache` / `load_kvcache_from_path`（`rknn3_api.h:1610-1633`） | 让会话可挂起/恢复/迁移 | 未做 |
+| 3.3 | 前端服务化（HTTP/WebSocket），每连接一个 `Conversation` | ~~需先有 P2 的调度~~ ✅ 已具备 | 未做（3.0 是它的前置） |
+| 3.4 | 常驻 worker 线程池（§3.3 方案 B） | 若线程抖动成为瓶颈 | 未做（实测线程开销 0.17%，暂无必要） |
+| 3.5 | 动态会话数（按负载创建/回收） | 受 KV cache 总容量硬约束 | 未做 |
+
+#### P3 完成记录：**交互式多会话已实现，验收全部通过（2026-09-14）** ✅
+
+**版本指纹**
+
+| 项 | 值 |
+|---|---|
+| commit | `075a7a4` multicard: interactive multi-session over --sessions (P3) |
+| 分支 / tag | `feature/multisession-concurrency` / `p3-interactive` |
+| 源码 md5 | `ff85aa377f91eb3b5e543dfa8754e4c6` |
+| 二进制 md5 | `d30ce8af8b508dd783cfa934100b462f`（板上文件名 `rknn_multicard_demo.p3`） |
+
+**落地形态**
+
+- **互斥解开**：`validate_command_line_options` 里去掉了 `--interactive` + `--sessions` 的拒绝；
+  `--perf` + `--sessions` 的拒绝**保留**。新增 `--rounds` + `--interactive` 的拒绝
+  （两种驱动方式不该同时生效，rc=255）。
+- **分派：谁空闲给谁。** 一条输入线程读 stdin，把整行推进 `InteractiveDispatcher`
+  的 `pending` 队列；每条会话一个 worker 线程按"抢到就干"消费。**不预先指派**
+  哪一行归哪个会话——这是与"轮询均摊"不同的语义，也是用户选定的方案。
+- **输出：整段成块 + `[s<i>]` 前缀。** 生成过程全程不打印，一轮生成完整回复后
+  一次性 `printf("[s%d] %s\n")` + `fflush`。
+  实现上复用了 `LastStageResultState::block_out`：只有最后一阶段会采样
+  （`disable_sampling` 只在非末阶段为 true），所以**只有一个线程会往 `block_out` 追加**。
+- **背压**：`pending` 上限 `kInteractivePendingCap = 32`，输入线程在队列满时等 `cv_space`。
+- **防挂死的两个细节**（都是先审出来、后写进去的）：
+  ① 若所有会话都提前失败，输入线程可能正卡在 `cv_space` 上——靠 `active_workers`
+  计数进谓词并在归零时唤醒，保证一定退得出；
+  ② 若 stdin 是 TTY 且会话全挂了，`getline` 会一直等用户输入——检测到这种情况时
+  打印一行提示让用户按回车/Ctrl-D。
+- **统计口径**：交互模式的耗时窗口是**"首个真实轮次开始 → 最后一个轮次结束"**，
+  从线程启动开始计时会把人的思考时间算进去。
+
+**验收证据**（脚本 `run_p3_interactive.sh`，板卡 `<板卡临时目录>`）
+
+| 测试 | 方法 | 通过标准 | 实测 |
+|---|---|---|---|
+| IT-A 等价性 | `--sessions 1 --interactive -n 512 --ignore-eos < 3 行` | 与 P1 交互黄金逐 token 一致 | ✅ **IDENTICAL** `it_a.tok == it_p1.tok`（1539 token） |
+| IT-B 等价性（跨清 KV） | 同上，6 行输入 | 同上，且清 KV 行为一致 | ✅ **IDENTICAL** `it_b.tok == kv_p1.tok`（3078 token）；清 KV 恰好 1 次 @ 3826/4096 |
+| IT-C 结构性正确 | N=4 + 12 行输入，`-n 96 --ignore-eos` | 12 个块、无穿插、四路都分到活 | ✅ **12 个 `[s<i>]` 块**；含前缀行数 12 = 行首块数 12（**无穿插**）；**s0/s1/s2/s3 各 3 轮** |
+| IT-C token 总量 | 四路 dump 求和 | 12 × (1 prefill + 96 decode) = 1164 | ✅ **恰好 1164**（每会话 291） |
+| IT-D CLI 门 | `--sessions 4 --perf 512 128`；`--sessions 4 --interactive --rounds 2` | 两个组合都拒绝 | ✅ 均 rc=255 |
+| IT-E 崩溃检查 | 日志 grep | 无 segfault/abort/堆损坏 | ✅ 全部 0 命中 |
+
+> **IT-C 能验什么、不能验什么**：**哪些行落到哪个会话是不可预期的**（取决于当时谁空闲），
+> 所以它只验"结构与总量"，不能拿 token 内容跟任何黄金比。等价性必须靠 IT-A/IT-B 的 N=1
+> 构造来验——N=1 时所有输入必然按顺序落到 s0，与单会话路径一一对应。
+
+> ⚠️ **IT-C 里 `--ignore-eos` 的副作用**：这个 flag 让模型越过轮次边界继续生成，
+> 于是回复里会出现下一轮的模板标记。这是**测试 flag 的后果，不是缺陷**；
+> 真实验收用的是正常停止条件。
+
+> **待确认项（不要当成已验）**：worker 里的 `rknn3_session_clear_kvcache`
+> **没有持有卡级锁**。这是从已验收的 `--rounds` 路径**原样继承**的行为，
+> 本次没有独立验证过它是否需要锁（`--rounds` 路径下它出现在回合之间，
+> 而交互路径下别的会话可能正在同一张卡上跑）。
+> 之所以不改：改它等于**悄悄变更已验收路径的行为**。列为待确认项，留给后续单独验证。
+
+**同批完成的两项验证**（P2 的欠账）
+
+- ☑ **30 分钟稳定性**：见 §9.3。6 轮 N=4 全部 rc=0，吞吐无衰减，**首末轮 token 逐字节一致**。
+- ☑ **TSan 跑一轮**：见 §9.4。**我们自己的代码零竞争**；SDK 内部有报告，且单会话对照证明
+  其中一组与本次改造无关。**边界必须连同结论一起引用**。
 
 ### 工作量估算
 
@@ -551,8 +623,9 @@ P2 必须靠它——N 路会话并发时 stdout 会交错，文本对比不再�
 | M0 | P0 探针报告 | 权重共享 ✅/❌、每会话 KV 实测大小 —— **✅ 已完成** |
 | M1 | P1 重构（单会话） | decode 80.75ms/tok、逐 token 一致 —— **✅ 已完成（80.82 ms/tok，token 全中）** |
 | M2 | P2 并发（N=2） | 聚合 decode ≥ 20 tok/s，2 会话输出正确 —— **✅ 已完成（19.78 tok/s 同口径；纯 decode 每会话 11.4，token 全中）** |
-| M3 | P2 完成（N=3~4） | 聚合 decode ≥ 30 tok/s，30 分钟稳定性 —— **⚠️ 吞吐达标（N=3 28.63、N=4 35.74 ≈ 纯 decode 合成 41.6），30 分钟稳定性未测** |
-| M4 | P3 服务化 | HTTP 接口，多连接并发 —— 未开始 |
+| M3 | P2 完成（N=3~4） | 聚合 decode ≥ 30 tok/s，30 分钟稳定性 —— **✅ 全部完成（N=3 28.63、N=4 35.74；30 分钟稳定性已测，§9.3）** |
+| M4 | P3 交互式多会话 | `--sessions N --interactive`，N 路各自成块输出 —— **✅ 已完成（§5 的 P3 完成记录）** |
+| M5 | P3 服务化 | HTTP/WebSocket 接口，多连接并发 —— 未开始（M4 是它的前置） |
 
 ---
 
@@ -564,13 +637,14 @@ P2 必须靠它——N 路会话并发时 stdout 会交错，文本对比不再�
 | R2 | ~~**KV cache 总量超卡内存**~~ ✅ **已排除** | — | — | 实测每会话仅 64.4–70.7 MB/卡，4 会话共 ~283 MB，余量充足；且 KV 预分配、与上下文长度解耦（§4.1） |
 | R2b | **卡内 session 上限 5，且不由内存决定** | 已确知（非概率） | 中 | 目标 4 路有 1 个 session 余量；**不要超配到 5**。成因未定位（§4.4），调 ctx 无效 |
 | R3 | 同 context 并发导致 hidden states 串话 | 高（不处理必现） | 高 | §3.2 卡级锁 + 可选 per-session output mem |
-| R4 | **`malloc(): unaligned tcache chunk`** —— 此前已在本 demo 中出现过的堆损坏，根因未定位 | 中 | 高 | 改造后开 `-DENABLE_ASAN`（`cpp/CMakeLists.txt:10` 已有开关）跑长稳定性测试；怀疑与多线程下 runtime 内部状态有关，多会话会放大 |
+| R4 | **`malloc(): unaligned tcache chunk`** —— 此前已在本 demo 中出现过的堆损坏，根因未定位 | 中 | 高 | 改造后开 `-DENABLE_ASAN`（`cpp/CMakeLists.txt:10` 已有开关）跑长稳定性测试；怀疑与多线程下 runtime 内部状态有关，多会话会放大 —— **30 分钟稳定性里 0 命中（§9.3）；TSan 也没报堆相关（§9.4）。但 ASan 仍未跑，风险等级不下调。** |
 | R5 | 死锁（锁序错误） | 中 | 高 | 严格 stage 升序锁；加 `--sessions 1` 回退开关；持锁超时告警 |
-| R6 | SDK 未文档化的同 context 并发限制 | 中 | 中 | 卡级锁已把并发"降级"为卡内串行，风险大幅降低 |
+| R6 | SDK 未文档化的同 context 并发限制 | 中 | 中 | 卡级锁已把并发"降级"为卡内串行，风险大幅降低。**但 TSan 实测发现：卡级锁只能串行化调用方，管不到 SDK 自己那条回调/传输线程**——竞争报告全部落在 `librknn3_api_rkcp.so` 内部（§9.4）。未能定性真伪（库未插桩），**不视为已关闭** |
 | R7 | `libtokenizer.a` 是否线程安全未知 | 低 | 中 | 每会话各自持一个 `Tokenizer` 实例（而非共享），或给解码加锁；`init_tokenizer_and_embedding`（`main.cc:1459`）要改成可重入 |
 | R8 | 每 token 新建线程（`main.cc:1893`）× N 会话 → 线程风暴 | 低 | 低 | 实测 host 开销仅 0.17%，暂不处理；P3 换常驻池 |
 | R9 | N=4 时利用率 >100%，排队抖动放大 | 高 | 中 | 产品配置定为 N=2~3，N=4 仅压测 |
-| R10 | 交互输入单线程阻塞（`read_line_utf8`） | 高（不处理必现） | 低 | P2-2.5 拆输入线程 |
+| R10 | ~~交互输入单线程阻塞（`read_line_utf8`）~~ ✅ **已解决** | — | — | P3 拆出独立输入线程 + 待办队列 + 背压（§5 的 P3 完成记录）。**注意交互输入用的是普通 `std::getline`，不是 `read_line_utf8`**——后者逐字符回显，会与 N 路输出块互相穿插 |
+| R11 | **交互 worker 里的 `clear_kvcache` 未持卡锁**（从 `--rounds` 路径继承，未独立验证） | 低 | 中 | 列为待确认项（§5）。**没有擅自改已验收路径的行为**；后续单独验证"回合之间清 KV 是否需要卡锁" |
 
 ---
 
@@ -588,10 +662,18 @@ git checkout -b feature/multisession-concurrency
 #   6347f57  multicard: sink session state into a Conversation object (P1)
 #   446cbdf  multicard: drive N conversations concurrently (P2)
 #   fa8aa97  docs: 多 Session 并发推理方案（脱敏版）v1.1
+#   8f1cdbb  docs: P2 并发完成记录 + 修正 v1.1 里被实测推翻的预期
+#   075a7a4  multicard: interactive multi-session over --sessions (P3)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
+git tag p3-interactive  # 指向 P3 的代码 commit
 ```
+
+> **文档记录为什么总在下一个 commit**：完成记录里要写**本阶段 commit 的哈希**，
+> 而文档自己就在那个 commit 里——哈希写不进去（改一个字哈希就变）。
+> 所以沿用 P2 的做法：**代码一个 commit、文档记录一个 commit**，两者都推。
+> 顺序上文档在**工作区先改好**，哈希落地后才随第二个 commit 提交。
 
 **P1 为什么没有拆成 5 个 commit**：P1 的五步互相咬合——`Conversation` 一旦引入，
 `PipelineState`/`result`/`callback` 就必须同时改到 `Conversation` 上，否则编译不过；
@@ -613,7 +695,9 @@ git tag p2-concurrent
 | P1 源码快照 | `rt_work/main.cc.p1_session_split` | `dfad38d5bbe49dae699bc2da52708e01` |
 | P0+插桩源码 | `rt_work/main.cc.p0_dump` | `81857bf2fa962a85d54a5a89cb6929c2` |
 | P2 源码快照 | `rt_work/main.cc.p2_concurrent` | `ef943467048fd5f985a89e1ec725f248` |
-| 板卡二进制 | 见 §5 各阶段完成记录的表 | P0 `a6739a6e…` / P0+插桩 `205232b8…` / P1 `6f5aa9d7…` / P2 `8f6e900d…` |
+| P3 源码快照 | `rt_work/main.cc.p3_interactive` | `ff85aa377f91eb3b5e543dfa8754e4c6` |
+| 板卡二进制 | 见 §5 各阶段完成记录的表 | P0 `a6739a6e…` / P0+插桩 `205232b8…` / P1 `6f5aa9d7…` / P2 `8f6e900d…` / P3 `d30ce8af…` |
+| TSan 二进制 | 板卡 `<板卡临时目录>/rknn_multicard_demo.tsan` | `acb78c120353c73f74725ed1c7a30ed2` |
 
 **红线（2026-09-14 更新）：**
 
@@ -781,6 +865,9 @@ readelf -n rknn_multicard_demo/rknn_multicard_demo | grep -i 'build id'
 | 并发隔离（N=1） | `--sessions 1` vs 单会话路径 | 逐 token 一致 | ✅ 49/49 |
 | 并发隔离（N=2） | 两路**同 prompt 同时**起跑，各自 dump | 两路都与单会话一致 | ✅ 49/49 ×2 |
 | 并发隔离（N=4） | 四路同上 | 四路都与单会话一致 | ✅ 49/49 ×4 |
+| **交互等价（N=1）** | `--sessions 1 --interactive` vs P1 交互黄金 | 逐 token 一致 | ✅ **IDENTICAL** 1539/1539 |
+| **交互等价（跨清 KV）** | 同上，6 轮输入 | 逐 token 一致 + 清 KV 行为一致 | ✅ **IDENTICAL** 3078/3078；清 KV 1 次 @3826/4096 |
+| **交互分派结构（N=4）** | 12 行输入，逼着排队 | 12 个块、无穿插、四路都分到活 | ✅ **12 块**；含前缀行数=行首块数（**无穿插**）；s0~s3 **各 3 轮**；token 总量 **1164** |
 | 上下文边界 | 会话接近 `max_ctx_len` | KV cache 清理正确触发 | ✅ 交互 6 轮在 3826/4096 触发，恰好 1 次，与 P1 一致 |
 | 会话数超限 | `--sessions 6` | 优雅失败、不崩溃 | ✅ rc=255，`rknn3_session_init failed`，无 segfault/abort |
 | 长对话 × N | 每会话 20 轮 | 无 KV 溢出、无串话、无崩溃 | ❌ **未测**（最长只到 6 轮 × 单会话） |
@@ -801,6 +888,8 @@ readelf -n rknn_multicard_demo/rknn_multicard_demo | grep -i 'build id'
 | N=5 | 聚合 decode | — | ✅ 34.94，**低于 N=4**，确认 N=4 是拐点 |
 | N=2 | 单会话 TTFT | 与 N=1 相比劣化 ≤ 30% | ❌ **未测**（没单独量 TTFT；只有整轮墙钟） |
 | N=4 | 单会话延迟劣化 | — | ✅ 每会话 12.38 → 10.16~10.55 tok/s（劣化约 17~22%） |
+| **N=4 交互式** | 聚合 decode（12 轮 × 96 token） | 无目标（首次标定） | **37.70 tok/s**（口径：首轮开始 → 末轮结束，已扣掉人的思考时间，但**含 12 次 prefill 气泡**，故不与上表直接可比） |
+| **N=4 长稳定** | 6 轮 × 30 分钟聚合 | 30 分钟不退化 | ✅ 41.26 → 41.62 tok/s（§9.3） |
 
 > **口径提醒**：上表"同 workload 口径"= 每会话 4 轮 × 64 token，**墙钟里含 4 次 prefill 气泡**，
 > 所以 N=1 只有 10.73 而不是 12.38。绝对数字与"纯 decode × N"不可直接比；**跨 N 的比值
@@ -809,12 +898,32 @@ readelf -n rknn_multicard_demo/rknn_multicard_demo | grep -i 'build id'
 
 ### 9.3 稳定性
 
-- ❌ **30 分钟连续跑 N=3 压测未做**，RSS 单调性、`malloc()` 告警、`rknn3_session_query_state`
-  异常均**未监控**。目前最长单次运行：单会话 6 轮交互（3078 token，约 4 分钟）、
-  N=4 压测 1024 token（约 29 秒）。
-- ❌ **ASan 版本未跑**（`cmake -DENABLE_ASAN=ON`，`cpp/CMakeLists.txt:10` 已支持）。
-  并发改造后这条比 P1 时期更值得做——卡级锁是否真的覆盖了所有共享访问，
-  ASan/TSan 比 token 对比更能给出确定答案。
+#### 30 分钟压测：**已做，通过** ✅（2026-09-14）
+
+方法：`--sessions 4 --rounds 8 -n 256 --ignore-eos` 连跑 6 轮，覆盖 30 分钟；
+每轮 dump token 并采样 RSS/温度。**全部 rc=0。**
+
+| 轮次 | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| 聚合吞吐 tok/s | 41.26 | 41.41 | 41.39 | 41.42 | 41.50 | 41.62 |
+| 峰值 RSS（MB） | 465 | 662 | 469 | **1181** | 462 | 463 |
+
+- **无衰减趋势**（吞吐反而微升 41.26 → 41.62），SoC 温度 44.4 → 49.9 °C，**未降频**。
+- **最强的一条证据是首末轮逐字节一致**：第 1 轮与第 6 轮的 4 路 token dump 完全相同
+  （每路各 2056 token），6 轮之间 18 对跨会话组合也全部一致。跑 30 分钟之后数值行为没有漂移。
+- 崩溃/堆破坏模式（`Segmentation`/`Aborted`/`double free`/`corrupted`/`unaligned tcache`）**0 命中**；
+  最差会话的纯 decode 10.69 → 10.78 tok/s，未劣化。
+
+> ⚠️ **RSS 那一列必须诚实地看**：1181 MB 是一次**孤立尖峰**，且整列**非单调**、
+> 末轮回落到 463 MB——**与泄漏的形状不符**。但采样是**每 5 秒一个单点**，
+> 无法排除这是模型加载/teardown 的一次性峰值。所以结论只能说到
+> **"没有与泄漏相符的证据"**，不能写成"无泄漏"。要定性需要更密的采样或分阶段（加载/推理/销毁）拆开量。
+
+#### ASan：**仍未跑** ❌
+
+- `cmake -DENABLE_ASAN=ON`（`cpp/CMakeLists.txt:10` 已支持；注意它只追加到 `CMAKE_CXX_FLAGS_DEBUG`，
+  必须配 `-d Debug` 才生效）。ASan 能查的是 `unaligned tcache chunk` 这类堆损坏（R4），
+  **和 TSan 查的数据竞争是两件事**——TSan 跑过不等于 ASan 的需求消失。
 
 ### 9.4 调试辅助
 
@@ -823,7 +932,57 @@ readelf -n rknn_multicard_demo/rknn_multicard_demo | grep -i 'build id'
 | `--dump-tokens <file>` | ✅ 已有 | 每步输出 token ID；并发模式下自动变成 `<file>.s<i>`（每会话一个） |
 | 每会话 perf 表 | ✅ 已有 | prefill/decode token 数、纯 decode tok/s、墙钟，区分"哪个会话慢" |
 | `--conv-trace` | ❌ 未加 | 打印 `[conv A][stage2] enter/exit card_lock`，排查死锁与相位 |
-| TSan 构建 | ❌ 未加 | `-fsanitize=thread` 跑 N=2 短程，直接给数据竞争的确定答案（目前只能靠 token 对比反证） |
+| TSan 构建 | ✅ 已加 | `-fsanitize=thread` 独立构建（板卡上 `rknn_multicard_demo.tsan`），见 §9.5 |
+
+### 9.5 TSan 跑一轮：**我们代码零竞争；SDK 内部有报告（含边界说明）**（2026-09-14）
+
+**先说这个工具能看到什么**：TSan 靠**编译器插桩** + 运行时影子内存算 happens-before。
+它**只能插桩我们自己编的代码**——`librknn3_api_rkcp.so` 是闭源预编译库、**没有被插桩**，
+它内部的访存 TSan 既看不见、也不会成为别人 happens-before 链上的边。
+**所以"TSan 干净"只证明我们的代码干净，不证明 SDK 干净**（反之，它报的 SDK 内部"竞争"
+也可能是"看不见原子操作"导致的假阳性）。TSan 下执行慢约 **2.5×**（90s → 233s），
+跑出的 tok/s 无参考价值，本文不引用。
+
+**三轮设计（顺序是刻意的）**：并发路径与交互式（新代码）排前面，单会话老路排最后——
+TSan 下每次启动都要重走一遍模型加载，万一要中途收尾，先拿到的是最有信息量的两段。
+而**单会话那一轮是决定性的对照**：它完全不进多会话路径。
+
+| 阶段 | 形态 | 报告数 | 竞争访存在**我们代码**里 |
+|---|---|---|---|
+| TS-A | `--sessions 2 --rounds 1`（并发路径） | 9 | **0** |
+| TS-B | `--sessions 2 --interactive`（**P3 新代码**） | 11 | **0** |
+| TS-C | **不指定 `--sessions`**（单会话老路径，对照） | 4 | **0** |
+
+（报告条数以 TSan 页脚 `reported N warnings` 为准；分类脚本逐条解析调用栈，不靠肉眼。）
+
+**结论一：我们自己的代码没有竞争。**
+**没有任何一条报告的竞争访存第一处本地帧落在我们的代码里**——全部在
+`librknn3_api_rkcp.so` 内部：`rknn3_session_output_callback`、`rknn3_mem_sync_range`、
+`utils_read`，以及它自己那块 16 MB `FreeListAllocator` arena。我们的帧只以两种身份出现：
+**调用者**（如 `run_chat_turn` main.cc:2238，它下面才是 SDK 的 memcpy）和
+**线程/锁的创建点**——两者都不是竞争证据。卡级锁、tokenizer 互斥、每会话队列与
+`block_out` 都干净。
+
+**结论二：有一组报告与本次改造无关。** TS-C（单会话，**完全不进多会话路径**）照样报出
+**4 条 `rknn3_destroy+0xfb068` 的 "unlock of an unlocked mutex"**，每卡 1 条，
+全部在**主线程单线程收尾**时触发（栈：`rknn3_destroy` ← `destroy_contexts` main.cc:528 ←
+`main`）。它在三个阶段里都是同样的 4 条 → **是 SDK 收尾路径的固有现象，不是 P2/P3 引入的**。
+（`pthread_mutex_unlock` 是被 TSan 拦截的，"unlock of an unlocked mutex"不能简单当作
+未插桩导致的假阳性；但它**在零并发的对照里也稳定复现**，所以与改造无关这一点是确定的。）
+
+**结论三：数据竞争只在 ≥2 会话并发时出现**（TS-A 5 条 / TS-B 7 条 / **TS-C 0 条**），
+且全在 SDK 的传输线程与 arena 之间。
+
+> ⚠️ **为什么这条不能简单判定为"SDK 的 bug"**：我们的卡级锁只能串行化**调用方**，
+> 而报告里的读方是 SDK **自己创建的**回调/传输线程（`Thread T3 ... created by main at
+> main.cc:3853`，即 SDK 初始化时起的）——**它不在我们的锁内，任何应用层的锁都管不到它**。
+> 这些位置要么是 SDK 内部有我们看不见的同步协议（lock-free 环 + 原子操作，TSan 盲区），
+> 要么是真竞争。**TSan 到此为止，定性需要 SDK 源码或原厂答复。** 因此 R6 **不视为已关闭**。
+
+**复现**（红线内的中间产物，**不进 git**）：脚本 `rt_work/run_tsan.sh`（板上 `<板卡临时目录>`），
+分类脚本 `rt_work/tsan/classify.py` + 三份原始报告 `rt_work/tsan/report_ts*.txt`。
+板上另需一份 GCC 11 的 `libtsan.so.0`（板卡自带的是 `libtsan.so.2`，SONAME 对不上，
+必须随二进制一起下发并让 `LD_LIBRARY_PATH` 把它排在 `./lib` **前面**）。
 
 ---
 
@@ -840,11 +999,11 @@ readelf -n rknn_multicard_demo/rknn_multicard_demo | grep -i 'build id'
 | **KV 隔离** | ✅ **隔离已证**：两个不同 prompt 各 12 步 decode 逐步交错，序列逐 token 一致 |
 | **模型** | ✅ **不用重新转换。** 当前是 **4096 上下文**（单 KV group，传 8192 会被静默降级）。降 ctx 重导**不能**提高并发数（并发上限不由内存决定，见 §4.4） |
 | **主要改造** | ✅ 4 处全局状态已全部下沉到 `Conversation`；并发靠 **`StageContext::run_mutex`（每卡一把锁）**，持锁覆盖整个 `session_run` |
-| **正确性** | ✅ N=1/2/4 共 7 路 token id 与单会话路径**逐字节一致**；单会话路径本身零回归（3 组黄金 token 全中） |
-| **工作量** | P0/P1/P2 已完成（各一个 commit）；P3 未开始 |
-| **剩余风险** | `unaligned tcache chunk` 堆损坏（未复现，也未用 ASan/TSan 主动查）、5 上限的成因未知（非阻塞）；**30 分钟稳定性未测** |
-| **版本管理** | 三个 commit（`d59a239`/`6347f57`/`446cbdf`）+ 三个 tag；回归对照物是独立保存的源码/二进制快照 + 黄金 token 文件；下发靠 **md5 + BuildID 双校验**（§8.4） |
-| **下一步** | ① `--sessions` × `--interactive`（stdin 分发到 N 路，各自成行输出）；② TSan/ASan 跑一轮 N=2；③ 30 分钟 N=3 稳定性；④ 每卡卡级统计拆到会话维度 |
+| **正确性** | ✅ N=1/2/4 共 7 路 token id 与单会话路径**逐字节一致**；单会话路径本身零回归（3 组黄金 token 全中）。**交互式多会话同样逐 token 等价**（1539/3078），N=4 时 12 个输入块无穿插、四路各分到 3 轮 |
+| **工作量** | P0/P1/P2/P3(交互式) 已完成（各一个 commit）；**P3 服务化（HTTP/WebSocket）未开始** |
+| **剩余风险** | `unaligned tcache chunk` 堆损坏（30 分钟稳定性 0 命中，**但 ASan 仍未跑**，等级不下调）；5 上限的成因未知（非阻塞）；**SDK 内部 TSan 报告未定性**（卡级锁管不到 SDK 自己的传输线程，§9.5 / R6） |
+| **版本管理** | 四个代码 commit（`d59a239`/`6347f57`/`446cbdf`/P3）+ 四个 tag；回归对照物是独立保存的源码/二进制快照 + 黄金 token 文件；下发靠 **md5 + BuildID 双校验**（§8.4） |
+| **下一步** | ① 定性 SDK 内部的 TSan 报告（需原厂/SDK 源码）；② ASan 跑一轮（R4 的堆损坏只它查得到）；③ 交互 worker 的 `clear_kvcache` 是否需要卡锁（R11）；④ HTTP/WebSocket 前端服务化（M5）；⑤ 每卡卡级统计拆到会话维度 |
 
 **关键数据速查**
 
@@ -857,12 +1016,16 @@ readelf -n rknn_multicard_demo/rknn_multicard_demo | grep -i 'build id'
 并发聚合吞吐      N=1 10.73 → N=2 19.78 → N=3 28.63 → N=4 35.74 → N=5 34.94 tok/s
                   （同 workload 口径：每会话 4 轮 × 64 token）
 并发增益          N=4 相对 N=1 为 3.33×（扩展效率 83%）
+30 分钟稳定       6 轮 N=4 全 rc=0，41.26→41.62 tok/s 无衰减，首末轮 token 逐字节一致
+交互式多会话      N=4 + 12 行输入 → 12 个 [s<i>] 块无穿插，四路各 3 轮，37.70 tok/s
+TSan              三轮（并发/交互/单会话对照）竞争访存全在 SDK 内部，我方 0 条
 模型上下文        4096（固化，不可运行时调大）
 ```
 
 ---
 
-*文档版本：v1.2（2026-09-14）—— 依据板卡实测更新 §5(P2 完成记录) / §6 / §8.1 / §8.5 / §9*
-*基线：`examples/multicard/cpp/main.cc` @ `446cbdf`，md5 `ef943467048fd5f985a89e1ec725f248`*
+*文档版本：v1.3（2026-09-14）—— 依据板卡实测更新 §0(第 8 条) / §5(P3 完成记录 + P2 欠账状态) / §6(M3~M5) / §7(R4/R6/R10/R11) / §8.1 / §9.1~§9.5 / §10*
+*基线：`examples/multicard/cpp/main.cc` @ `446cbdf`，md5 `ef943467048fd5f985a89e1ec725f248`；**P3 后的源码 md5 为 `ff85aa377f91eb3b5e543dfa8754e4c6`***
+*v1.2（2026-09-14）—— §5(P2 完成记录) / §6 / §8.1 / §8.5 / §9*
 *v1.0 中以下估算已被实测推翻，勿再引用：每卡 ~128 MB/会话（实测 64.4–70.7）、可用 8192 上下文（实测 4096）、「降 kvcache_len 提高并发」退路（无效）*
 *v1.1 中以下预期需修正：N=2/3/4 理论值 24/36/48 tok/s 未达到（实测同口径 19.78/28.63/35.74），缺口来自 prefill 气泡与卡级串行排队，非实现缺陷——N=1 的每会话纯 decode 12.38 tok/s 与 P0 基线完全吻合可作为旁证*
