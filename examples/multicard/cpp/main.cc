@@ -53,12 +53,21 @@ static bool g_ignore_eos = false;
 static bool g_interactive = false;
 static bool g_performance_mode = false;
 static bool g_tensor_dump_enabled = false;
-// --dump-tokens 的输出文件；nullptr 表示不导出。
+// --dump-tokens 的输出文件；nullptr 表示不导出。单会话路径用它；
+// 并发路径改用每个 Conversation 自己的 dump 文件（见 LastStageResultState::token_dump），
+// 否则 N 个会话的 token 会在同一个文件里交错。
 static FILE* g_token_dump = nullptr;
 static std::string g_tensor_dump_dir;
 static std::mutex g_tensor_dump_mutex;
 static uint64_t g_embed_dump_count = 0;
 static uint64_t g_input_dump_count = 0;
+// 并发模式下关掉逐 token 的 stdout 打印：N 个会话同时往 stdout 写必然交错，
+// 而且 printf 在热路径上会污染吞吐测量。token 走各自的 dump 文件。
+static bool g_suppress_generation_output = false;
+// Tokenizer 是共享的，且底层实现（3rdparty 预编译库）没有线程安全承诺——decode 路径
+// 里的 TokenToPiece/Decode 由 N 个会话线程同时调用，这里串行化，代价可忽略
+// （一次调用是微秒级，相比 80ms/token 的推理可以不计）。
+static std::mutex g_tokenizer_mutex;
 
 enum class InferencePhase
 {
@@ -158,6 +167,22 @@ struct StageContext
   int              n_ext_inputs = 0;
   // 卡级统计：同一张卡上所有会话的耗时都累加到这里。
   StagePerformanceStatistics performance;
+
+  // 卡级串行锁：同一张卡上同一时刻只允许一个 session 在一次 rknn3_session_run 里跑。
+  //
+  // 为什么必须有：output_tensors 是**每张卡一份**的设备内存（init_output_tensors 分配），
+  // 所有 session 的回调都往同一块 buffer 里读。两个会话在同一张卡上并发跑，
+  // 后一个会把前一个的隐状态覆盖掉——采样出来的 token 会错，而且错得不稳定。
+  // 持锁范围覆盖整个 session_run，所以回调里对 output_tensors 的读取也在锁内。
+  //
+  // 这不会牺牲流水线并行：每个会话自己的 4 段仍然各占一张卡并行跑，
+  // 被串行化的只是「同一张卡上的不同会话」。而 P0 实测单会话时每卡 decode
+  // 利用率只有 25.5%，串行反而正好把这张卡的空闲时间喂满。
+  //
+  // 这也是方案文档 §3.2 的方案 A。方案 B（每 session 一份 output_tensors，
+  // 每份约 1.3 MB）能去掉这把锁，但需要 runtime 支持同 context 真并发，
+  // 留待后续验证。
+  std::mutex run_mutex;
 };
 
 // 一个会话在一张卡上占用的部分：session 句柄 + 注册到它上面的回调。
@@ -180,10 +205,13 @@ struct LastStageResultState
   std::mutex mutex;
   bool       has_token = false;
   int32_t    next_token = -1;
+  // 会话私有的 token dump 文件。非空时优先于全局 g_token_dump。
+  // 并发模式下每会话一个文件，避免 N 路 token 交错成一个文件。
+  FILE*      token_dump = nullptr;
 };
 
 // 一个独立会话：自己的一整套 session、流水线队列、结果槽与统计。
-// P1 阶段只创建一个（行为与单会话基线完全一致）；P2 起每路并发一个。
+// 单会话路径创建一个（行为与改造前完全一致）；--sessions N 时创建 N 个并发驱动。
 struct Conversation
 {
   std::vector<StageSession> stages;    // 每卡一个 session
@@ -196,6 +224,12 @@ struct Conversation
   uint64_t                  total_decode_tokens = 0;
   double                    total_prefill_ms = 0.0;
   double                    total_decode_ms = 0.0;
+
+  // 并发模式专用：会话编号、错误标记、墙钟耗时（含等锁与等流水线的时间，
+  // 与 total_decode_ms 里的纯 NPU 时间不同——后者只统计 session_run 本身）。
+  int                       index = 0;
+  bool                      failed = false;
+  double                    wall_ms = 0.0;
 
   explicit Conversation(size_t stage_count) : stages(stage_count), pipeline(stage_count) {}
 };
@@ -651,6 +685,12 @@ struct CommandLineOptions
   std::vector<std::string> device_ids;
   // --probe-sessions N：多 session 可行性探针（每卡再建 N-1 个 session 并测量设备内存）
   int         probe_sessions = 0;
+  // --sessions N：并发驱动 N 个会话。**不指定**时走原来的单会话路径，
+  // 保证与改造前逐字节一致；显式指定（含 N=1）才进入并发执行器。
+  int         sessions = 0;
+  bool        has_sessions = false;
+  // --rounds M：并发模式下每个会话跑 M 轮（首轮用 --prompt，后续轮用 chat 模板追加）。
+  int         rounds = 1;
 
   bool     performance_mode = false;
   uint64_t performance_input_length = 0;
@@ -680,6 +720,13 @@ static void print_usage(const char* program)
   printf("  --probe-sessions <N>          multi-session feasibility probe (N in [2,16]);\n"
          "                                creates N-1 extra sessions per card, measures device\n"
          "                                memory and verifies KV-cache isolation, then exits\n");
+  printf("  --sessions <N>                run N conversations concurrently (N in [1,16]).\n"
+         "                                Omit to keep the original single-session path.\n"
+         "                                Same-card sessions are serialized by a per-card\n"
+         "                                lock, so the shared output tensors stay safe;\n"
+         "                                the 4 pipeline stages still run in parallel.\n");
+  printf("  --rounds <M>                  with --sessions: M turns per conversation (default: 1);\n"
+         "                                turn 1 uses --prompt, later turns continue the chat\n");
   printf("  --dump-tensors <dir>          dump callback tensors to this directory\n");
   printf("  --help                        show this message\n");
   printf("Legacy positional arguments remain supported for compatibility.\n");
@@ -740,6 +787,33 @@ static bool validate_command_line_options(const CommandLineOptions& options)
   if (!options.device_ids.empty() && options.device_ids.size() != options.stage_count) {
     printf("expected %zu --device-id values, got %zu\n",
            options.stage_count, options.device_ids.size());
+    return false;
+  }
+  if (options.has_sessions) {
+    // 并发执行器目前只覆盖「--prompt + --rounds」这条路径。interactive 需要在一份
+    // stdin 上给 N 个会话分派输入、并把 N 路输出各自成行，那是独立的一步；
+    // --perf 用它自己的长度驱动的循环，也还没并进来。这里直接拒绝，
+    // 免得出现「参数接受了但行为没测过」的组合。
+    if (options.interactive) {
+      printf("--sessions cannot be combined with --interactive yet; "
+             "use the default single-session path for interactive chat\n");
+      return false;
+    }
+    if (options.performance_mode) {
+      printf("--sessions cannot be combined with --perf yet; "
+             "use the default single-session path for --perf\n");
+      return false;
+    }
+    if (options.probe_sessions > 0) {
+      printf("--sessions cannot be combined with --probe-sessions\n");
+      return false;
+    }
+    if (options.rounds > 1 && !options.prompt) {
+      printf("--rounds requires --prompt as the first turn's input\n");
+      return false;
+    }
+  } else if (options.rounds > 1) {
+    printf("--rounds only applies together with --sessions\n");
     return false;
   }
   return true;
@@ -841,6 +915,28 @@ static bool parse_named_command_line(int argc, char** argv, CommandLineOptions* 
         return false;
       }
       options->probe_sessions = (int)probe_count;
+    } else if (strcmp(arg, "--sessions") == 0) {
+      const char* sessions_value = nullptr;
+      uint64_t    session_count = 0;
+      if (!take_option_value(argc, argv, &i, arg, &sessions_value) ||
+          !parse_positive_u64(sessions_value, &session_count) ||
+          session_count < 1 || session_count > 16) {
+        printf("%s requires a session count in [1, 16] (got '%s')\n",
+               arg, sessions_value ? sessions_value : "");
+        return false;
+      }
+      options->sessions = (int)session_count;
+      options->has_sessions = true;
+    } else if (strcmp(arg, "--rounds") == 0) {
+      const char* rounds_value = nullptr;
+      uint64_t    round_count = 0;
+      if (!take_option_value(argc, argv, &i, arg, &rounds_value) ||
+          !parse_positive_u64(rounds_value, &round_count) || round_count > 1000) {
+        printf("%s requires a round count in [1, 1000] (got '%s')\n",
+               arg, rounds_value ? rounds_value : "");
+        return false;
+      }
+      options->rounds = (int)round_count;
     } else if (strcmp(arg, "--device-id") == 0) {
       if (!take_option_value(argc, argv, &i, arg, &value) ||
           !append_device_ids(value, &options->device_ids)) {
@@ -1294,22 +1390,27 @@ static int result_callback(void* userdata, RKLLMResult* result, LLMCallState sta
       result_state->has_token = true;
     }
 
-    if (g_token_dump) {
+    // 并发模式下每个会话写自己的文件；单会话路径回落到全局文件，输出逐字节不变。
+    FILE* token_dump = result_state->token_dump ? result_state->token_dump : g_token_dump;
+    if (token_dump) {
       for (int i = 0; i < result->num_tokens; ++i) {
-        fprintf(g_token_dump, "%d\n", result->token_ids[i]);
+        fprintf(token_dump, "%d\n", result->token_ids[i]);
       }
-      fflush(g_token_dump);
+      fflush(token_dump);
     }
 
-    if (g_performance_mode) {
+    if (g_performance_mode || g_suppress_generation_output) {
       return 0;
     }
 
     std::string piece;
-    if (result->num_tokens == 1) {
-      piece = tokenizer->TokenToPiece(result->token_ids[0]);
-    } else {
-      piece = tokenizer->Decode(result->token_ids, result->num_tokens);
+    {
+      std::lock_guard<std::mutex> tokenizer_lock(g_tokenizer_mutex);
+      if (result->num_tokens == 1) {
+        piece = tokenizer->TokenToPiece(result->token_ids[0]);
+      } else {
+        piece = tokenizer->Decode(result->token_ids, result->num_tokens);
+      }
     }
     VLOG("[result_callback] %s, next_token=%d\n", piece.c_str(), next_token);
     printf("%s", piece.c_str());
@@ -1936,11 +2037,17 @@ static void run_stage_worker(size_t stage_idx, std::vector<StageContext>& stages
          (int)local_param.disable_sampling);
     timeval run_start;
     timeval run_end;
-    gettimeofday(&run_start, NULL);
-    int ret = rknn3_session_run(session, &embed_input, 1, &local_param);
-    gettimeofday(&run_end, NULL);
-    record_stage_performance(stage, phase, batch.n_tokens,
-                             elapsed_us(run_start, run_end) / 1e3);
+    int ret = RKNN3_SUCCESS;
+    {
+      // 卡级串行：持锁覆盖整个 session_run，回调里读 output_tensors 也在锁内。
+      // 计时放在锁内，统计到的是纯 NPU 时间，等锁的时间只体现在并发模式的墙钟里。
+      std::lock_guard<std::mutex> card_lock(stage.run_mutex);
+      gettimeofday(&run_start, NULL);
+      ret = rknn3_session_run(session, &embed_input, 1, &local_param);
+      gettimeofday(&run_end, NULL);
+      record_stage_performance(stage, phase, batch.n_tokens,
+                               elapsed_us(run_start, run_end) / 1e3);
+    }
 
     if (output_slot) {
       std::lock_guard<std::mutex> lock(output_slot->mutex);
@@ -2006,9 +2113,14 @@ static bool run_pipeline_once(std::vector<StageContext>& stages, Conversation& c
 
   timeval stage0_start;
   timeval stage0_end;
-  gettimeofday(&stage0_start, NULL);
-  int ret = rknn3_session_run(conv.stages[0].session, &first_input, 1, &infer_param);
-  gettimeofday(&stage0_end, NULL);
+  int ret = RKNN3_SUCCESS;
+  {
+    // 与 worker 同源：stage0 也要拿本卡的串行锁（多会话时别的会话也在抢这张卡）。
+    std::lock_guard<std::mutex> card_lock(stages[0].run_mutex);
+    gettimeofday(&stage0_start, NULL);
+    ret = rknn3_session_run(conv.stages[0].session, &first_input, 1, &infer_param);
+    gettimeofday(&stage0_end, NULL);
+  }
   if (ret != RKNN3_SUCCESS) {
     printf("[stage0] run failed ret=%d\n", ret);
     fail_pipeline(pipeline);
@@ -2024,8 +2136,12 @@ static bool run_pipeline_once(std::vector<StageContext>& stages, Conversation& c
     std::lock_guard<std::mutex> lock(pipeline.slots[0]->mutex);
     current_stage0_input_tokens = pipeline.slots[0]->expected_tokens;
   }
-  record_stage_performance(stages[0], phase, current_stage0_input_tokens,
-                           elapsed_us(stage0_start, stage0_end) / 1e3);
+  {
+    // 统计累加也必须串行，否则多个会话线程同时 += 会丢更新。
+    std::lock_guard<std::mutex> card_lock(stages[0].run_mutex);
+    record_stage_performance(stages[0], phase, current_stage0_input_tokens,
+                             elapsed_us(stage0_start, stage0_end) / 1e3);
+  }
 
   if (stage0_input_tokens) {
     *stage0_input_tokens = current_stage0_input_tokens;
@@ -2101,6 +2217,197 @@ static bool run_chat_turn(std::vector<StageContext>& stages, Conversation& conv,
     result->decode_ms = elapsed_us(decode_start, decode_end) / 1e3f;
   }
   return true;
+}
+
+// ============================================================================
+// 多会话并发执行器（--sessions N）
+//
+// 每个会话一个驱动线程，各自跑 M 轮 prefill+decode。会话之间**唯一的**共享资源是
+// 每张卡的那一份 context + output_tensors，由 StageContext::run_mutex 串行化；
+// 会话自己的 KV / 流水线队列 / 统计都是独立的。
+//
+// 为什么并发是安全的、以及为什么串行化每张卡仍然有收益，见 StageContext::run_mutex
+// 上的注释。
+//
+// 正确性判据（不是「跑起来了」就算数）：
+//   同一 prompt、同一 -n、--ignore-eos，N=2 的两个会话各自 dump 出来的 token id
+//   必须与单会话路径逐 token 完全一致。任何跨会话串扰（output_tensors 被覆盖、
+//   KV 混用、队列串台）都会让 token 变掉。
+// ============================================================================
+
+// 让 N 个驱动线程尽量同时起跑。不设这个闸门的话，先起的会话会白跑一段，
+// 后起的会话还没开始，量出来的吞吐会虚高。
+struct StartGate
+{
+  std::mutex              mutex;
+  std::condition_variable cv;
+  int                     arrived = 0;
+  int                     total = 0;
+  bool                    open = false;
+
+  explicit StartGate(int n) : total(n) {}
+
+  void arrive_and_wait()
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (++arrived >= total) {
+      open = true;
+      cv.notify_all();
+      return;
+    }
+    cv.wait(lock, [this]() { return open; });
+  }
+};
+
+struct SessionTiming
+{
+  timeval start{};
+  timeval end{};
+  bool    valid = false;
+};
+
+// 一个会话的驱动循环。首轮用 first_prompt（与单会话路径同源，便于逐 token 对比），
+// 后续轮用模板拼出的续写 prompt。
+static void run_conversation_worker(Conversation& conv, std::vector<StageContext>& stages,
+                                    const VocabInfo& vocab_info, const ChatTemplateSpec* tpl,
+                                    const char* first_prompt, int max_new_tokens, int rounds,
+                                    uint64_t context_limit, StartGate* gate,
+                                    SessionTiming* timing)
+{
+  gate->arrive_and_wait();
+  gettimeofday(&timing->start, NULL);
+
+  const uint64_t prefill_reserve = 512;
+  std::string    round_prompt;
+
+  for (int round = 0; round < rounds; ++round) {
+    if (conv.context_tokens > 0 && context_limit > 0 &&
+        conv.context_tokens + prefill_reserve >= context_limit) {
+      // 与交互模式同一条策略：快满了就清 KV 重开一段对话（只影响本会话）。
+      for (size_t i = 0; i < stages.size(); ++i) {
+        rknn3_session_clear_kvcache(conv.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+      }
+      conv.context_tokens = 0;
+      conv.first_turn = true;
+    }
+
+    // 首轮直接用 --prompt 原文（与单会话路径同源，token id 才具备可比性）；
+    // 后续轮用 chat 模板拼一个续写 prompt。刚清过 KV 时按新对话的开头处理，
+    // 把 system prompt 补回来。
+    if (round == 0) {
+      round_prompt = first_prompt;
+    } else {
+      if (conv.first_turn) {
+        round_prompt = tpl->system_prompt;
+      }
+      round_prompt += tpl->user_prefix;
+      round_prompt += "continue";
+      round_prompt += tpl->user_postfix;
+    }
+    conv.first_turn = false;
+
+    const char* prompt_for_round = round_prompt.c_str();
+
+    ChatTurnResult turn;
+    if (!run_chat_turn(stages, conv, vocab_info, prompt_for_round, max_new_tokens, &turn)) {
+      conv.failed = true;
+      break;
+    }
+    conv.total_prefill_tokens += turn.prefill_tokens;
+    conv.total_decode_tokens += turn.decode_tokens;
+    conv.total_prefill_ms += turn.prefill_ms;
+    conv.total_decode_ms += turn.decode_ms;
+    conv.context_tokens += turn.prefill_tokens + turn.decode_tokens;
+  }
+
+  gettimeofday(&timing->end, NULL);
+  timing->valid = true;
+  conv.wall_ms = elapsed_us(timing->start, timing->end) / 1e3;
+}
+
+static uint64_t timeval_to_us(const timeval& tv)
+{
+  return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+// 并发模式的结果汇总。返回 0 表示所有会话都正常跑完。
+static int report_concurrent_sessions(const std::vector<std::unique_ptr<Conversation>>& convs,
+                                       const std::vector<SessionTiming>& timings,
+                                       const char* prompt, int rounds, int max_new_tokens)
+{
+  bool all_ok = true;
+  uint64_t total_decode_tokens = 0;
+  uint64_t total_prefill_tokens = 0;
+
+  printf("\n=== Multi-Session Concurrent Run ===\n");
+  printf("prompt      : %.48s%s\n", prompt, strlen(prompt) > 48 ? "..." : "");
+  printf("conversations: %zu, rounds: %d, max tokens/round: %d\n\n",
+         convs.size(), rounds, max_new_tokens);
+
+  printf(" %-6s | %-10s | %-10s | %-14s | %-12s | %-8s\n",
+         "Session", "Prefill tok", "Decode tok", "Decode tok/s", "Wall (ms)", "Status");
+  printf("---------------------------------------------------------------------------\n");
+
+  for (size_t i = 0; i < convs.size(); ++i) {
+    const Conversation& conv = *convs[i];
+    const double decode_s = conv.total_decode_ms / 1e3;
+    const double decode_tps = decode_s > 0.0 ? (double)conv.total_decode_tokens / decode_s : 0.0;
+    total_decode_tokens += conv.total_decode_tokens;
+    total_prefill_tokens += conv.total_prefill_tokens;
+    if (conv.failed) {
+      all_ok = false;
+    }
+    printf(" s%-5zu | %-10llu | %-10llu | %-14.2f | %-12.1f | %-8s\n",
+           i,
+           (unsigned long long)conv.total_prefill_tokens,
+           (unsigned long long)conv.total_decode_tokens,
+           decode_tps,
+           conv.wall_ms,
+           conv.failed ? "FAILED" : "ok");
+  }
+  printf("---------------------------------------------------------------------------\n");
+
+  // 聚合口径：所有会话从最早起跑到最晚结束的那段墙钟（并发窗口），
+  // 而不是各会话时间之和——后者在并发下会重复计时。
+  uint64_t window_start_us = 0;
+  uint64_t window_end_us = 0;
+  bool     window_valid = false;
+  for (const auto& t : timings) {
+    if (!t.valid) {
+      continue;
+    }
+    const uint64_t s = timeval_to_us(t.start);
+    const uint64_t e = timeval_to_us(t.end);
+    if (!window_valid) {
+      window_start_us = s;
+      window_end_us = e;
+      window_valid = true;
+    } else {
+      if (s < window_start_us) window_start_us = s;
+      if (e > window_end_us) window_end_us = e;
+    }
+  }
+
+  if (window_valid && window_end_us > window_start_us) {
+    const double window_s = (window_end_us - window_start_us) / 1e6;
+    const double aggregate_tps = (double)total_decode_tokens / window_s;
+    printf(" aggregate   : %llu decode tokens over %.3f s wall = %.2f tok/s",
+           (unsigned long long)total_decode_tokens, window_s, aggregate_tps);
+    if (convs.size() > 1) {
+      // 单会话基线（80.75 ms/tok ≈ 12.38 tok/s）来自 P0 实测；这里给出相对它、
+      // 以及相对「N 倍线性」的达成率，便于一眼看出串行化损失了多少。
+      const double baseline_tps = 12.38;
+      printf("\n               (single-session baseline 12.38 tok/s → speedup %.2fx, "
+             "linear would be %.2fx, efficiency %.0f%%)",
+             aggregate_tps / baseline_tps,
+             (double)convs.size(),
+             100.0 * (aggregate_tps / baseline_tps) / (double)convs.size());
+    }
+    printf("\n");
+  }
+  printf(" total prefill tokens: %llu\n", (unsigned long long)total_prefill_tokens);
+
+  return all_ok ? 0 : 1;
 }
 
 // ============================================================================
@@ -3067,7 +3374,9 @@ int main(int argc, char** argv)
     return -1;
   }
 
-  if (options.dump_tokens && options.dump_tokens[0] != '\0') {
+  // 并发模式改用每个会话自己的 dump 文件（见下面的 --sessions 分支），
+  // 这里不能也把全局文件打开——否则 N=1 时同一个路径会被打开两次、留下一份空文件。
+  if (options.dump_tokens && options.dump_tokens[0] != '\0' && !options.has_sessions) {
     g_token_dump = fopen(options.dump_tokens, "w");
     if (!g_token_dump) {
       printf("failed to open --dump-tokens file: %s\n", options.dump_tokens);
@@ -3149,8 +3458,10 @@ int main(int argc, char** argv)
   for (size_t i = 0; i < stages.size(); ++i) {
     stages[i].name = "stage" + std::to_string(i);
   }
-  // P1：只建一个会话。P2 起这里会变成 N 个 Conversation 并发驱动。
+  // 单会话路径用 conversation；--sessions N 时改用 multi_conversations 里的 N 个，
+  // conversation 本身不建 session（保持为默认状态，随后的统一释放会忽略它）。
   Conversation conversation(g_stage_count);
+  std::vector<std::unique_ptr<Conversation>> multi_conversations;
 
   Tokenizer* tokenizer = nullptr;
   VocabInfo vocab_info;
@@ -3245,19 +3556,49 @@ int main(int argc, char** argv)
       break;
     }
   }
-  // 第二遍：在已建好的 context 上开会话。P1 只有 conversation 这一个会话；
-  // P2 会在这里循环创建多个 Conversation，每个拿到一套独立 session。
+  // 第二遍：在已建好的 context 上开会话。这套 context 是复用的——权重与每卡设备
+  // 内存只有一份。未指定 --sessions 时只建 conversation 这一个会话（走原有单会话
+  // 路径，行为与改造前逐字节一致）；指定了则建 N 个，每个会话在每张卡上各有一个
+  // session。
   if (ok) {
-    for (size_t i = 0; i < stages.size(); ++i) {
-      ok = init_conversation(stages, conversation, i, session_param,
-                             tokenizer, &embed_info, &input_cb_data);
-      if (!ok) {
-        break;
+    if (!options.has_sessions) {
+      for (size_t i = 0; i < stages.size(); ++i) {
+        ok = init_conversation(stages, conversation, i, session_param,
+                               tokenizer, &embed_info, &input_cb_data);
+        if (!ok) {
+          break;
+        }
+      }
+    } else {
+      const int session_count = options.sessions;
+      for (int s = 0; s < session_count && ok; ++s) {
+        std::unique_ptr<Conversation> conv(new Conversation(g_stage_count));
+        conv->index = s;
+        conv->result.tokenizer = tokenizer;
+        reset_last_stage_result(*conv);
+        for (size_t i = 0; i < stages.size(); ++i) {
+          ok = init_conversation(stages, *conv, i, session_param,
+                                 tokenizer, &embed_info, &input_cb_data);
+          if (!ok) {
+            break;
+          }
+        }
+        // 失败的那个也收进容器，交给下面统一销毁（它可能已经建好了前几段的 session）。
+        multi_conversations.push_back(std::move(conv));
+      }
+      if (ok) {
+        printf("[sessions] %d conversations ready on %zu cards\n",
+               session_count, stages.size());
       }
     }
   }
   if (!ok) {
-    release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+    for (auto& conv : multi_conversations) {
+      destroy_conversation(*conv);
+    }
+    multi_conversations.clear();
+    release_resources(stages, options.has_sessions ? nullptr : &conversation,
+                      &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
     return -1;
   }
 
@@ -3324,6 +3665,98 @@ int main(int argc, char** argv)
                                    options.probe_sessions, tokenizer);
     release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
     return probe_ret == 0 ? 0 : 1;
+  }
+
+  // 多会话并发执行（--sessions N）。走到这里说明 N 个 Conversation 已经在每张卡上
+  // 各拿到了自己的 session。
+  if (options.has_sessions) {
+    const int session_count = (int)multi_conversations.size();
+
+    // 逐 token 的 stdout 打印在 N 路并发下必然交错，且 printf 在热路径上会污染
+    // 吞吐测量——并发模式一律静音，token 走每个会话自己的 dump 文件。
+    g_suppress_generation_output = true;
+
+    // 每个会话一个 token dump 文件：N=1 时就是 --dump-tokens 给的原路径（保持与
+    // 单会话路径同一份文件、同样内容），N>1 时是 <path>.s<i>。
+    std::vector<std::string> dump_paths;
+    bool dump_ok = true;
+    if (options.dump_tokens && options.dump_tokens[0] != '\0') {
+      for (int s = 0; s < session_count; ++s) {
+        std::string path = options.dump_tokens;
+        if (session_count > 1) {
+          path += ".s" + std::to_string(s);
+        }
+        FILE* fp = fopen(path.c_str(), "w");
+        if (!fp) {
+          printf("failed to open --dump-tokens file: %s\n", path.c_str());
+          dump_ok = false;
+          break;
+        }
+        multi_conversations[s]->result.token_dump = fp;
+        dump_paths.push_back(path);
+      }
+    }
+    if (dump_ok) {
+      printf("\n=== Multi-Session Mode ===\n");
+      printf("concurrent conversations: %d, rounds per conversation: %d\n",
+             session_count, options.rounds);
+      for (size_t i = 0; i < dump_paths.size(); ++i) {
+        printf("[dump] session %zu token ids -> %s\n", i, dump_paths[i].c_str());
+      }
+
+      StartGate gate(session_count);
+      std::vector<SessionTiming> timings(session_count);
+      const uint64_t context_limit = stages[0].max_ctx_len > 0
+                                         ? (uint64_t)stages[0].max_ctx_len
+                                         : (uint64_t)max_context_len;
+
+      std::vector<std::thread> drivers;
+      drivers.reserve(session_count);
+      for (int s = 0; s < session_count; ++s) {
+        drivers.emplace_back(run_conversation_worker,
+                             std::ref(*multi_conversations[s]), std::ref(stages),
+                             std::cref(vocab_info), chat_tpl, prompt, max_new_tokens,
+                             options.rounds, context_limit, &gate, &timings[s]);
+      }
+      for (auto& driver : drivers) {
+        driver.join();
+      }
+
+      int rc = report_concurrent_sessions(multi_conversations, timings, prompt,
+                                          options.rounds, max_new_tokens);
+      print_stage_performance_statistics(stages);
+      for (auto& conv : multi_conversations) {
+        for (size_t i = 0; i < stages.size(); ++i) {
+          rknn3_session_clear_kvcache(conv->stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+        }
+      }
+      for (auto& conv : multi_conversations) {
+        if (conv->result.token_dump) {
+          fclose(conv->result.token_dump);
+          conv->result.token_dump = nullptr;
+        }
+      }
+      for (auto& conv : multi_conversations) {
+        destroy_conversation(*conv);
+      }
+      multi_conversations.clear();
+      g_suppress_generation_output = false;
+      release_resources(stages, nullptr, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+      return rc;
+    }
+
+    // dump 文件打不开：把已经开出来的关掉，再整体释放。
+    for (auto& conv : multi_conversations) {
+      if (conv->result.token_dump) {
+        fclose(conv->result.token_dump);
+        conv->result.token_dump = nullptr;
+      }
+      destroy_conversation(*conv);
+    }
+    multi_conversations.clear();
+    g_suppress_generation_output = false;
+    release_resources(stages, nullptr, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+    return -1;
   }
 
   if (g_interactive) {
