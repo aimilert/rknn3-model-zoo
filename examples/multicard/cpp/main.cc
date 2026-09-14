@@ -53,6 +53,8 @@ static bool g_ignore_eos = false;
 static bool g_interactive = false;
 static bool g_performance_mode = false;
 static bool g_tensor_dump_enabled = false;
+// --dump-tokens 的输出文件；nullptr 表示不导出。
+static FILE* g_token_dump = nullptr;
 static std::string g_tensor_dump_dir;
 static std::mutex g_tensor_dump_mutex;
 static uint64_t g_embed_dump_count = 0;
@@ -137,18 +139,16 @@ struct StagePerformanceStatistics
   PhasePerformanceStatistics decode;
 };
 
-struct StageRuntime
+// 一张卡（流水线的一段）上所有会话共用的资源：NPU context、输出张量、形状信息。
+// 多会话并发时这部分**只有一份**，权重与这部分设备内存天然共享——P0 探针已实测
+// 证实（每加一个 session 只多出 KV cache，权重不复制）。
+struct StageContext
 {
   std::string      name;
   std::string      model_path;
   std::string      weight_path;
   std::string      device_id;
   rknn3_context    ctx = 0;
-  rknn3_session*   session = nullptr;
-  // 已注册到 session 上的 callback。多 session 探针需要把它原样复制到额外创建的
-  // session 上（callback 是 per-session 的，但内容可以共用）。
-  RKLLMCallback    callback;
-  bool             has_callback = false;
   int32_t          embedding_dim = 0;
   int32_t          vocab_size = 0;
   int32_t          max_ctx_len = 0;
@@ -156,8 +156,22 @@ struct StageRuntime
   int              n_output_tensors = 0;
   int*             ext_input_indices = nullptr;
   int              n_ext_inputs = 0;
-  StageCallbackContext callback_ctx;
+  // 卡级统计：同一张卡上所有会话的耗时都累加到这里。
   StagePerformanceStatistics performance;
+};
+
+// 一个会话在一张卡上占用的部分：session 句柄 + 注册到它上面的回调。
+// RKLLMCallback 必须跟着会话走而不是跟着卡走：它同时携带 per-card 的东西
+// （output_tensors / ext_input_indices / tokenizer）和 per-conversation 的东西
+// （callback_ctx.pipeline / embed_ctx / result_userdata）。多会话并发时，
+// 每个 session 都要有一套指向**自己**那个 Conversation 的回调。
+struct StageSession
+{
+  rknn3_session*   session = nullptr;
+  RKLLMCallback    callback;
+  bool             has_callback = false;
+  StageCallbackContext callback_ctx;
+  EmbedCallbackContext  embed_ctx;
 };
 
 struct LastStageResultState
@@ -166,6 +180,24 @@ struct LastStageResultState
   std::mutex mutex;
   bool       has_token = false;
   int32_t    next_token = -1;
+};
+
+// 一个独立会话：自己的一整套 session、流水线队列、结果槽与统计。
+// P1 阶段只创建一个（行为与单会话基线完全一致）；P2 起每路并发一个。
+struct Conversation
+{
+  std::vector<StageSession> stages;    // 每卡一个 session
+  PipelineState             pipeline;
+  LastStageResultState      result;
+  // 当前对话累计占用上下文 token 数（prefill + decode），用于接近上限时清 KV。
+  uint64_t                  context_tokens = 0;
+  bool                      first_turn = true;
+  uint64_t                  total_prefill_tokens = 0;
+  uint64_t                  total_decode_tokens = 0;
+  double                    total_prefill_ms = 0.0;
+  double                    total_decode_ms = 0.0;
+
+  explicit Conversation(size_t stage_count) : stages(stage_count), pipeline(stage_count) {}
 };
 
 struct rope_cache_tensor
@@ -264,8 +296,6 @@ static int find_rope_cache_index(RopeCacheFormat format, const char* name)
   return -1;
 }
 
-static LastStageResultState g_last_stage_result;
-
 static size_t get_dtype_elem_size(int dtype)
 {
   switch (dtype) {
@@ -317,7 +347,7 @@ static void print_performance_statistics(uint64_t prefill_tokens, float prefill_
   printf("-----------------------------------------------------------------------------------------\n");
 }
 
-static void record_stage_performance(StageRuntime& stage, InferencePhase phase,
+static void record_stage_performance(StageContext& stage, InferencePhase phase,
                                      uint64_t token_count, double total_time_ms)
 {
   PhasePerformanceStatistics& statistics = phase == InferencePhase::PREFILL
@@ -328,7 +358,7 @@ static void record_stage_performance(StageRuntime& stage, InferencePhase phase,
   statistics.total_time_ms += total_time_ms;
 }
 
-static void print_stage_performance_statistics(const std::vector<StageRuntime>& stages)
+static void print_stage_performance_statistics(const std::vector<StageContext>& stages)
 {
   printf("\nPer-Stage Performance Statistics: ");
   printf("\n----------------------------------------------------------------------------------------------------------------------\n");
@@ -375,7 +405,7 @@ static void release_safetensors(InputCbUserdata* cb_data)
   }
 }
 
-static void release_output_tensors(StageRuntime& stage)
+static void release_output_tensors(StageContext& stage)
 {
   if (!stage.output_tensors) {
     return;
@@ -397,13 +427,26 @@ static void release_output_tensors(StageRuntime& stage)
   stage.n_output_tensors = 0;
 }
 
-static void destroy_stage(StageRuntime& stage)
+// 只销毁会话自己的 session；卡级资源由 destroy_context 负责。
+static void destroy_session(StageSession& sess)
 {
-  if (stage.session) {
-    rknn3_session_destroy(stage.session);
-    stage.session = nullptr;
+  if (sess.session) {
+    rknn3_session_destroy(sess.session);
+    sess.session = nullptr;
   }
+  sess.has_callback = false;
+}
 
+static void destroy_conversation(Conversation& conv)
+{
+  for (auto& sess : conv.stages) {
+    destroy_session(sess);
+  }
+}
+
+// 销毁卡级资源。调用前必须确保该卡上所有会话的 session 都已销毁。
+static void destroy_context(StageContext& stage)
+{
   release_output_tensors(stage);
 
   if (stage.ext_input_indices) {
@@ -418,17 +461,22 @@ static void destroy_stage(StageRuntime& stage)
   }
 }
 
-static void destroy_stages(std::vector<StageRuntime>& stages)
+static void destroy_contexts(std::vector<StageContext>& stages)
 {
   for (auto& stage : stages) {
-    destroy_stage(stage);
+    destroy_context(stage);
   }
 }
 
-static void release_resources(std::vector<StageRuntime>& stages, InputCbUserdata* input_cb_data,
+// conv 可为 nullptr（会话尚未建立时的早期失败路径）。
+static void release_resources(std::vector<StageContext>& stages, Conversation* conv,
+                              InputCbUserdata* input_cb_data,
                               embedding_info* embed_info, size_t embedding_size, Tokenizer* tokenizer)
 {
-  destroy_stages(stages);
+  if (conv) {
+    destroy_conversation(*conv);
+  }
+  destroy_contexts(stages);
   release_safetensors(input_cb_data);
   if (embed_info->embedding_data) {
     munmap(embed_info->embedding_data, embedding_size);
@@ -491,20 +539,21 @@ static bool pipeline_failed(PipelineState& pipeline)
   return false;
 }
 
-static void reset_last_stage_result()
+// 结果槽挂在 Conversation 上（不再是全局），多会话并发时每个会话各读各的。
+static void reset_last_stage_result(Conversation& conv)
 {
-  std::lock_guard<std::mutex> lock(g_last_stage_result.mutex);
-  g_last_stage_result.has_token = false;
-  g_last_stage_result.next_token = -1;
+  std::lock_guard<std::mutex> lock(conv.result.mutex);
+  conv.result.has_token = false;
+  conv.result.next_token = -1;
 }
 
-static bool get_last_stage_token(int32_t* token)
+static bool get_last_stage_token(Conversation& conv, int32_t* token)
 {
-  std::lock_guard<std::mutex> lock(g_last_stage_result.mutex);
-  if (!g_last_stage_result.has_token) {
+  std::lock_guard<std::mutex> lock(conv.result.mutex);
+  if (!conv.result.has_token) {
     return false;
   }
-  *token = g_last_stage_result.next_token;
+  *token = conv.result.next_token;
   return true;
 }
 
@@ -596,6 +645,9 @@ struct CommandLineOptions
   const char* rope_path = nullptr;
   const char* chat_template = nullptr;
   const char* tensor_dump_dir = nullptr;
+  // --dump-tokens <path>：把每步采样出的 token id 逐行写入文件，用于回归对比
+  // （改造前后必须逐 token 一致）以及 P2 多会话下 stdout 交错时的逐会话核对。
+  const char* dump_tokens = nullptr;
   std::vector<std::string> device_ids;
   // --probe-sessions N：多 session 可行性探针（每卡再建 N-1 个 session 并测量设备内存）
   int         probe_sessions = 0;
@@ -615,6 +667,7 @@ static void print_usage(const char* program)
          "    --stage-count <count> --bucket-size <tokens> [options]\n");
   printf("Options:\n");
   printf("  --prompt <text-or-file>       prompt text or a .txt prompt file\n");
+  printf("  --dump-tokens <path>          append every sampled token id (one per line)\n");
   printf("  -n/--predict/--n-predict <count>  maximum generated tokens (default: 512)\n");
   printf("  --verbose                     enable verbose logs\n");
   printf("  --ignore-eos                  ignore EOS during generation\n");
@@ -775,6 +828,8 @@ static bool parse_named_command_line(int argc, char** argv, CommandLineOptions* 
                arg, options->chat_template);
         return false;
       }
+    } else if (strcmp(arg, "--dump-tokens") == 0) {
+      if (!take_option_value(argc, argv, &i, arg, &options->dump_tokens)) return false;
     } else if (strcmp(arg, "--probe-sessions") == 0) {
       const char* probe_value = nullptr;
       uint64_t    probe_count = 0;
@@ -1239,6 +1294,13 @@ static int result_callback(void* userdata, RKLLMResult* result, LLMCallState sta
       result_state->has_token = true;
     }
 
+    if (g_token_dump) {
+      for (int i = 0; i < result->num_tokens; ++i) {
+        fprintf(g_token_dump, "%d\n", result->token_ids[i]);
+      }
+      fflush(g_token_dump);
+    }
+
     if (g_performance_mode) {
       return 0;
     }
@@ -1515,7 +1577,7 @@ static int init_tokenizer_and_embedding(const char* tokenizer_path, const char* 
   return 0;
 }
 
-static int init_output_tensors(StageRuntime& stage)
+static int init_output_tensors(StageContext& stage)
 {
   rknn3_input_output_num io_num;
   memset(&io_num, 0, sizeof(io_num));
@@ -1598,7 +1660,7 @@ static int init_output_tensors(StageRuntime& stage)
   return 0;
 }
 
-static int query_ext_input_indices(StageRuntime& stage)
+static int query_ext_input_indices(StageContext& stage)
 {
   rknn3_input_output_num io_num;
   memset(&io_num, 0, sizeof(io_num));
@@ -1655,18 +1717,15 @@ static int query_ext_input_indices(StageRuntime& stage)
   return 0;
 }
 
-static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stage_idx, const char* device_id,
-                       const char* model_path, const char* weight_path, const rknn3_llm_param& session_param,
-                       uint32_t run_core_mask,
-                       bool is_last_stage, Tokenizer* tokenizer,
-                       EmbedCallbackContext* embed_ctx,
-                       InputCbUserdata* input_cb_data)
+// 建立一张卡上与会话无关的资源：context、权重、模型初始化、输出张量。
+// 多会话并发时这一步只做一次。
+static bool init_stage_context(StageContext& stage, size_t stage_idx, const char* device_id,
+                               const char* model_path, const char* weight_path,
+                               uint32_t run_core_mask, InputCbUserdata* input_cb_data)
 {
   stage.model_path = model_path;
   stage.weight_path = weight_path;
   stage.device_id = device_id ? device_id : "";
-  stage.callback_ctx.pipeline = &pipeline;
-  stage.callback_ctx.stage_index = stage_idx;
 
   printf("[%s] init stage: model=%s, weight=%s, device_id=%s\n",
          stage.name.c_str(), model_path, weight_path, device_id);
@@ -1684,7 +1743,7 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
   ret = rknn3_load_model_from_path(stage.ctx, stage.model_path.c_str(), stage.weight_path.c_str());
   if (ret != RKNN3_SUCCESS) {
     printf("[%s] rknn3_load_model_from_path failed, ret=%d\n", stage.name.c_str(), ret);
-    destroy_stage(stage);
+    destroy_context(stage);
     return false;
   }
 
@@ -1694,7 +1753,7 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
   ret = rknn3_model_init(stage.ctx, &cfg);
   if (ret != RKNN3_SUCCESS) {
     printf("[%s] rknn3_model_init failed, ret=%d\n", stage.name.c_str(), ret);
-    destroy_stage(stage);
+    destroy_context(stage);
     return false;
   }
   // rknn3_set_input_name_alias(stage.ctx, "inputs_embeds", "input_embeds");
@@ -1704,35 +1763,64 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
   ret = rknn3_query(stage.ctx, RKNN3_QUERY_LLM_CONFIG, &llm_cfg, sizeof(llm_cfg));
   if (ret != RKNN3_SUCCESS) {
     printf("[%s] query llm config failed, ret=%d\n", stage.name.c_str(), ret);
-    destroy_stage(stage);
+    destroy_context(stage);
     return false;
   }
   stage.embedding_dim = (int32_t)llm_cfg.embedding_dim;
   stage.vocab_size = (int32_t)llm_cfg.vocab_size;
   stage.max_ctx_len = (int32_t)llm_cfg.max_ctx_len;
-  stage.callback_ctx.embedding_dim = stage.embedding_dim;
 
   if (init_output_tensors(stage) != 0) {
     printf("[%s] init output tensors failed\n", stage.name.c_str());
-    destroy_stage(stage);
+    destroy_context(stage);
     return false;
   }
+
+  // 外部 rope cache 的 ext input 索引也是卡级信息，一次查好给所有会话共用。
+  if (input_cb_data && input_cb_data->rope_mmap_base) {
+    if (query_ext_input_indices(stage) != 0) {
+      printf("[%s] query_ext_input_indices failed\n", stage.name.c_str());
+      destroy_context(stage);
+      return false;
+    }
+  }
+
+  printf("[%s] context init done: embedding_dim=%d vocab_size=%d max_ctx_len=%d outputs=%d\n",
+         stage.name.c_str(), stage.embedding_dim, stage.vocab_size, stage.max_ctx_len, stage.n_output_tensors);
+  return true;
+}
+
+// 在一个已初始化的 StageContext 上建一个会话：session + 指向**本会话**的回调。
+// 同一个 ctx 可以建多个 session（P0 已实测每卡上限 5 个）。
+static bool init_conversation(const std::vector<StageContext>& stages, Conversation& conv,
+                              size_t stage_idx, const rknn3_llm_param& session_param,
+                              Tokenizer* tokenizer, embedding_info* embed_info,
+                              InputCbUserdata* input_cb_data)
+{
+  const StageContext& stage = stages[stage_idx];
+  StageSession& sess = conv.stages[stage_idx];
+  const bool is_last_stage = (stage_idx + 1 == stages.size());
+
+  sess.callback_ctx.pipeline = &conv.pipeline;
+  sess.callback_ctx.stage_index = stage_idx;
+  sess.callback_ctx.embedding_dim = stage.embedding_dim;
+  sess.embed_ctx.embed_info = embed_info;
+  sess.embed_ctx.pipeline = &conv.pipeline;
 
   rknn3_llm_param local_param = session_param;
-
-  stage.session = rknn3_session_init(stage.ctx, &local_param, 1);
-  if (!stage.session) {
+  sess.session = rknn3_session_init(stage.ctx, &local_param, 1);
+  if (!sess.session) {
     printf("[%s] rknn3_session_init failed\n", stage.name.c_str());
-    destroy_stage(stage);
     return false;
   }
-  rknn3_session_set_chat_template(stage.session, "", "", "");
-  RKLLMCallback& callback = stage.callback;
+  rknn3_session_set_chat_template(sess.session, "", "", "");
+
+  RKLLMCallback& callback = sess.callback;
   memset(&callback, 0, sizeof(callback));
 
   if (!is_last_stage) {
     callback.output_callback = stage_output_callback;
-    callback.output_userdata = &stage.callback_ctx;
+    callback.output_userdata = &sess.callback_ctx;
     callback.output_tensors = stage.output_tensors;
     callback.n_output_tensors = stage.n_output_tensors;
   }
@@ -1740,17 +1828,12 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
   callback.tokenizer_callback = tokenizer_callback;
   callback.tokenizer_userdata = tokenizer;
   callback.embed_callback = embed_callback;
-  callback.embed_userdata = embed_ctx;
+  callback.embed_userdata = &sess.embed_ctx;
   callback.result_callback = result_callback;
-  callback.result_userdata = &g_last_stage_result;
+  callback.result_userdata = &conv.result;
 
   // 如果提供了 safetensors (rope caches)，则注册 input_callback 并设置 ext input indices
   if (input_cb_data && input_cb_data->rope_mmap_base) {
-    if (query_ext_input_indices(stage) != 0) {
-      printf("[%s] query_ext_input_indices failed\n", stage.name.c_str());
-      destroy_stage(stage);
-      return false;
-    }
     callback.input_callback = input_callback;
     callback.input_userdata = input_cb_data;
     callback.input_tensors_index = stage.ext_input_indices;
@@ -1760,16 +1843,14 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
     }
   }
 
-  ret = rknn3_session_set_callback(stage.session, &stage.callback);
-  stage.has_callback = (ret == RKNN3_SUCCESS);
+  int ret = rknn3_session_set_callback(sess.session, &sess.callback);
+  sess.has_callback = (ret == RKNN3_SUCCESS);
   if (ret != RKNN3_SUCCESS) {
     printf("[%s] rknn3_session_set_callback failed, ret=%d\n", stage.name.c_str(), ret);
-    destroy_stage(stage);
     return false;
   }
 
-  printf("[%s] init done: embedding_dim=%d vocab_size=%d max_ctx_len=%d outputs=%d\n",
-         stage.name.c_str(), stage.embedding_dim, stage.vocab_size, stage.max_ctx_len, stage.n_output_tensors);
+  printf("[%s] session init done (stage_idx=%zu)\n", stage.name.c_str(), stage_idx);
   return true;
 }
 
@@ -1788,11 +1869,13 @@ static bool wait_stage_batch(StageSlot& slot, StageBatch* batch)
   return true;
 }
 
-static void run_stage_worker(size_t stage_idx, std::vector<StageRuntime>& stages,
-                             PipelineState& pipeline, const rknn3_llm_infer_param& infer_param,
+static void run_stage_worker(size_t stage_idx, std::vector<StageContext>& stages,
+                             Conversation& conv, const rknn3_llm_infer_param& infer_param,
                              InferencePhase phase)
 {
-  StageRuntime& stage = stages[stage_idx];
+  StageContext& stage = stages[stage_idx];
+  PipelineState& pipeline = conv.pipeline;
+  rknn3_session* session = conv.stages[stage_idx].session;
   StageSlot& input_slot = *pipeline.slots[stage_idx - 1];
   StageSlot* output_slot = stage_idx + 1 < stages.size() ? pipeline.slots[stage_idx].get() : nullptr;
   bool is_last_stage = (stage_idx == stages.size() - 1);
@@ -1854,7 +1937,7 @@ static void run_stage_worker(size_t stage_idx, std::vector<StageRuntime>& stages
     timeval run_start;
     timeval run_end;
     gettimeofday(&run_start, NULL);
-    int ret = rknn3_session_run(stage.session, &embed_input, 1, &local_param);
+    int ret = rknn3_session_run(session, &embed_input, 1, &local_param);
     gettimeofday(&run_end, NULL);
     record_stage_performance(stage, phase, batch.n_tokens,
                              elapsed_us(run_start, run_end) / 1e3);
@@ -1875,13 +1958,14 @@ static void run_stage_worker(size_t stage_idx, std::vector<StageRuntime>& stages
   }
 }
 
-static bool run_pipeline_once(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+static bool run_pipeline_once(std::vector<StageContext>& stages, Conversation& conv,
                               const char* prompt, const std::vector<int32_t>* input_tokens,
                               InferencePhase phase, uint64_t* stage0_input_tokens)
 {
   if (stages.empty()) {
     return false;
   }
+  PipelineState& pipeline = conv.pipeline;
 
   rknn3_llm_infer_param infer_param;
   memset(&infer_param, 0, sizeof(infer_param));
@@ -1897,7 +1981,7 @@ static bool run_pipeline_once(std::vector<StageRuntime>& stages, PipelineState& 
   }
 
   reset_pipeline(pipeline);
-  reset_last_stage_result();
+  reset_last_stage_result(conv);
 
   rknn3_llm_input first_input;
   memset(&first_input, 0, sizeof(first_input));
@@ -1916,14 +2000,14 @@ static bool run_pipeline_once(std::vector<StageRuntime>& stages, PipelineState& 
   std::vector<std::thread> workers;
   workers.reserve(stages.size() - 1);
   for (size_t i = 1; i < stages.size(); ++i) {
-    workers.emplace_back(run_stage_worker, i, std::ref(stages), std::ref(pipeline),
+    workers.emplace_back(run_stage_worker, i, std::ref(stages), std::ref(conv),
                          std::cref(infer_param), phase);
   }
 
   timeval stage0_start;
   timeval stage0_end;
   gettimeofday(&stage0_start, NULL);
-  int ret = rknn3_session_run(stages[0].session, &first_input, 1, &infer_param);
+  int ret = rknn3_session_run(conv.stages[0].session, &first_input, 1, &infer_param);
   gettimeofday(&stage0_end, NULL);
   if (ret != RKNN3_SUCCESS) {
     printf("[stage0] run failed ret=%d\n", ret);
@@ -1960,7 +2044,7 @@ struct ChatTurnResult
 
 // 运行一轮完整的对话：以 prompt 做 prefill，再逐 token decode 生成本轮回复。
 // 历史通过 run_pipeline_once 内部的 keep_history=1 自动累积，本函数不清理 KV cache。
-static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+static bool run_chat_turn(std::vector<StageContext>& stages, Conversation& conv,
                           const VocabInfo& vocab_info, const char* prompt,
                           int max_new_tokens, ChatTurnResult* result)
 {
@@ -1968,7 +2052,7 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
   timeval prefill_end;
   gettimeofday(&prefill_start, NULL);
   uint64_t prefill_tokens = 0;
-  if (!run_pipeline_once(stages, pipeline, prompt, nullptr,
+  if (!run_pipeline_once(stages, conv, prompt, nullptr,
                          InferencePhase::PREFILL, &prefill_tokens)) {
     printf("prefill failed\n");
     return false;
@@ -1976,7 +2060,7 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
   gettimeofday(&prefill_end, NULL);
 
   int next_token = -1;
-  get_last_stage_token(&next_token);
+  get_last_stage_token(conv, &next_token);
   if (next_token < 0) {
     printf("prefill did not return token from result_callback\n");
     return false;
@@ -1991,13 +2075,13 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
     std::vector<int32_t> token_vec(1, next_token);
     VLOG("[Decode %llu] token=%d\n", (unsigned long long)(step + 1), next_token);
 
-    if (!run_pipeline_once(stages, pipeline, nullptr, &token_vec,
+    if (!run_pipeline_once(stages, conv, nullptr, &token_vec,
                            InferencePhase::DECODE, nullptr)) {
       printf("decode step %llu failed\n", (unsigned long long)(step + 1));
       break;
     }
 
-    if (!get_last_stage_token(&next_token)) {
+    if (!get_last_stage_token(conv, &next_token)) {
       printf("decode step %llu did not return token from result_callback\n",
              (unsigned long long)(step + 1));
       break;
@@ -2089,11 +2173,11 @@ static void probe_print_mem_diff(const ProbeMemSample& before, const ProbeMemSam
          probe_mb(before.total_free), probe_mb(after.total_free), total_delta);
 }
 
-static void probe_dump_allocation(const StageRuntime& stage, const char* tag);
+static void probe_dump_allocation(const StageContext& stage, const char* tag);
 
 // 打印每个 stage 的 context 级内存：权重 / 内部 / KV cache，以及 KV cache 长度分组。
 // 这些数字回答"卡内放得下几个 session"。
-static void probe_dump_context_mem(const StageRuntime& stage)
+static void probe_dump_context_mem(const StageContext& stage)
 {
   printf("\n--- [probe] %s (device=%s) ---\n", stage.name.c_str(), stage.device_id.c_str());
 
@@ -2139,7 +2223,7 @@ static void probe_dump_context_mem(const StageRuntime& stage)
 
 // 查询 context 级内存分配明细（每核 weight/internal/kvcache）。
 // 在创建额外 session 前后各调一次，"kvcache 是否增长"直接回答 KV cache 是不是 per-session。
-static void probe_dump_allocation(const StageRuntime& stage, const char* tag)
+static void probe_dump_allocation(const StageContext& stage, const char* tag)
 {
   int32_t core_num = 0;
   if (rknn3_query(stage.ctx, RKNN3_QUERY_CORE_NUMBER, &core_num, sizeof(core_num)) != RKNN3_SUCCESS ||
@@ -2189,26 +2273,26 @@ static void probe_dump_allocation(const StageRuntime& stage, const char* tag)
 
 // 把 stages[] 临时切到指定的 session 组上跑一次流水线，跑完切回原组。
 // 这样可以在不改动 pipeline 结构的前提下，用不同 session 组各跑一遍推理。
-static bool probe_run_on_group(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+static bool probe_run_on_group(std::vector<StageContext>& stages, Conversation& conv,
                                const std::vector<rknn3_session*>& group, const char* prompt,
                                const std::vector<int32_t>* input_tokens, InferencePhase phase,
                                int32_t* out_token)
 {
   std::vector<rknn3_session*> saved(stages.size(), nullptr);
   for (size_t i = 0; i < stages.size(); ++i) {
-    saved[i] = stages[i].session;
-    stages[i].session = group[i];
+    saved[i] = conv.stages[i].session;
+    conv.stages[i].session = group[i];
   }
 
-  bool ok = run_pipeline_once(stages, pipeline, prompt, input_tokens, phase, nullptr);
+  bool ok = run_pipeline_once(stages, conv, prompt, input_tokens, phase, nullptr);
   if (ok && out_token) {
-    if (!get_last_stage_token(out_token)) {
+    if (!get_last_stage_token(conv, out_token)) {
       *out_token = -1;
     }
   }
 
   for (size_t i = 0; i < stages.size(); ++i) {
-    stages[i].session = saved[i];
+    conv.stages[i].session = saved[i];
   }
   return ok;
 }
@@ -2224,16 +2308,16 @@ static void probe_clear_group(const std::vector<rknn3_session*>& group)
 
 // 在指定 session 组上推进一步：prompt != nullptr 走 prefill，否则用上一步的 token 走 decode。
 // 隔离性测试需要把 A / B 两个会话逐步交错推进，所以这一步必须能单独调用。
-static bool probe_step(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+static bool probe_step(std::vector<StageContext>& stages, Conversation& conv,
                        const std::vector<rknn3_session*>& group, const char* prompt,
                        int32_t prev_token, int32_t* out_token)
 {
   if (prompt != nullptr) {
-    return probe_run_on_group(stages, pipeline, group, prompt, nullptr,
+    return probe_run_on_group(stages, conv, group, prompt, nullptr,
                               InferencePhase::PREFILL, out_token);
   }
   std::vector<int32_t> one(1, prev_token);
-  return probe_run_on_group(stages, pipeline, group, nullptr, &one,
+  return probe_run_on_group(stages, conv, group, nullptr, &one,
                             InferencePhase::DECODE, out_token);
 }
 
@@ -2248,20 +2332,20 @@ static void probe_print_seq(const char* label, const std::vector<int32_t>& seq)
 
 // 把 seq 推进到 steps 个 token：首步走 prefill（prompt != nullptr），其余是 greedy decode。
 // 传 prompt == nullptr 表示在会话已有 KV 上继续——隔离性测试靠它做 A/B 逐步交错。
-static bool probe_advance(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+static bool probe_advance(std::vector<StageContext>& stages, Conversation& conv,
                           const std::vector<rknn3_session*>& group, const char* prompt,
                           int steps, std::vector<int32_t>* seq)
 {
   if (prompt != nullptr) {
     int32_t first = -1;
-    if (!probe_step(stages, pipeline, group, prompt, -1, &first) || first < 0) {
+    if (!probe_step(stages, conv, group, prompt, -1, &first) || first < 0) {
       return false;
     }
     seq->push_back(first);
   }
   while ((int)seq->size() < steps) {
     int32_t next = -1;
-    if (seq->empty() || !probe_step(stages, pipeline, group, nullptr, seq->back(), &next) ||
+    if (seq->empty() || !probe_step(stages, conv, group, nullptr, seq->back(), &next) ||
         next < 0) {
       return false;
     }
@@ -2272,7 +2356,7 @@ static bool probe_advance(std::vector<StageRuntime>& stages, PipelineState& pipe
 
 // 一张卡上最紧的那个 NPU node 的空闲内存（MB）。
 // session 分配失败总是发生在最紧的 node 上，所以卡内天花板由它决定而非平均值。
-static double probe_tightest_node_free_mb(const StageRuntime& stage)
+static double probe_tightest_node_free_mb(const StageContext& stage)
 {
   rknn3_dev_mem_info dev_mem;
   memset(&dev_mem, 0, sizeof(dev_mem));
@@ -2292,7 +2376,7 @@ static double probe_tightest_node_free_mb(const StageRuntime& stage)
 
 // 整卡口径的最紧 node 空闲：跨 4 段取最小。段间权重不同（stage3 带 norm+lm_head，
 // 比 stage0 多 ~172 MB），所以真正绑死卡内天花板的是全段里最紧的那个 node。
-static double probe_card_tightest_free_mb(const std::vector<StageRuntime>& stages)
+static double probe_card_tightest_free_mb(const std::vector<StageContext>& stages)
 {
   double tightest = -1.0;
   for (size_t i = 0; i < stages.size(); ++i) {
@@ -2319,7 +2403,7 @@ static int probe_count_tokens(Tokenizer* tokenizer, const std::string& text)
 
 // 模型实际生效的上下文上限。以模型内固化的 max_ctx_len 为准——命令行 --ctx-size
 // 只在不超过它时才有意义（RK1828 上超了会被静默降到这个值）。
-static int probe_model_ctx_len(const StageRuntime& stage)
+static int probe_model_ctx_len(const StageContext& stage)
 {
   rknn3_llm_config llm_cfg;
   memset(&llm_cfg, 0, sizeof(llm_cfg));
@@ -2341,7 +2425,7 @@ struct ProbeAllocSums
   bool   valid = false;
 };
 
-static bool probe_get_alloc_sums(const StageRuntime& stage, ProbeAllocSums* out)
+static bool probe_get_alloc_sums(const StageContext& stage, ProbeAllocSums* out)
 {
   *out = ProbeAllocSums();
   int32_t core_num = 0;
@@ -2364,7 +2448,7 @@ static bool probe_get_alloc_sums(const StageRuntime& stage, ProbeAllocSums* out)
   return true;
 }
 
-static int probe_sessions(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+static int probe_sessions(std::vector<StageContext>& stages, Conversation& conv,
                           const rknn3_llm_param& session_param, const ChatTemplateSpec* tpl,
                           int n_sessions, Tokenizer* tokenizer)
 {
@@ -2401,7 +2485,7 @@ static int probe_sessions(std::vector<StageRuntime>& stages, PipelineState& pipe
   std::vector<std::vector<rknn3_session*>> groups;
   groups.push_back(std::vector<rknn3_session*>(n_stages, nullptr));
   for (size_t i = 0; i < n_stages; ++i) {
-    groups[0][i] = stages[i].session;
+    groups[0][i] = conv.stages[i].session;
   }
 
   ProbeMemSample prev = baseline;
@@ -2433,8 +2517,8 @@ static int probe_sessions(std::vector<StageRuntime>& stages, PipelineState& pipe
       }
       // callback 是 per-session 的，但内容可以复用；额外 session 也装上同一套回调，
       // 这样它们才能参与真实推理。
-      if (stages[i].has_callback) {
-        rknn3_session_set_callback(session, &stages[i].callback);
+      if (conv.stages[i].has_callback) {
+        rknn3_session_set_callback(session, &conv.stages[i].callback);
       }
       rknn3_session_set_chat_template(session, "", "", "");
       this_group[i] = session;
@@ -2622,27 +2706,27 @@ static int probe_sessions(std::vector<StageRuntime>& stages, PipelineState& pipe
     // 1) 交错推进：A prefill → B prefill → (A decode → B decode) × (steps-1)
     probe_clear_group(groups[0]);
     probe_clear_group(groups[1]);
-    bool io_ok = probe_advance(stages, pipeline, groups[0], prompt_a.c_str(), 1, &seqA_i) &&
-                 probe_advance(stages, pipeline, groups[1], prompt_b.c_str(), 1, &seqB_i);
+    bool io_ok = probe_advance(stages, conv, groups[0], prompt_a.c_str(), 1, &seqA_i) &&
+                 probe_advance(stages, conv, groups[1], prompt_b.c_str(), 1, &seqB_i);
     for (int s = 1; io_ok && s < kIsolationSteps; ++s) {
-      io_ok = probe_advance(stages, pipeline, groups[0], nullptr, s + 1, &seqA_i) &&
-              probe_advance(stages, pipeline, groups[1], nullptr, s + 1, &seqB_i);
+      io_ok = probe_advance(stages, conv, groups[0], nullptr, s + 1, &seqA_i) &&
+              probe_advance(stages, conv, groups[1], nullptr, s + 1, &seqB_i);
     }
 
     // 2) 对照：A / B 各自单独跑同样步数（无交错干扰）
     probe_clear_group(groups[0]);
     probe_clear_group(groups[1]);
-    bool r_ok = probe_advance(stages, pipeline, groups[0], prompt_a.c_str(),
+    bool r_ok = probe_advance(stages, conv, groups[0], prompt_a.c_str(),
                               kIsolationSteps, &seqA_r) &&
-                probe_advance(stages, pipeline, groups[1], prompt_b.c_str(),
+                probe_advance(stages, conv, groups[1], prompt_b.c_str(),
                               kIsolationSteps, &seqB_r);
 
     // 3) 自洽性：对照再跑一遍，排除采样非确定性
     probe_clear_group(groups[0]);
     probe_clear_group(groups[1]);
-    bool r2_ok = probe_advance(stages, pipeline, groups[0], prompt_a.c_str(),
+    bool r2_ok = probe_advance(stages, conv, groups[0], prompt_a.c_str(),
                                kIsolationSteps, &seqA_r2) &&
-                 probe_advance(stages, pipeline, groups[1], prompt_b.c_str(),
+                 probe_advance(stages, conv, groups[1], prompt_b.c_str(),
                                kIsolationSteps, &seqB_r2);
 
     if (!io_ok || !r_ok || !r2_ok) {
@@ -2732,14 +2816,14 @@ static int probe_sessions(std::vector<StageRuntime>& stages, PipelineState& pipe
       for (int k = 0; k < longctx_n; ++k) {
         probe_clear_group(groups[k]);
         int32_t tok = -1;
-        bool ok = probe_step(stages, pipeline, groups[k], long_prompt.c_str(), -1, &tok);
+        bool ok = probe_step(stages, conv, groups[k], long_prompt.c_str(), -1, &tok);
         if (!ok || tok < 0) {
           printf("[probe]   会话 #%d: 满上下文 prefill 失败 ❌  最紧 node 空闲 %.1f MB\n",
                  k + 1, probe_card_tightest_free_mb(stages));
           break;
         }
         int32_t next = -1;
-        bool ok2 = probe_step(stages, pipeline, groups[k], nullptr, tok, &next);
+        bool ok2 = probe_step(stages, conv, groups[k], nullptr, tok, &next);
         printf("[probe]   会话 #%d: prefill ok(token %d) → decode %s(token %d)  "
                "最紧 node 空闲 %.1f MB\n",
                k + 1, tok, ok2 ? "ok" : "FAIL", next,
@@ -2983,6 +3067,15 @@ int main(int argc, char** argv)
     return -1;
   }
 
+  if (options.dump_tokens && options.dump_tokens[0] != '\0') {
+    g_token_dump = fopen(options.dump_tokens, "w");
+    if (!g_token_dump) {
+      printf("failed to open --dump-tokens file: %s\n", options.dump_tokens);
+      return -1;
+    }
+    printf("[dump] token ids -> %s\n", options.dump_tokens);
+  }
+
   std::vector<std::string> ext_device_ids = options.device_ids;
 
   if (g_stage_count < 1) {
@@ -3052,11 +3145,12 @@ int main(int argc, char** argv)
     return -1;
   }
 
-  PipelineState pipeline(g_stage_count);
-  std::vector<StageRuntime> stages(g_stage_count);
+  std::vector<StageContext> stages(g_stage_count);
   for (size_t i = 0; i < stages.size(); ++i) {
     stages[i].name = "stage" + std::to_string(i);
   }
+  // P1：只建一个会话。P2 起这里会变成 N 个 Conversation 并发驱动。
+  Conversation conversation(g_stage_count);
 
   Tokenizer* tokenizer = nullptr;
   VocabInfo vocab_info;
@@ -3069,8 +3163,8 @@ int main(int argc, char** argv)
     return -1;
   }
 
-  g_last_stage_result.tokenizer = tokenizer;
-  reset_last_stage_result();
+  conversation.result.tokenizer = tokenizer;
+  reset_last_stage_result(conversation);
 
   rknn3_llm_param session_param;
   memset(&session_param, 0, sizeof(session_param));
@@ -3090,10 +3184,6 @@ int main(int argc, char** argv)
   session_param.vocab_info.linefeed_id = vocab_info.linefeed_id;
   session_param.vocab_info.ignore_eos_token = g_ignore_eos ? 1 : 0;
 
-  EmbedCallbackContext embed_ctx;
-  embed_ctx.embed_info = &embed_info;
-  embed_ctx.pipeline = &pipeline;
-
   InputCbUserdata input_cb_data;
   memset(&input_cb_data, 0, sizeof(input_cb_data));
 
@@ -3103,7 +3193,7 @@ int main(int argc, char** argv)
   int ret = rknn3_find_devices(&devs);
   if (ret != RKNN3_SUCCESS) {
     printf("find devices failed: ret=%d\n", ret);
-    release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+    release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
     return -1;
   }
   printf("found %d devices:\n", devs.n_devices);
@@ -3115,13 +3205,13 @@ int main(int argc, char** argv)
     // 未指定外部 device_id，自动分配
     if (devs.n_devices < (int)g_stage_count) {
       printf("auto-detect failed: found=%d devices, need=%zu\n", devs.n_devices, g_stage_count);
-      release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+      release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
       return -1;
     }
     printf("auto-assigning %zu devices\n", g_stage_count);
   } else if ((int)ext_device_ids.size() < (int)g_stage_count) {
     printf("not enough device_id arguments: need=%zu, got=%zu\n", g_stage_count, ext_device_ids.size());
-    release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+    release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
     return -1;
   } else {
     // 校验外部指定的 device_id 是否在可用设备列表中
@@ -3139,23 +3229,35 @@ int main(int argc, char** argv)
                          &input_cb_data.rope_fd, &input_cb_data.rope_mmap_base,
                          &input_cb_data.rope_mmap_size) != 0) {
       printf("load_safetensors failed\n");
-      release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+      release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
       return -1;
     }
   }
 
+  // 第一遍：每卡建 context（权重只加载一次，多会话共享）。
   bool ok = true;
   for (size_t i = 0; i < stages.size(); ++i) {
     const char* device_id = ext_device_ids.empty() ? devs.devices[i].id : ext_device_ids[i].c_str();
-    ok = init_stage(stages[i], pipeline, i, device_id,
-                    model_paths[i].c_str(), weight_paths[i].c_str(), session_param, run_core_mask,
-                    i + 1 == stages.size(), tokenizer, &embed_ctx, &input_cb_data);
+    ok = init_stage_context(stages[i], i, device_id,
+                            model_paths[i].c_str(), weight_paths[i].c_str(), run_core_mask,
+                            &input_cb_data);
     if (!ok) {
       break;
     }
   }
+  // 第二遍：在已建好的 context 上开会话。P1 只有 conversation 这一个会话；
+  // P2 会在这里循环创建多个 Conversation，每个拿到一套独立 session。
+  if (ok) {
+    for (size_t i = 0; i < stages.size(); ++i) {
+      ok = init_conversation(stages, conversation, i, session_param,
+                             tokenizer, &embed_info, &input_cb_data);
+      if (!ok) {
+        break;
+      }
+    }
+  }
   if (!ok) {
-    release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+    release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
     return -1;
   }
 
@@ -3177,7 +3279,7 @@ int main(int argc, char** argv)
                stage.name.c_str(),
                (unsigned long long)required_context_tokens,
                stage.max_ctx_len);
-        release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+        release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
         return -1;
       }
     }
@@ -3218,9 +3320,9 @@ int main(int argc, char** argv)
 
   // 多 session 可行性探针：只做测量与隔离性验证，跑完立即退出，不进入对话/性能模式。
   if (options.probe_sessions > 0) {
-    int probe_ret = probe_sessions(stages, pipeline, session_param, chat_tpl,
+    int probe_ret = probe_sessions(stages, conversation, session_param, chat_tpl,
                                    options.probe_sessions, tokenizer);
-    release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+    release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
     return probe_ret == 0 ? 0 : 1;
   }
 
@@ -3232,14 +3334,7 @@ int main(int argc, char** argv)
     printf("\n=== Interactive Chat Mode ===\n");
     printf("Type your message and press Enter (Ctrl-D to exit).\n");
 
-    bool first_turn = true;
     std::string user_input;
-    uint64_t total_prefill_tokens = 0;
-    uint64_t total_decode_tokens = 0;
-    double total_prefill_ms = 0.0;
-    double total_decode_ms = 0.0;
-    // 当前对话累计占用上下文 token 数（prefill + decode），用于在接近上限时主动清空 KV cache。
-    uint64_t context_tokens = 0;
     while (true) {
       printf("\nUser: ");
       fflush(stdout);
@@ -3262,24 +3357,26 @@ int main(int argc, char** argv)
                                          ? (uint64_t)stages[0].max_ctx_len
                                          : (uint64_t)max_context_len;
       const uint64_t prefill_reserve = 512;
-      if (context_tokens > 0 && context_tokens + prefill_reserve >= context_limit) {
+      // 上下文累计与"是否首轮"都挂在会话上（P2 起每个会话各有一套）。
+      if (conversation.context_tokens > 0 &&
+          conversation.context_tokens + prefill_reserve >= context_limit) {
         printf("\n[warning] context %llu/%llu tokens nearly full, clearing KV cache to start a fresh conversation\n",
-               (unsigned long long)context_tokens, (unsigned long long)context_limit);
+               (unsigned long long)conversation.context_tokens, (unsigned long long)context_limit);
         for (size_t i = 0; i < stages.size(); ++i) {
-          rknn3_session_clear_kvcache(stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+          rknn3_session_clear_kvcache(conversation.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
         }
-        context_tokens = 0;
-        first_turn = true;
+        conversation.context_tokens = 0;
+        conversation.first_turn = true;
       }
 
       std::string chat_prompt;
-      if (first_turn) {
+      if (conversation.first_turn) {
         // Gemma-4 没有 system role，其 system_prompt 为空串，这里自然退化为不带 system 轮。
         chat_prompt = tpl->system_prompt;
         chat_prompt += tpl->user_prefix;
         chat_prompt += user_input;
         chat_prompt += tpl->user_postfix;
-        first_turn = false;
+        conversation.first_turn = false;
       } else {
         chat_prompt = tpl->user_prefix;
         chat_prompt += user_input;
@@ -3289,22 +3386,24 @@ int main(int argc, char** argv)
       printf("Assistant: ");
       fflush(stdout);
       ChatTurnResult turn;
-      if (!run_chat_turn(stages, pipeline, vocab_info, chat_prompt.c_str(),
+      if (!run_chat_turn(stages, conversation, vocab_info, chat_prompt.c_str(),
                          max_new_tokens, &turn)) {
         printf("\n[interactive] inference failed, stopping\n");
         break;
       }
       printf("\n");
 
-      total_prefill_tokens += turn.prefill_tokens;
-      total_decode_tokens += turn.decode_tokens;
-      total_prefill_ms += turn.prefill_ms;
-      total_decode_ms += turn.decode_ms;
-      context_tokens += turn.prefill_tokens + turn.decode_tokens;
+      conversation.total_prefill_tokens += turn.prefill_tokens;
+      conversation.total_decode_tokens += turn.decode_tokens;
+      conversation.total_prefill_ms += turn.prefill_ms;
+      conversation.total_decode_ms += turn.decode_ms;
+      conversation.context_tokens += turn.prefill_tokens + turn.decode_tokens;
     }
 
-    print_performance_statistics(total_prefill_tokens, (float)total_prefill_ms,
-                                 total_decode_tokens, (float)total_decode_ms);
+    print_performance_statistics(conversation.total_prefill_tokens,
+                                 (float)conversation.total_prefill_ms,
+                                 conversation.total_decode_tokens,
+                                 (float)conversation.total_decode_ms);
   } else {
     printf("\n=== Prefill Pipeline ===\n");
     timeval prefill_start;
@@ -3314,21 +3413,21 @@ int main(int argc, char** argv)
     const char* prefill_prompt = g_performance_mode ? nullptr : prompt;
     const std::vector<int32_t>* prefill_input_tokens =
         g_performance_mode ? &performance_input_tokens : nullptr;
-    if (!run_pipeline_once(stages, pipeline, prefill_prompt, prefill_input_tokens,
+    if (!run_pipeline_once(stages, conversation, prefill_prompt, prefill_input_tokens,
                            InferencePhase::PREFILL, &prefill_tokens)) {
       printf("prefill failed\n");
-      release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+      release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
       return -1;
     }
     gettimeofday(&prefill_end, NULL);
 
     int next_token = -1;
-    get_last_stage_token(&next_token);
+    get_last_stage_token(conversation, &next_token);
 
     printf("\n=== Decode Loop ===\n");
     if (next_token < 0) {
       printf("prefill did not return token from result_callback\n");
-      release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+      release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
       return -1;
     }
     timeval decode_start;
@@ -3342,13 +3441,13 @@ int main(int argc, char** argv)
       std::vector<int32_t> token_vec(1, next_token);
       VLOG("[Decode %llu] token=%d\n", (unsigned long long)(step + 1), next_token);
 
-      if (!run_pipeline_once(stages, pipeline, nullptr, &token_vec,
+      if (!run_pipeline_once(stages, conversation, nullptr, &token_vec,
                              InferencePhase::DECODE, nullptr)) {
         printf("decode step %llu failed\n", (unsigned long long)(step + 1));
         break;
       }
 
-      if (!get_last_stage_token(&next_token)) {
+      if (!get_last_stage_token(conversation, &next_token)) {
         printf("decode step %llu did not return token from result_callback\n",
                (unsigned long long)(step + 1));
         break;
@@ -3374,12 +3473,17 @@ int main(int argc, char** argv)
     print_performance_statistics(prefill_tokens, prefill_ms, decode_tokens, decode_ms);
   }
 
-  print_stage_performance_statistics(stages);
-  for (size_t i = 0; i < stages.size(); ++i) {
-    rknn3_session_clear_kvcache(stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+  if (g_token_dump) {
+    fclose(g_token_dump);
+    g_token_dump = nullptr;
   }
 
-  release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+  print_stage_performance_statistics(stages);
+  for (size_t i = 0; i < stages.size(); ++i) {
+    rknn3_session_clear_kvcache(conversation.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+  }
+
+  release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
 
   return 0;
 }
