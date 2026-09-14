@@ -142,8 +142,13 @@ struct StageRuntime
   std::string      name;
   std::string      model_path;
   std::string      weight_path;
+  std::string      device_id;
   rknn3_context    ctx = 0;
   rknn3_session*   session = nullptr;
+  // 已注册到 session 上的 callback。多 session 探针需要把它原样复制到额外创建的
+  // session 上（callback 是 per-session 的，但内容可以共用）。
+  RKLLMCallback    callback;
+  bool             has_callback = false;
   int32_t          embedding_dim = 0;
   int32_t          vocab_size = 0;
   int32_t          max_ctx_len = 0;
@@ -187,6 +192,48 @@ static const char* GEMMA4_ROPE_CACHE_NAMES[4] = {
 static const char* QWEN35_ROPE_CACHE_NAMES[2] = {
     "rope_cos_cache", "rope_sin_cache"
 };
+
+// 多轮对话的 prompt 拼装模板。Qwen3.5 与 Gemma-4 的对话标记完全不同，不能共用；
+// 另注意 Gemma 没有 system role，首轮不能拼 system prompt。
+enum class ChatTemplateFamily
+{
+  QWEN35 = 0,
+  GEMMA4,
+};
+
+struct ChatTemplateSpec
+{
+  const char* system_prompt;
+  const char* user_prefix;
+  const char* user_postfix;
+};
+
+static const ChatTemplateSpec QWEN35_CHAT_TEMPLATE = {
+    "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n",
+    "<|im_start|>user\n",
+    "<|im_end|>\n<|im_start|>assistant\n",
+};
+
+// Gemma-4 官方模板，取自模型导出时生成的 config.pkl（system_prompt / prompt_prefix /
+// prompt_postfix 三个字段），与 examples/gemma4 的 set_chat_template 一致。
+// 注意：Gemma-4 用的是 <|turn> / <turn|>，与 functiongemma 的 <start_of_turn> /
+// <end_of_turn> 完全不同，混用会让模型既进不了 channel、也不在回合结束处停止。
+// postfix 末尾预置空 thought channel，模型据此跳过思考直接作答，输出更干净。
+static const ChatTemplateSpec GEMMA4_CHAT_TEMPLATE = {
+    "",
+    "<|turn>user\n",
+    "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+};
+
+static const ChatTemplateSpec* chat_template_for(ChatTemplateFamily family)
+{
+  return family == ChatTemplateFamily::GEMMA4 ? &GEMMA4_CHAT_TEMPLATE : &QWEN35_CHAT_TEMPLATE;
+}
+
+static const char* chat_template_name(ChatTemplateFamily family)
+{
+  return family == ChatTemplateFamily::GEMMA4 ? "gemma4" : "qwen3.5";
+}
 
 struct InputCbUserdata
 {
@@ -547,8 +594,11 @@ struct CommandLineOptions
   bool        ignore_eos = false;
   bool        interactive = false;
   const char* rope_path = nullptr;
+  const char* chat_template = nullptr;
   const char* tensor_dump_dir = nullptr;
   std::vector<std::string> device_ids;
+  // --probe-sessions N：多 session 可行性探针（每卡再建 N-1 个 session 并测量设备内存）
+  int         probe_sessions = 0;
 
   bool     performance_mode = false;
   uint64_t performance_input_length = 0;
@@ -570,8 +620,13 @@ static void print_usage(const char* program)
   printf("  --ignore-eos                  ignore EOS during generation\n");
   printf("  --interactive, -i             interactive multi-turn chat mode (reads stdin)\n");
   printf("  --rope-tensor <safetensors>   external rope cache\n");
+  printf("  --chat-template <auto|qwen|gemma>  multi-turn chat markers; auto (default)\n"
+         "                                detects the model family from the rope cache\n");
   printf("  --device-id <id[#id...]>      device IDs separated by '#'; optional\n");
   printf("  --perf <input> <output>       performance test mode\n");
+  printf("  --probe-sessions <N>          multi-session feasibility probe (N in [2,16]);\n"
+         "                                creates N-1 extra sessions per card, measures device\n"
+         "                                memory and verifies KV-cache isolation, then exits\n");
   printf("  --dump-tensors <dir>          dump callback tensors to this directory\n");
   printf("  --help                        show this message\n");
   printf("Legacy positional arguments remain supported for compatibility.\n");
@@ -711,6 +766,26 @@ static bool parse_named_command_line(int argc, char** argv, CommandLineOptions* 
     } else if (strcmp(arg, "--rope-tensor") == 0 || strcmp(arg, "--rope") == 0 ||
                strcmp(arg, "--rope-path") == 0) {
       if (!take_option_value(argc, argv, &i, arg, &options->rope_path)) return false;
+    } else if (strcmp(arg, "--chat-template") == 0) {
+      if (!take_option_value(argc, argv, &i, arg, &options->chat_template)) return false;
+      if (strcmp(options->chat_template, "auto") != 0 &&
+          strcmp(options->chat_template, "qwen") != 0 &&
+          strcmp(options->chat_template, "gemma") != 0) {
+        printf("%s expects one of: auto, qwen, gemma (got '%s')\n",
+               arg, options->chat_template);
+        return false;
+      }
+    } else if (strcmp(arg, "--probe-sessions") == 0) {
+      const char* probe_value = nullptr;
+      uint64_t    probe_count = 0;
+      if (!take_option_value(argc, argv, &i, arg, &probe_value) ||
+          !parse_positive_u64(probe_value, &probe_count) ||
+          probe_count < 2 || probe_count > 16) {
+        printf("%s requires a session count in [2, 16] (got '%s')\n",
+               arg, probe_value ? probe_value : "");
+        return false;
+      }
+      options->probe_sessions = (int)probe_count;
     } else if (strcmp(arg, "--device-id") == 0) {
       if (!take_option_value(argc, argv, &i, arg, &value) ||
           !append_device_ids(value, &options->device_ids)) {
@@ -1589,6 +1664,7 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
 {
   stage.model_path = model_path;
   stage.weight_path = weight_path;
+  stage.device_id = device_id ? device_id : "";
   stage.callback_ctx.pipeline = &pipeline;
   stage.callback_ctx.stage_index = stage_idx;
 
@@ -1651,7 +1727,7 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
     return false;
   }
   rknn3_session_set_chat_template(stage.session, "", "", "");
-  RKLLMCallback callback;
+  RKLLMCallback& callback = stage.callback;
   memset(&callback, 0, sizeof(callback));
 
   if (!is_last_stage) {
@@ -1661,7 +1737,7 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
     callback.n_output_tensors = stage.n_output_tensors;
   }
 
-  callback.tokenizer_callback = tokenizer_callback; 
+  callback.tokenizer_callback = tokenizer_callback;
   callback.tokenizer_userdata = tokenizer;
   callback.embed_callback = embed_callback;
   callback.embed_userdata = embed_ctx;
@@ -1684,7 +1760,8 @@ static bool init_stage(StageRuntime& stage, PipelineState& pipeline, size_t stag
     }
   }
 
-  ret = rknn3_session_set_callback(stage.session, &callback);
+  ret = rknn3_session_set_callback(stage.session, &stage.callback);
+  stage.has_callback = (ret == RKNN3_SUCCESS);
   if (ret != RKNN3_SUCCESS) {
     printf("[%s] rknn3_session_set_callback failed, ret=%d\n", stage.name.c_str(), ret);
     destroy_stage(stage);
@@ -1942,6 +2019,817 @@ static bool run_chat_turn(std::vector<StageRuntime>& stages, PipelineState& pipe
   return true;
 }
 
+// ============================================================================
+// 多 Session 可行性探针（--probe-sessions N）
+//
+// 在写任何并发代码之前，用最小代价回答三个"一票否决"问题：
+//   1) rknn3_session_init 是否为每个 session 复制一份权重？
+//      每卡权重约 3.79GB，若复制则第二个 session 直接 OOM，四卡并发方案不成立。
+//   2) KV cache 是 per-session 独立分配的吗？分配时机在 init 还是首次推理？
+//   3) 两个 session 的 KV cache 是否真正隔离（B 的 prefill 不会污染 A 的上下文）？
+//
+// 做法：复用已初始化好的 N 个 stage（每卡 1 个 session），再为每卡逐步创建额外
+//       session，每创建一轮测一次设备内存；最后在两组 session 上交错跑 prefill/decode
+//       验证 KV 隔离性，并用"同组重跑"排除采样非确定性造成的假阴性。
+//
+// 探针只读/只建 session，不修改模型文件；结束时销毁额外 session 并退出。
+// ============================================================================
+
+#define PROBE_MAX_DEVICES 64
+
+struct ProbeMemSample
+{
+  int      n_devices = 0;
+  uint64_t free_bytes[PROBE_MAX_DEVICES] = {};
+  uint64_t total_free = 0;
+};
+
+static double probe_mb(uint64_t bytes)
+{
+  return (double)bytes / 1048576.0;
+}
+
+static bool probe_sample_mem(ProbeMemSample* sample)
+{
+  rknn3_devices devs;
+  memset(&devs, 0, sizeof(devs));
+  if (rknn3_find_devices(&devs) != RKNN3_SUCCESS) {
+    return false;
+  }
+  sample->n_devices = devs.n_devices < PROBE_MAX_DEVICES ? devs.n_devices : PROBE_MAX_DEVICES;
+  sample->total_free = 0;
+  for (int i = 0; i < sample->n_devices; ++i) {
+    sample->free_bytes[i] = devs.devices[i].mem_info.sys_free;
+    sample->total_free += devs.devices[i].mem_info.sys_free;
+  }
+  return true;
+}
+
+static void probe_print_mem(const ProbeMemSample& sample, const char* tag)
+{
+  printf("[probe] %s\n", tag);
+  for (int i = 0; i < sample.n_devices; ++i) {
+    printf("[probe]   card[%d] free = %9.1f MB\n", i, probe_mb(sample.free_bytes[i]));
+  }
+  printf("[probe]   TOTAL  free = %9.1f MB\n", probe_mb(sample.total_free));
+}
+
+static void probe_print_mem_diff(const ProbeMemSample& before, const ProbeMemSample& after,
+                                 const char* tag)
+{
+  printf("[probe] %s\n", tag);
+  const int n = after.n_devices < before.n_devices ? after.n_devices : before.n_devices;
+  for (int i = 0; i < n; ++i) {
+    double delta = probe_mb(after.free_bytes[i]) - probe_mb(before.free_bytes[i]);
+    printf("[probe]   card[%d] free %9.1f -> %9.1f MB   delta %+9.1f MB\n",
+           i, probe_mb(before.free_bytes[i]), probe_mb(after.free_bytes[i]), delta);
+  }
+  double total_delta = probe_mb(after.total_free) - probe_mb(before.total_free);
+  printf("[probe]   TOTAL  free %9.1f -> %9.1f MB   delta %+9.1f MB\n",
+         probe_mb(before.total_free), probe_mb(after.total_free), total_delta);
+}
+
+static void probe_dump_allocation(const StageRuntime& stage, const char* tag);
+
+// 打印每个 stage 的 context 级内存：权重 / 内部 / KV cache，以及 KV cache 长度分组。
+// 这些数字回答"卡内放得下几个 session"。
+static void probe_dump_context_mem(const StageRuntime& stage)
+{
+  printf("\n--- [probe] %s (device=%s) ---\n", stage.name.c_str(), stage.device_id.c_str());
+
+  rknn3_llm_config llm_cfg;
+  memset(&llm_cfg, 0, sizeof(llm_cfg));
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_LLM_CONFIG, &llm_cfg, sizeof(llm_cfg)) == RKNN3_SUCCESS) {
+    printf("[probe]   llm: vocab=%u emb_dim=%u max_ctx_len=%u max_pos_emb=%u model_type=%s\n",
+           llm_cfg.vocab_size, llm_cfg.embedding_dim, llm_cfg.max_ctx_len,
+           llm_cfg.max_position_embeddings,
+           llm_cfg.model_type ? llm_cfg.model_type : "(null)");
+    printf("[probe]   kvcache: dtype=%d store_method=%d group_size=%u residual_depth=%u\n",
+           (int)llm_cfg.kvcache_dtype, (int)llm_cfg.kvcache_store_method,
+           llm_cfg.kvcache_group_size, llm_cfg.kvcache_residual_depth);
+    for (uint32_t a = 0; a < llm_cfg.n_attention_kvcache_lens && a < RKNN3_MAX_ATTENTION_TYPE_NUM; ++a) {
+      printf("[probe]   attn[%u] type=%d n_lens=%u lens:", a,
+             (int)llm_cfg.attention_kvcache_lens[a].attention_type,
+             llm_cfg.attention_kvcache_lens[a].n_kvcache_buffer_lens);
+      for (uint32_t l = 0; l < llm_cfg.attention_kvcache_lens[a].n_kvcache_buffer_lens &&
+                         l < RKNN3_MAX_KVCACHE_LEN_GROUPS; ++l) {
+        printf(" %d", llm_cfg.attention_kvcache_lens[a].kvcache_buffer_lens[l]);
+      }
+      printf("\n");
+    }
+  }
+
+  // 设备级内存：sys_* 是本机侧的小块内存，真正要看的是每个 node 的可用量。
+  rknn3_dev_mem_info dev_mem;
+  memset(&dev_mem, 0, sizeof(dev_mem));
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_DEVICE_MEM_INFO, &dev_mem, sizeof(dev_mem)) == RKNN3_SUCCESS) {
+    printf("[probe]   device: nodes=%u sys_total=%.1f MB sys_free=%.1f MB\n",
+           dev_mem.node_num, probe_mb(dev_mem.sys_total), probe_mb(dev_mem.sys_free));
+    uint32_t n = dev_mem.node_num < RKNN3_MAX_NPU_NODE_NUM ? dev_mem.node_num : RKNN3_MAX_NPU_NODE_NUM;
+    for (uint32_t n_idx = 0; n_idx < n; ++n_idx) {
+      printf("[probe]     node[%u] total=%9.1f MB free=%9.1f MB used=%9.1f MB\n", n_idx,
+             probe_mb(dev_mem.node_mem_info[n_idx].total),
+             probe_mb(dev_mem.node_mem_info[n_idx].free),
+             probe_mb(dev_mem.node_mem_info[n_idx].total - dev_mem.node_mem_info[n_idx].free));
+    }
+  }
+
+  probe_dump_allocation(stage, nullptr);
+}
+
+// 查询 context 级内存分配明细（每核 weight/internal/kvcache）。
+// 在创建额外 session 前后各调一次，"kvcache 是否增长"直接回答 KV cache 是不是 per-session。
+static void probe_dump_allocation(const StageRuntime& stage, const char* tag)
+{
+  int32_t core_num = 0;
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_CORE_NUMBER, &core_num, sizeof(core_num)) != RKNN3_SUCCESS ||
+      core_num <= 0) {
+    printf("[probe]   query core number failed\n");
+    return;
+  }
+  if (tag) {
+    printf("[probe]   [%s] cores=%d\n", tag, core_num);
+  } else {
+    printf("[probe]   cores=%d\n", core_num);
+  }
+
+  std::vector<rknn3_allocation_info> allocs((size_t)core_num);
+  memset(allocs.data(), 0, sizeof(rknn3_allocation_info) * (size_t)core_num);
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_ALLOCATION_INFO, allocs.data(),
+                  sizeof(rknn3_allocation_info) * (size_t)core_num) == RKNN3_SUCCESS) {
+    double weight_total = 0.0;
+    double internal_total = 0.0;
+    double kvcache_total = 0.0;
+    for (int c = 0; c < core_num; ++c) {
+      printf("[probe]   core[%d] weight=%9.1f MB internal=%9.1f MB kvcache=%9.1f MB\n",
+             allocs[c].core_id, probe_mb(allocs[c].weight_mem.size),
+             probe_mb(allocs[c].internal_mem.size), probe_mb(allocs[c].kvcache_mem.size));
+      weight_total += probe_mb(allocs[c].weight_mem.size);
+      internal_total += probe_mb(allocs[c].internal_mem.size);
+      kvcache_total += probe_mb(allocs[c].kvcache_mem.size);
+    }
+    printf("[probe]   SUM: weight=%.1f MB internal=%.1f MB kvcache=%.1f MB\n",
+           weight_total, internal_total, kvcache_total);
+  }
+
+  std::vector<rknn3_kvcache_len_group_info> groups((size_t)core_num);
+  memset(groups.data(), 0, sizeof(rknn3_kvcache_len_group_info) * (size_t)core_num);
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_KVCACHE_LEN_GROUP_INFO, groups.data(),
+                  sizeof(rknn3_kvcache_len_group_info) * (size_t)core_num) == RKNN3_SUCCESS) {
+    for (int c = 0; c < core_num; ++c) {
+      printf("[probe]   core[%d] kvcache groups=%u active_group=%d", groups[c].core_id,
+             groups[c].n_groups, groups[c].active_group_id);
+      for (uint32_t g = 0; g < groups[c].n_groups && g < RKNN3_MAX_KVCACHE_LEN_GROUPS; ++g) {
+        printf(" [g%u]=%.1fMB", g, probe_mb(groups[c].kvcache_sizes[g]));
+      }
+      printf("\n");
+    }
+  }
+}
+
+// 把 stages[] 临时切到指定的 session 组上跑一次流水线，跑完切回原组。
+// 这样可以在不改动 pipeline 结构的前提下，用不同 session 组各跑一遍推理。
+static bool probe_run_on_group(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+                               const std::vector<rknn3_session*>& group, const char* prompt,
+                               const std::vector<int32_t>* input_tokens, InferencePhase phase,
+                               int32_t* out_token)
+{
+  std::vector<rknn3_session*> saved(stages.size(), nullptr);
+  for (size_t i = 0; i < stages.size(); ++i) {
+    saved[i] = stages[i].session;
+    stages[i].session = group[i];
+  }
+
+  bool ok = run_pipeline_once(stages, pipeline, prompt, input_tokens, phase, nullptr);
+  if (ok && out_token) {
+    if (!get_last_stage_token(out_token)) {
+      *out_token = -1;
+    }
+  }
+
+  for (size_t i = 0; i < stages.size(); ++i) {
+    stages[i].session = saved[i];
+  }
+  return ok;
+}
+
+static void probe_clear_group(const std::vector<rknn3_session*>& group)
+{
+  for (auto* session : group) {
+    if (session) {
+      rknn3_session_clear_kvcache(session, RKNN3_KVCACHE_CLEAR_ALL);
+    }
+  }
+}
+
+// 在指定 session 组上推进一步：prompt != nullptr 走 prefill，否则用上一步的 token 走 decode。
+// 隔离性测试需要把 A / B 两个会话逐步交错推进，所以这一步必须能单独调用。
+static bool probe_step(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+                       const std::vector<rknn3_session*>& group, const char* prompt,
+                       int32_t prev_token, int32_t* out_token)
+{
+  if (prompt != nullptr) {
+    return probe_run_on_group(stages, pipeline, group, prompt, nullptr,
+                              InferencePhase::PREFILL, out_token);
+  }
+  std::vector<int32_t> one(1, prev_token);
+  return probe_run_on_group(stages, pipeline, group, nullptr, &one,
+                            InferencePhase::DECODE, out_token);
+}
+
+static void probe_print_seq(const char* label, const std::vector<int32_t>& seq)
+{
+  printf("[probe]   %s (%zu tok):", label, seq.size());
+  for (size_t i = 0; i < seq.size(); ++i) {
+    printf(" %d", seq[i]);
+  }
+  printf("\n");
+}
+
+// 把 seq 推进到 steps 个 token：首步走 prefill（prompt != nullptr），其余是 greedy decode。
+// 传 prompt == nullptr 表示在会话已有 KV 上继续——隔离性测试靠它做 A/B 逐步交错。
+static bool probe_advance(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+                          const std::vector<rknn3_session*>& group, const char* prompt,
+                          int steps, std::vector<int32_t>* seq)
+{
+  if (prompt != nullptr) {
+    int32_t first = -1;
+    if (!probe_step(stages, pipeline, group, prompt, -1, &first) || first < 0) {
+      return false;
+    }
+    seq->push_back(first);
+  }
+  while ((int)seq->size() < steps) {
+    int32_t next = -1;
+    if (seq->empty() || !probe_step(stages, pipeline, group, nullptr, seq->back(), &next) ||
+        next < 0) {
+      return false;
+    }
+    seq->push_back(next);
+  }
+  return true;
+}
+
+// 一张卡上最紧的那个 NPU node 的空闲内存（MB）。
+// session 分配失败总是发生在最紧的 node 上，所以卡内天花板由它决定而非平均值。
+static double probe_tightest_node_free_mb(const StageRuntime& stage)
+{
+  rknn3_dev_mem_info dev_mem;
+  memset(&dev_mem, 0, sizeof(dev_mem));
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_DEVICE_MEM_INFO, &dev_mem, sizeof(dev_mem)) != RKNN3_SUCCESS) {
+    return -1.0;
+  }
+  uint32_t n = dev_mem.node_num < RKNN3_MAX_NPU_NODE_NUM ? dev_mem.node_num : RKNN3_MAX_NPU_NODE_NUM;
+  double tightest = -1.0;
+  for (uint32_t i = 0; i < n; ++i) {
+    double free_mb = probe_mb(dev_mem.node_mem_info[i].free);
+    if (tightest < 0.0 || free_mb < tightest) {
+      tightest = free_mb;
+    }
+  }
+  return tightest;
+}
+
+// 整卡口径的最紧 node 空闲：跨 4 段取最小。段间权重不同（stage3 带 norm+lm_head，
+// 比 stage0 多 ~172 MB），所以真正绑死卡内天花板的是全段里最紧的那个 node。
+static double probe_card_tightest_free_mb(const std::vector<StageRuntime>& stages)
+{
+  double tightest = -1.0;
+  for (size_t i = 0; i < stages.size(); ++i) {
+    double v = probe_tightest_node_free_mb(stages[i]);
+    if (v > 0.0 && (tightest < 0.0 || v < tightest)) {
+      tightest = v;
+    }
+  }
+  return tightest;
+}
+
+// 用模型自己的 tokenizer 数一遍，返回 token 数（失败返回 -1）。
+// 满上下文测试必须报出**真实** token 数：靠「字符数 / 3.5」估算无从判断
+// 到底有没有把上下文填满，测试强度就不可知。
+static int probe_count_tokens(Tokenizer* tokenizer, const std::string& text)
+{
+  if (!tokenizer || text.empty()) {
+    return -1;
+  }
+  std::vector<int32_t> buf(text.size() + 16);
+  int n = tokenizer->Tokenize(text.c_str(), (int32_t)text.size(), buf.data(), (int32_t)buf.size());
+  return n > 0 ? n : -1;
+}
+
+// 模型实际生效的上下文上限。以模型内固化的 max_ctx_len 为准——命令行 --ctx-size
+// 只在不超过它时才有意义（RK1828 上超了会被静默降到这个值）。
+static int probe_model_ctx_len(const StageRuntime& stage)
+{
+  rknn3_llm_config llm_cfg;
+  memset(&llm_cfg, 0, sizeof(llm_cfg));
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_LLM_CONFIG, &llm_cfg, sizeof(llm_cfg)) != RKNN3_SUCCESS) {
+    return -1;
+  }
+  return (int)llm_cfg.max_ctx_len;
+}
+
+// context 级内存分配汇总，用于对比"建 session 前后"的权重 / KV cache 变化。
+// 这是判定权重复制与否的决定性证据：
+//   delta_weight ≈ 0 且 delta_kvcache > 0  → 权重共享，KV cache per-session ✅
+//   delta_weight ≈ 权重总量                → 权重被逐 session 复制       ❌
+struct ProbeAllocSums
+{
+  double weight_mb = 0.0;
+  double internal_mb = 0.0;
+  double kvcache_mb = 0.0;
+  bool   valid = false;
+};
+
+static bool probe_get_alloc_sums(const StageRuntime& stage, ProbeAllocSums* out)
+{
+  *out = ProbeAllocSums();
+  int32_t core_num = 0;
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_CORE_NUMBER, &core_num, sizeof(core_num)) != RKNN3_SUCCESS ||
+      core_num <= 0) {
+    return false;
+  }
+  std::vector<rknn3_allocation_info> allocs((size_t)core_num);
+  memset(allocs.data(), 0, sizeof(rknn3_allocation_info) * (size_t)core_num);
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_ALLOCATION_INFO, allocs.data(),
+                  sizeof(rknn3_allocation_info) * (size_t)core_num) != RKNN3_SUCCESS) {
+    return false;
+  }
+  for (int c = 0; c < core_num; ++c) {
+    out->weight_mb += probe_mb(allocs[c].weight_mem.size);
+    out->internal_mb += probe_mb(allocs[c].internal_mem.size);
+    out->kvcache_mb += probe_mb(allocs[c].kvcache_mem.size);
+  }
+  out->valid = true;
+  return true;
+}
+
+static int probe_sessions(std::vector<StageRuntime>& stages, PipelineState& pipeline,
+                          const rknn3_llm_param& session_param, const ChatTemplateSpec* tpl,
+                          int n_sessions, Tokenizer* tokenizer)
+{
+  const size_t n_stages = stages.size();
+
+  printf("\n");
+  printf("================================================================================\n");
+  printf(" 多 Session 可行性探针 (--probe-sessions %d)\n", n_sessions);
+  printf("--------------------------------------------------------------------------------\n");
+  printf(" 回答：(1) 权重是否 per-session 复制  (2) KV cache 分配时机与容量\n");
+  printf("       (3) 两组 session 的 KV cache 是否真正隔离\n");
+  printf("================================================================================\n");
+
+  ProbeMemSample baseline;
+  if (!probe_sample_mem(&baseline)) {
+    printf("[probe] ERROR: rknn3_find_devices failed\n");
+    return -1;
+  }
+  printf("\n");
+  probe_print_mem(baseline, "基线设备内存（每卡 1 个 session，模型已加载）:");
+
+  for (const auto& stage : stages) {
+    probe_dump_context_mem(stage);
+  }
+
+  // 采集"只有 1 个 session"时的 context 内存分配，作为判据基线。
+  std::vector<ProbeAllocSums> alloc_before(n_stages);
+  for (size_t i = 0; i < n_stages; ++i) {
+    probe_get_alloc_sums(stages[i], &alloc_before[i]);
+  }
+
+  // ---------------- 逐步创建额外 session，每轮测一次内存 ----------------------
+  // groups[k][stage] = 第 k+1 组 session；groups[0] 是 init_stage 创建的原组。
+  std::vector<std::vector<rknn3_session*>> groups;
+  groups.push_back(std::vector<rknn3_session*>(n_stages, nullptr));
+  for (size_t i = 0; i < n_stages; ++i) {
+    groups[0][i] = stages[i].session;
+  }
+
+  ProbeMemSample prev = baseline;
+  bool all_created = true;
+  // 每卡实际能容纳的 session 数。以「最后一次全部 stage 都建成功的那一组」为准：
+  // RK1828 上查询接口不更新，卡内天花板只能靠这个计数反推。
+  int per_card_ok = 1;
+  // 建任何额外 session 之前的空闲预算——必须在这时候取，建完再取就是「已扣除」后的
+  // 残值，拿它算每 session 成本会系统性偏大。
+  const double free_budget_mb = probe_card_tightest_free_mb(stages);
+  for (int k = 1; k < n_sessions && all_created; ++k) {
+    printf("\n[probe] >>> 创建第 %d 组 session（每卡第 %d 个）...\n", k + 1, k + 1);
+    std::vector<rknn3_session*> this_group(n_stages, nullptr);
+    timeval group_start;
+    timeval group_end;
+    gettimeofday(&group_start, NULL);
+    for (size_t i = 0; i < n_stages; ++i) {
+      rknn3_llm_param param = session_param;
+      timeval init_start;
+      timeval init_end;
+      gettimeofday(&init_start, NULL);
+      rknn3_session* session = rknn3_session_init(stages[i].ctx, &param, 1);
+      gettimeofday(&init_end, NULL);
+      if (!session) {
+        printf("[probe]   *** %s: rknn3_session_init FAILED（第 %d 个 session）***\n",
+               stages[i].name.c_str(), k + 1);
+        all_created = false;
+        break;
+      }
+      // callback 是 per-session 的，但内容可以复用；额外 session 也装上同一套回调，
+      // 这样它们才能参与真实推理。
+      if (stages[i].has_callback) {
+        rknn3_session_set_callback(session, &stages[i].callback);
+      }
+      rknn3_session_set_chat_template(session, "", "", "");
+      this_group[i] = session;
+      printf("[probe]   %s: session #%d created in %.1f ms\n",
+             stages[i].name.c_str(), k + 1, elapsed_us(init_start, init_end) / 1e3);
+    }
+    gettimeofday(&group_end, NULL);
+    if (all_created) {
+      per_card_ok = k + 1;
+      // 权重若被逐 session 复制，每卡要多搬 3.6GB 过 PCIe，耗时是秒级甚至十秒级；
+      // 毫秒级说明只是建了个轻量会话对象。
+      printf("[probe]   本轮 4 卡建 session 共耗时 %.1f ms\n", elapsed_us(group_start, group_end) / 1e3);
+    }
+    groups.push_back(this_group);
+    if (!all_created) {
+      break;
+    }
+
+    // 关键判据：新建 session 后 context 的内存分配有没有变化。
+    // kvcache 增长 → KV cache 是 per-session；weight 增长 → 权重被复制。
+    probe_dump_allocation(stages.front(), "after extra session");
+    if (stages.size() > 1) {
+      probe_dump_allocation(stages.back(), "after extra session");
+    }
+
+    ProbeMemSample now;
+    if (probe_sample_mem(&now)) {
+      char tag[160];
+      snprintf(tag, sizeof(tag), "本轮（第 %d 个 session）内存变化:", k + 1);
+      probe_print_mem_diff(prev, now, tag);
+      prev = now;
+    }
+  }
+
+  // ---------------- 卡内天花板与每 session 成本 --------------------------------
+  // RK1828 上 rknn3_query 的分配明细不会随建 session 更新（恒 +0.0），
+  // rknn3_find_devices 的 mem_info 又返回 0——两个接口都不反映 session 级分配。
+  // 唯一可用的判据是「抬高 N 直到某一张卡建不出来」，用 OOM 点反推成本。
+  printf("\n[probe] >>> 卡内天花板（靠抬高 N 到 OOM 反推，分配明细接口在本平台不更新）\n");
+  // 注意量纲：每个 session 在卡内**每个 node 上都会分配**（各 core 持有自己那几层的
+  // KV），而绑死天花板的是最紧的那个 node。所以下面是「每 session 每 node」，
+  // 乘 node_num 才是「每 session 每卡」。
+  uint32_t node_num = 1;
+  {
+    rknn3_dev_mem_info dev_mem;
+    memset(&dev_mem, 0, sizeof(dev_mem));
+    if (rknn3_query(stages.front().ctx, RKNN3_QUERY_DEVICE_MEM_INFO, &dev_mem,
+                    sizeof(dev_mem)) == RKNN3_SUCCESS && dev_mem.node_num > 0) {
+      node_num = dev_mem.node_num;
+    }
+  }
+  double tightest_now = probe_card_tightest_free_mb(stages);
+  const int extra_ok = per_card_ok - 1;   // 已成功创建的额外 session 数
+
+  if (free_budget_mb > 0.0) {
+    printf("[probe]   最紧 node 空闲：基线 %.1f MB → 建完 %d 个额外 session 后 %.1f MB，node 数 %u\n",
+           free_budget_mb, extra_ok, tightest_now, node_num);
+  }
+  if (extra_ok > 0 && free_budget_mb > 0.0 && tightest_now > 0.0) {
+    // 直接实测：建 session 前后的差值就是这批 session 真实吃掉的内存。
+    double measured_node = (free_budget_mb - tightest_now) / extra_ok;
+    printf("[probe]   每 session 实测消耗 ≈ %.2f MB/node = %.1f MB/卡（%d 个额外 session 的差值）\n",
+           measured_node, measured_node * node_num, extra_ok);
+    if (alloc_before[0].valid && alloc_before[0].kvcache_mb > 0.0) {
+      double reported_card = alloc_before[0].kvcache_mb;
+      printf("[probe]   对照：分配明细上报的 KV cache = %.1f MB/卡", reported_card);
+      if (measured_node * node_num <= reported_card * 1.25) {
+        printf(" —— 与实测同量级，口径一致 ✅\n");
+      } else {
+        printf(" —— 明显低于实测，说明还有未上报的 per-session 开销\n");
+      }
+    }
+  }
+  if (extra_ok > 0 && free_budget_mb > 0.0 && tightest_now > 0.0) {
+    // 剩余可容纳的会话数——只在「天花板由内存决定」时才成立。下面 if/else 会明确
+    // 这个前提是否满足，若满足则这是可直接用于容量规划的数字。
+    double measured_node = (free_budget_mb - tightest_now) / extra_ok;
+    if (measured_node > 0.01) {
+      printf("[probe]   若天花板由 node 内存决定，余量 %.1f MB/node 可再容纳约 %d 个 session\n",
+             tightest_now, (int)(tightest_now / measured_node));
+    }
+  }
+  if (all_created) {
+    printf("[probe]   每卡 %d 个 session 全部建成功 —— 未触及天花板，需继续抬高 N 才能定界\n",
+           per_card_ok);
+  } else {
+    printf("[probe]   每卡天花板 = %d 个 session（第 %d 个建不出来）\n",
+           per_card_ok, per_card_ok + 1);
+    if (free_budget_mb > 0.0 && tightest_now > 0.0 && tightest_now > free_budget_mb / 4.0) {
+      // 重要：若失败时仍剩大块空闲，说明天花板不由这个 node 的空闲量决定，
+      // 账算不平——那就不能把「每 session 成本」当成容量模型来用。
+      printf("[probe]   ⚠️ 注意：失败时最紧 node 仍剩 %.1f MB（占基线 %.0f%%），\n"
+             "           远大于单会话成本，说明 5 这个上限**不由 node 空闲量解释**，\n"
+             "           而是别的池子或硬上限——容量规划不能按「剩余/单会话成本」估算\n",
+             tightest_now, tightest_now * 100.0 / free_budget_mb);
+    }
+    if (per_card_ok < 2) {
+      printf("[probe]   *** 每卡放不下第 2 个 session —— 多会话方案不成立 ***\n");
+    }
+  }
+
+  // ---------------- 权重是否被复制：判定 -------------------------------
+  ProbeMemSample after_init = prev;
+  printf("\n");
+  probe_print_mem_diff(baseline, after_init,
+                       "创建全部额外 session 后的设备内存变化（恒为 0 表示该接口不可用）:");
+
+  // RK1828 上 rknn3_find_devices 的 mem_info 返回 0，设备内存这条路走不通。
+  // 改用 context 级分配明细做判定：建 session 前后对比 weight / kvcache 增量。
+  printf("\n[probe] 判定依据：context 内存分配明细（建 session 前 -> 后）\n");
+  std::vector<ProbeAllocSums> alloc_after(n_stages);
+  bool alloc_ok = true;
+  for (size_t i = 0; i < n_stages; ++i) {
+    probe_get_alloc_sums(stages[i], &alloc_after[i]);
+    if (!alloc_before[i].valid || !alloc_after[i].valid) {
+      alloc_ok = false;
+      continue;
+    }
+    printf("[probe]   %s: weight %.1f -> %.1f MB (%+.1f)  "
+           "internal %.1f -> %.1f MB (%+.1f)  kvcache %.1f -> %.1f MB (%+.1f)\n",
+           stages[i].name.c_str(),
+           alloc_before[i].weight_mb, alloc_after[i].weight_mb,
+           alloc_after[i].weight_mb - alloc_before[i].weight_mb,
+           alloc_before[i].internal_mb, alloc_after[i].internal_mb,
+           alloc_after[i].internal_mb - alloc_before[i].internal_mb,
+           alloc_before[i].kvcache_mb, alloc_after[i].kvcache_mb,
+           alloc_after[i].kvcache_mb - alloc_before[i].kvcache_mb);
+  }
+
+  double weight_delta_max = 0.0;
+  double kvcache_delta_min = 1e30;
+  double kvcache_delta_max = -1e30;
+  for (size_t i = 0; i < n_stages; ++i) {
+    if (!alloc_before[i].valid || !alloc_after[i].valid) {
+      continue;
+    }
+    double dw = alloc_after[i].weight_mb - alloc_before[i].weight_mb;
+    double dk = alloc_after[i].kvcache_mb - alloc_before[i].kvcache_mb;
+    if (dw > weight_delta_max) weight_delta_max = dw;
+    if (dk < kvcache_delta_min) kvcache_delta_min = dk;
+    if (dk > kvcache_delta_max) kvcache_delta_max = dk;
+  }
+
+  printf("\n");
+  if (!all_created) {
+    printf("[probe] ==> session 未全部创建，判定不可靠\n");
+  } else if (!alloc_ok) {
+    printf("[probe] ==> 分配明细查询失败，无法判定\n");
+  } else if (weight_delta_max < 1.0 && kvcache_delta_max > 1.0) {
+    printf("[probe] ==> 判定：权重【共享】✅（每卡权重增量 %.1f MB ≈ 0），\n"
+           "           KV cache 按 session 增长，每卡合计增量 %.1f MB（%d 个额外 session）\n",
+           weight_delta_max, kvcache_delta_max, n_sessions - 1);
+  } else if (weight_delta_max >= 1.0) {
+    printf("[probe] ==> 判定：权重【被复制】❌ 每卡权重增量 %.1f MB，\n"
+           "           四卡并发方案在当前模型切分下不可行\n", weight_delta_max);
+  } else {
+    printf("[probe] ==> 判定：权重与 KV cache 均无增长（weight %+.1f MB, kvcache %+.1f MB），\n"
+           "           说明该接口不反映 session 级分配，需改用实测 OOM 点判定\n",
+           weight_delta_max, kvcache_delta_max);
+  }
+
+  // ---------------- KV cache 隔离性测试 ---------------------------------------
+  // 单步 decode 判别力不足：两块 KV 即便真被共享，B 的 prefill 也只覆盖它自己写过的
+  // 位置，一步 decode 未必分叉。这里改成 A / B 各跑「prefill + kIsolationSteps 步
+  // decode」，**逐步交错**推进，再与各自单独跑的序列逐 token 比对：
+  //   交错序列 == 单独序列   → 两块 KV 内容互不影响（隔离）✅
+  //   单独序列两遍都不一致   → 采样本身非确定，本轮结论作废（不可采信，也不能据此判失败）
+  const int kIsolationSteps = 12;
+  std::vector<int32_t> seqA_i, seqB_i;    // 交错跑
+  std::vector<int32_t> seqA_r, seqB_r;    // 单独跑（对照）
+  std::vector<int32_t> seqA_r2, seqB_r2;  // 对照重跑（自洽性）
+  bool kv_tested = false;
+  bool kv_deterministic = false;
+  bool kv_isolated = false;
+  // 隔离性只需要两组可用的 session，不要求全部建成——所以这里判 per_card_ok 而非
+  // all_created。否则一旦抬高 N 触及天花板（那正是最该同时测隔离的场景），隔离测试就被跳过。
+  if (per_card_ok >= 2 && tpl != nullptr) {
+    kv_tested = true;
+    printf("\n[probe] >>> KV cache 隔离性测试（%d 步 decode，A/B 逐步交错）\n", kIsolationSteps);
+    const std::string prompt_a = std::string(tpl->system_prompt) + tpl->user_prefix +
+                                 "What is 1+1?" + tpl->user_postfix;
+    const std::string prompt_b = std::string(tpl->system_prompt) + tpl->user_prefix +
+                                 "What is the capital of France?" + tpl->user_postfix;
+
+    // 1) 交错推进：A prefill → B prefill → (A decode → B decode) × (steps-1)
+    probe_clear_group(groups[0]);
+    probe_clear_group(groups[1]);
+    bool io_ok = probe_advance(stages, pipeline, groups[0], prompt_a.c_str(), 1, &seqA_i) &&
+                 probe_advance(stages, pipeline, groups[1], prompt_b.c_str(), 1, &seqB_i);
+    for (int s = 1; io_ok && s < kIsolationSteps; ++s) {
+      io_ok = probe_advance(stages, pipeline, groups[0], nullptr, s + 1, &seqA_i) &&
+              probe_advance(stages, pipeline, groups[1], nullptr, s + 1, &seqB_i);
+    }
+
+    // 2) 对照：A / B 各自单独跑同样步数（无交错干扰）
+    probe_clear_group(groups[0]);
+    probe_clear_group(groups[1]);
+    bool r_ok = probe_advance(stages, pipeline, groups[0], prompt_a.c_str(),
+                              kIsolationSteps, &seqA_r) &&
+                probe_advance(stages, pipeline, groups[1], prompt_b.c_str(),
+                              kIsolationSteps, &seqB_r);
+
+    // 3) 自洽性：对照再跑一遍，排除采样非确定性
+    probe_clear_group(groups[0]);
+    probe_clear_group(groups[1]);
+    bool r2_ok = probe_advance(stages, pipeline, groups[0], prompt_a.c_str(),
+                               kIsolationSteps, &seqA_r2) &&
+                 probe_advance(stages, pipeline, groups[1], prompt_b.c_str(),
+                               kIsolationSteps, &seqB_r2);
+
+    if (!io_ok || !r_ok || !r2_ok) {
+      printf("[probe]   *** 序列推进失败（io=%d ref=%d ref2=%d），隔离性未验证 ***\n",
+             (int)io_ok, (int)r_ok, (int)r2_ok);
+      kv_tested = false;
+    } else {
+      probe_print_seq("A(interleaved)", seqA_i);
+      probe_print_seq("A(ref)        ", seqA_r);
+      probe_print_seq("A(ref x2)     ", seqA_r2);
+      probe_print_seq("B(interleaved)", seqB_i);
+      probe_print_seq("B(ref)        ", seqB_r);
+      probe_print_seq("B(ref x2)     ", seqB_r2);
+      kv_deterministic = (seqA_r == seqA_r2) && (seqB_r == seqB_r2);
+      kv_isolated = kv_deterministic && (seqA_i == seqA_r) && (seqB_i == seqB_r);
+      if (!kv_deterministic) {
+        printf("[probe]   对照重跑不一致 → 采样非确定，本轮隔离性结论作废\n");
+      }
+    }
+  }
+
+  // ---------------- 满上下文容量测试（方案的真正闸门）--------------------------
+  // 上面的隔离性测试每个会话只有几十个 token，而方案要的是「4 个会话各跑满 4096」。
+  // KV cache 在多数 runtime 里随上下文增长分配，所以必须让每个会话真的把上下文
+  // 填满，才能回答「4 路并存放不放得下」。这是唯一能证伪方案目标的一步。
+  const int kLongCtxTarget = 4;   // 方案的目标并发数
+  bool longctx_tested = false;
+  int  longctx_ok = 0;
+  int  longctx_n = 0;
+  int  longctx_tokens = -1;   // 满上下文测试实际填入的 token 数（-1 表示未知）
+  if (per_card_ok >= 2 && tpl != nullptr) {
+    longctx_tested = true;
+    longctx_n = std::min(kLongCtxTarget, per_card_ok);
+
+    // 以模型内固化的 max_ctx_len 为目标把 prompt 填到 ~95%，并报出真实 token 数。
+    const int ctx_len = probe_model_ctx_len(stages.front());
+    const int target_tokens = ctx_len > 0 ? (int)(ctx_len * 0.95) : 3900;
+    printf("\n[probe] >>> 满上下文容量测试（目标：%d 个会话各填 ~%d token，模型上限 %d）\n",
+           longctx_n, target_tokens, ctx_len);
+
+    const char* para = "The quick brown fox jumps over the lazy dog near the river bank. "
+                       "Pack my box with five dozen liquor jugs before the storm arrives. "
+                       "How vexingly quick daft zebras jump over the sleeping guard. "
+                       "Sphinx of black quartz, judge my vow and then report the tally. ";
+    const std::string prefix = std::string(tpl->system_prompt) + tpl->user_prefix;
+    const std::string postfix = tpl->user_postfix;
+
+    // 按实测 token 数迭代收放，避免靠字符数瞎估。
+    std::string long_prompt;
+    int n_prompt_tokens = -1;
+    int chars_target = target_tokens * 4;   // 起始猜测，下面用真实 tokenize 校正
+    for (int iter = 0; iter < 10; ++iter) {
+      std::string filler;
+      while ((int)filler.size() < chars_target) {
+        filler += para;
+      }
+      long_prompt = prefix + filler + postfix;
+      int n = probe_count_tokens(tokenizer, long_prompt);
+      if (n < 0) {
+        printf("[probe]   tokenizer 不可用，无法确认测试强度（跳过满上下文测试）\n");
+        longctx_tested = false;
+        break;
+      }
+      if (n > ctx_len) {
+        chars_target = chars_target * ctx_len / n * 95 / 100;
+        continue;
+      }
+      n_prompt_tokens = n;
+      if (n < target_tokens - 64) {
+        chars_target = chars_target * target_tokens / n;
+        continue;
+      }
+      break;
+    }
+    if (longctx_tested && n_prompt_tokens > 0) {
+      longctx_tokens = n_prompt_tokens;
+      printf("[probe]   prompt 实测 %d token / %d 字符（占模型上限 %d 的 %.1f%%）\n",
+             n_prompt_tokens, (int)long_prompt.size(), ctx_len,
+             n_prompt_tokens * 100.0 / (ctx_len > 0 ? ctx_len : 1));
+
+      // 关键：逐个会话依次填满，让占用**累加**——这才是 N 路并存的真实内存图景。
+      double free_before = probe_card_tightest_free_mb(stages);
+      if (free_before > 0.0) {
+        printf("[probe]   起始最紧 node 空闲 = %.1f MB（%d 个会话，均为空上下文）\n",
+               free_before, longctx_n);
+      }
+      for (int k = 0; k < longctx_n; ++k) {
+        probe_clear_group(groups[k]);
+        int32_t tok = -1;
+        bool ok = probe_step(stages, pipeline, groups[k], long_prompt.c_str(), -1, &tok);
+        if (!ok || tok < 0) {
+          printf("[probe]   会话 #%d: 满上下文 prefill 失败 ❌  最紧 node 空闲 %.1f MB\n",
+                 k + 1, probe_card_tightest_free_mb(stages));
+          break;
+        }
+        int32_t next = -1;
+        bool ok2 = probe_step(stages, pipeline, groups[k], nullptr, tok, &next);
+        printf("[probe]   会话 #%d: prefill ok(token %d) → decode %s(token %d)  "
+               "最紧 node 空闲 %.1f MB\n",
+               k + 1, tok, ok2 ? "ok" : "FAIL", next,
+               probe_card_tightest_free_mb(stages));
+        if (ok2) {
+          ++longctx_ok;
+        } else {
+          break;
+        }
+      }
+      double free_after = probe_card_tightest_free_mb(stages);
+      if (free_before > 0.0 && free_after > 0.0) {
+        printf("[probe]   %d 个满上下文会话（各 %d token）共消耗最紧 node %.1f MB\n",
+               longctx_ok, n_prompt_tokens, free_before - free_after);
+        if (free_before - free_after < 0.5) {
+          // 这个 0 很关键：说明 KV 在 session_init 时已按满上下文预分配，
+          // 与实际用了多少上下文无关——那么容量规划只需按会话数算，与上下文长度解耦。
+          printf("[probe]   ==> 填入 %d token 上下文未产生任何新增分配\n", n_prompt_tokens);
+          printf("[probe]       结论：KV cache 在 session_init 时按满上下文一次性预分配，\n"
+                 "       与会话实际用掉多少上下文无关 —— 容量只与「会话数」有关\n");
+        } else {
+          double per_session_node = (free_before - free_after) / longctx_ok;
+          printf("[probe]   ==> KV 随上下文增长，满上下文下单会话 ≈ %.1f MB/node = %.1f MB/卡\n",
+                 per_session_node, per_session_node * node_num);
+        }
+      }
+    }
+  }
+
+  // ---------------- 销毁额外 session，确认内存归还 -----------------------------
+  printf("\n[probe] >>> 销毁额外 session 并测量内存归还...\n");
+  for (size_t k = 1; k < groups.size(); ++k) {
+    for (size_t i = 0; i < groups[k].size(); ++i) {
+      if (groups[k][i]) {
+        rknn3_session_destroy(groups[k][i]);
+        groups[k][i] = nullptr;
+      }
+    }
+  }
+  ProbeMemSample after_destroy;
+  if (probe_sample_mem(&after_destroy)) {
+    probe_print_mem_diff(after_init, after_destroy, "销毁额外 session 后的内存变化:");
+    double leak = probe_mb(after_destroy.total_free) - probe_mb(baseline.total_free);
+    printf("[probe] 与基线相比残留差值 = %+.1f MB（接近 0 说明销毁能完整归还内存）\n", leak);
+  }
+
+  // ---------------- 总结 -------------------------------------------------------
+  printf("\n");
+  printf("================================================================================\n");
+  printf(" 探针结论\n");
+  printf("================================================================================\n");
+  printf(" [1] N=%d 组 session 是否全部创建成功 : %s\n", n_sessions,
+         all_created ? "是 ✅" : "否 ❌（卡内内存不足）");
+  printf(" [2] 每卡 session 天花板             : %d 个%s\n", per_card_ok,
+         all_created ? "（未触及上限，需抬高 N 再测）" : "（实测 OOM 点）");
+  printf(" [3] 权重是否 per-session 复制       : 见上方'卡内天花板'一节\n");
+  printf(" [4] KV cache 隔离性                 : ");
+  if (!kv_tested) {
+    printf("未验证（session 未全部创建，或序列推进失败）\n");
+  } else if (!kv_deterministic) {
+    printf("无法判定 ⚠️ 同一会话重跑序列都不一致，采样非确定，隔离性结论不可信\n");
+  } else if (kv_isolated) {
+    printf("隔离正常 ✅ %d 步交错 decode 与各自单独跑的序列逐 token 一致\n",
+           kIsolationSteps);
+    printf("       A: %zu tok, B: %zu tok 全部吻合\n", seqA_i.size(), seqB_i.size());
+  } else {
+    printf("不隔离或受干扰 ❌ 交错序列与对照不符\n");
+    probe_print_seq("A(interleaved)", seqA_i);
+    probe_print_seq("A(ref)        ", seqA_r);
+    probe_print_seq("B(interleaved)", seqB_i);
+    probe_print_seq("B(ref)        ", seqB_r);
+  }
+  printf(" [5] 满上下文并发（方案目标）        : ");
+  if (!longctx_tested) {
+    printf("未测试\n");
+  } else if (longctx_tokens <= 0) {
+    printf("未测成（tokenizer 不可用，无法确认测试强度）\n");
+  } else if (longctx_ok >= kLongCtxTarget) {
+    printf("%d 路 × %d token 上下文各 prefill+decode 全部成功 ✅ —— 方案目标容量成立\n",
+           longctx_ok, longctx_tokens);
+  } else if (longctx_ok > 0) {
+    printf("仅 %d/%d 路 × %d token 成功 ❌ —— 达不到方案的 %d 路目标，需降 ctx 或降并发\n",
+           longctx_ok, kLongCtxTarget, longctx_tokens, kLongCtxTarget);
+  } else {
+    printf("满上下文 prefill 直接失败 ❌\n");
+  }
+  printf("================================================================================\n");
+  return all_created ? 0 : -1;
+}
+
 // 返回字符串 s 中从 start 开始的一个 UTF-8 字符的终端显示列宽（中文等宽字符为 2，ASCII 为 1）。
 static int utf8_char_width(const std::string& s, size_t start)
 {
@@ -2084,9 +2972,8 @@ int main(int argc, char** argv)
       prompt = prompt_arg;
     }
   }
-  if (!prompt) {
-    prompt = "system\n You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n";
-  }
+  // 未指定 --prompt 时的默认 prompt 推迟到下面确定 chat 模板之后再拼（见 default_prompt_buf）。
+  // 原实现在这里硬编码了 Qwen 格式的 prompt，对 Gemma-4 不适用。
   int max_new_tokens = options.max_new_tokens;
   g_verbose = options.verbose;
   g_ignore_eos = options.ignore_eos;
@@ -2303,13 +3190,44 @@ int main(int argc, char** argv)
            (unsigned long long)performance_output_length);
   }
 
+  // 选择多轮对话的 prompt 模板：默认按外部 rope cache 的 tensor 命名格式判定模型族
+  // （Gemma-4 为编号 rope cache，Qwen3.5 为 rope_cos/sin_cache），也可用 --chat-template 覆盖。
+  ChatTemplateFamily chat_family =
+      (input_cb_data.rope_format == RopeCacheFormat::GEMMA4) ? ChatTemplateFamily::GEMMA4
+                                                             : ChatTemplateFamily::QWEN35;
+  if (options.chat_template != nullptr && strcmp(options.chat_template, "auto") != 0) {
+    chat_family = (strcmp(options.chat_template, "gemma") == 0) ? ChatTemplateFamily::GEMMA4
+                                                                : ChatTemplateFamily::QWEN35;
+  }
+  const ChatTemplateSpec* chat_tpl = chat_template_for(chat_family);
+  printf("[chat] multi-turn prompt template: %s\n", chat_template_name(chat_family));
+  if (input_cb_data.rope_format == RopeCacheFormat::NONE && options.chat_template == nullptr) {
+    printf("[chat] no external rope cache to detect the model family from; "
+           "defaulting to qwen3.5 (use --chat-template to override)\n");
+  }
+
+  // 未指定 --prompt 时，用所选模板拼一个演示用 prompt。
+  std::string default_prompt_buf;
+  if (!prompt) {
+    default_prompt_buf = chat_tpl->system_prompt;
+    default_prompt_buf += chat_tpl->user_prefix;
+    default_prompt_buf += "hello";
+    default_prompt_buf += chat_tpl->user_postfix;
+    prompt = default_prompt_buf.c_str();
+  }
+
+  // 多 session 可行性探针：只做测量与隔离性验证，跑完立即退出，不进入对话/性能模式。
+  if (options.probe_sessions > 0) {
+    int probe_ret = probe_sessions(stages, pipeline, session_param, chat_tpl,
+                                   options.probe_sessions, tokenizer);
+    release_resources(stages, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
+    return probe_ret == 0 ? 0 : 1;
+  }
+
   if (g_interactive) {
     // 多轮交互：keep_history=1 已让 runtime 累积历史 KV cache，
-    // 每轮只需把新用户输入拼成 Qwen chat 格式作为 prefill 传入。
-    static const char* SYSTEM_PROMPT =
-        "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n";
-    static const char* USER_PREFIX = "<|im_start|>user\n";
-    static const char* USER_POSTFIX = "<|im_end|>\n<|im_start|>assistant\n";
+    // 每轮只需把新用户输入按所选模板拼成 prompt 作为 prefill 传入。
+    const ChatTemplateSpec* tpl = chat_tpl;
 
     printf("\n=== Interactive Chat Mode ===\n");
     printf("Type your message and press Enter (Ctrl-D to exit).\n");
@@ -2356,15 +3274,16 @@ int main(int argc, char** argv)
 
       std::string chat_prompt;
       if (first_turn) {
-        chat_prompt = SYSTEM_PROMPT;
-        chat_prompt += USER_PREFIX;
+        // Gemma-4 没有 system role，其 system_prompt 为空串，这里自然退化为不带 system 轮。
+        chat_prompt = tpl->system_prompt;
+        chat_prompt += tpl->user_prefix;
         chat_prompt += user_input;
-        chat_prompt += USER_POSTFIX;
+        chat_prompt += tpl->user_postfix;
         first_turn = false;
       } else {
-        chat_prompt = USER_PREFIX;
+        chat_prompt = tpl->user_prefix;
         chat_prompt += user_input;
-        chat_prompt += USER_POSTFIX;
+        chat_prompt += tpl->user_postfix;
       }
 
       printf("Assistant: ");

@@ -1,3 +1,4 @@
+import inspect
 import os
 import torch
 import numpy as np
@@ -328,14 +329,23 @@ class Qwen3_5SegmentWrapper(torch.nn.Module):
 
         from transformers.masking_utils import create_causal_mask
 
-        full_attention_mask = create_causal_mask(
+        # 新版 transformers 改为由 inputs_embeds / past_key_values 自动推导 mask 尺寸，
+        # cache_position 只作为「已废弃的 BC 参数」保留。它那条兼容分支在本场景（无 cache、
+        # 整段 causal mask）会算出 0 维的 q_length，进而在 sdpa_mask 里 shape[0] 越界。
+        # 不传 cache_position 时，_preprocess_mask_arguments 会推导出完全相同的
+        # q_length=seq_len / q_offset=0，所以只在旧版把它列为必填参数时才传入。
+        mask_kwargs = dict(
             config=self.config,
             inputs_embeds=hidden_states,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=None,
             position_ids=None,
         )
+        cache_position_param = inspect.signature(create_causal_mask).parameters.get("cache_position")
+        if cache_position_param is not None and cache_position_param.default is inspect.Parameter.empty:
+            mask_kwargs["cache_position"] = cache_position
+
+        full_attention_mask = create_causal_mask(**mask_kwargs)
 
         # Match Qwen3_5TextModel._update_linear_attn_mask().
         linear_attn_mask = attention_mask
