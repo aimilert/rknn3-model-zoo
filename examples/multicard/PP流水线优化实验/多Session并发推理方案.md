@@ -699,12 +699,14 @@ git checkout -b feature/multisession-concurrency
 #   213a131  multicard/serve: stop the session pool from handing a bound session to a new conversation
 #   462cec8  multicard/serve: add a demo runbook and the concurrent-streaming demo it drives
 #   570c406  multicard/serve: serve the 4-panel chat demo from the gateway itself
+#   bc7f013  multicard/serve: multiuser edge-server mode (identity, queue, release)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
 git tag p3-interactive  # 指向 P3 的代码 commit
 git tag r11-kvlock      # 指向 R11 的代码 commit
 git tag m5-serve        # 指向 M5 的代码 commit
+git tag m5-multiuser    # 指向多用户接入（身份/排队/交还）的代码 commit
 ```
 
 > **文档记录为什么总在下一个 commit**：完成记录里要写**本阶段 commit 的哈希**，
@@ -735,7 +737,9 @@ git tag m5-serve        # 指向 M5 的代码 commit
 | P3 源码快照 | `rt_work/main.cc.p3_interactive` | `ff85aa377f91eb3b5e543dfa8754e4c6` |
 | R11 源码快照 | `rt_work/main.cc.r11_kvlock` | `c1fcc366958c34941b99c46c8f22cd62` |
 | M5 源码快照（`--serve` 帧协议 / `TokenSink`） | `rt_work/main.cc.m5_serve` | `108706c0c96c231f1632c489fc5963b3` |
-| M5 板端网关（**已入库**） | `examples/multicard/serve/rkllm_gateway.py` | `e09ac2b941de767443c0d1d635bd305b`（与板卡上部署的副本同 md5） |
+| M5 板端网关（**已入库**，多用户版） | `examples/multicard/serve/rkllm_gateway.py` | `f35fd2b84ec9968d83795c70cc3d6e0d`（`bc7f013`） |
+| └ **板卡上正在跑的仍是旧版** | 板卡上的部署副本 | `e09ac2b941de767443c0d1d635bd305b` —— **与上面这个不同 md5**。§9.8 的改动（身份/排队/`close`/`/v1/pool` 的 `key`）**板上还没有**，要用得先重新下发 + 重启网关（重载模型约 240s） |
+| 网页演示页（**已入库**，带身份/交还版） | `examples/multicard/serve/demo_4chat.html` | `1db0882d98850b20232d0f96e325c9a1`（`bc7f013`）—— 板卡上的副本同样是旧版（匿名对话，会占住 4 个会话，见 §9.8 第 5 条） |
 | M5 启动/构建/验收脚本（**已入库**） | `examples/multicard/serve/*.sh`、`*.py`、`README.md` | 见 `git ls-tree`；板卡路径全部走环境变量 |
 | M5 板端二进制（Release） | 板卡 `<板卡临时目录>/rknn_multicard_demo.serve` | `e223ea8f3f5d38e82a37cd560c29fb96`（1091328 B） |
 | 板卡二进制 | 见 §5 各阶段完成记录的表 | P0 `a6739a6e…` / P0+插桩 `205232b8…` / P1 `6f5aa9d7…` / P2 `8f6e900d…` / P3 `d30ce8af…` / **R11 补锁后 `1b01b960904c7412f64a173b222240a1`** |
