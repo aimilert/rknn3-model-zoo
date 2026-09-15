@@ -24,7 +24,7 @@
    > ⚠️ **第 8 点的退路已作废**：卡内上限 5 个 session **不由内存决定**（失败时最紧 node 仍剩 93.7 MB，占基线 74%，够再放约 11 个会话的 KV）。因此**调小 `kvcache_len` 提高并发数这条路是无效的**——它降低的是每会话内存，而限制并发的不是内存。详见 §4.4。
 8. **P3（交互式多会话）已实现并验收**（见 §5 的 P3 完成记录）。`--sessions N --interactive` 解开了 P2 时期写死的互斥：一条输入线程 + 每会话一个 worker 抢同一个待办队列（**"谁空闲给谁"**），输出按**整段成块 + `[s<i>]` 前缀**打印，N 路不互相穿插。
    > ✅ **实测（2026-09-14）**：N=1 时与 P1 交互黄金**逐 token 等价**（1539/1539、跨清 KV 3078/3078，清 KV 仍在 3826/4096）；N=4 + 12 行输入 → **恰好 12 个块、无穿插、4 个会话各分到 3 轮**（"谁空闲给谁"的正面证据），聚合 **37.70 tok/s**。
-   > 同批补齐了 §9.3 的 **30 分钟稳定性**（通过）与 §9.5 的 **TSan 跑一轮**（我们代码干净；SDK 内部有报告，边界见 §9.5）。**`--perf` 仍与 `--sessions` 互斥。**
+   > 同批补齐了 §9.3 的 **30 分钟稳定性**（通过）、§9.5 的 **TSan 两轮**（补轮把 R11 新加的锁那段代码真正压进去了；但首轮"我方零竞争"的说法已按 4 条"写侧在我方"的报告收窄，边界见 §9.5）与 §9.3 的 **ASan 四阶段 + 阳性对照**（零报告）。**`--perf` 仍与 `--sessions` 互斥。**
 
 ---
 
@@ -528,7 +528,7 @@ P2 必须靠它——N 路会话并发时 stdout 会交错，文本对比不再�
    卡级锁已经拿到 83% 效率，方案 B 的潜在收益只有那剩下的 17%，而它要赌
    "runtime 支持同 context 真并发"——不值得先做。→ **仍然没做**。
 5. 卡级统计仍是多会话混在一起（见表中 2.6 的 ⚠️）。→ **仍然没做**。
-6. **没有跑 ASan/TSan** → ✅ TSan 已跑（§9.5）；**ASan 仍未跑**。
+6. **没有跑 ASan/TSan** → ✅ **两者都已跑**（TSan 两轮见 §9.5；ASan 四阶段 + 阳性对照见 §9.3）。
 
 ### P3：可选增强
 
@@ -603,8 +603,15 @@ P2 必须靠它——N 路会话并发时 stdout 会交错，文本对比不再�
 **同批完成的两项验证**（P2 的欠账）
 
 - ☑ **30 分钟稳定性**：见 §9.3。6 轮 N=4 全部 rc=0，吞吐无衰减，**首末轮 token 逐字节一致**。
-- ☑ **TSan 跑一轮**：见 §9.5。**我们自己的代码零竞争**；SDK 内部有报告，且单会话对照证明
-  其中一组与本次改造无关。**边界必须连同结论一起引用**。
+- ☑ **TSan 跑两轮**：见 §9.5。**R11 新加锁的那段代码已真正跑过 TSan**（首轮"从未执行到
+  `clear_kvcache`"的盲区已关闭）；多会话路径的报告**全部落在 SDK 的 16 MB
+  `FreeListAllocator` arena 内**，控制组（`ignore_noninstrumented_modules=1`）把并发盘的
+  报告**整体压到 0**，即没有一条是"两侧都在我方插桩代码内"的竞争。**但有 4 条报告的
+  写侧是我方 `input_callback`（写的是 SDK 给的缓冲）——首轮"我方零竞争"的说法已按此收窄。**
+  边界必须连同结论一起引用。
+- ☑ **ASan 跑一轮**：见 §9.3。四个阶段零报告，**且阳性对照证明这套 ASan 在这块板上真会报**
+  （堆越界 / use-after-free / LSan 三项都报出来了）；AS-2 的四路 dump 与 Release 版
+  R11 T2 dump **逐字节一致** → 排除"构建不同、跑了另一条路"这个解释。
 
 ### 工作量估算
 
@@ -639,9 +646,9 @@ P2 必须靠它——N 路会话并发时 stdout 会交错，文本对比不再�
 | R2 | ~~**KV cache 总量超卡内存**~~ ✅ **已排除** | — | — | 实测每会话仅 64.4–70.7 MB/卡，4 会话共 ~283 MB，余量充足；且 KV 预分配、与上下文长度解耦（§4.1） |
 | R2b | **卡内 session 上限 5，且不由内存决定** | 已确知（非概率） | 中 | 目标 4 路有 1 个 session 余量；**不要超配到 5**。成因未定位（§4.4），调 ctx 无效 |
 | R3 | 同 context 并发导致 hidden states 串话 | 高（不处理必现） | 高 | §3.2 卡级锁 + 可选 per-session output mem |
-| R4 | **`malloc(): unaligned tcache chunk`** —— 此前已在本 demo 中出现过的堆损坏，根因未定位 | 中 | 高 | 改造后开 `-DENABLE_ASAN`（`cpp/CMakeLists.txt:10` 已有开关）跑长稳定性测试；怀疑与多线程下 runtime 内部状态有关，多会话会放大 —— **30 分钟稳定性里 0 命中（§9.3）；TSan 也没报堆相关（§9.5）。但 ASan 仍未跑，风险等级不下调。** |
+| R4 | **`malloc(): unaligned tcache chunk`** —— 此前已在本 demo 中出现过的堆损坏，根因未定位 | 中 → **低** | 高 | 已开 `-DENABLE_ASAN`（`cpp/CMakeLists.txt:10`）跑完四个阶段（含最重的 4 会话 × 4800 decode + 4 次清 KV）：**0 报告**，且**阳性对照证明这套 ASan 在这块板上会报**（§9.3）；30 分钟稳定性 0 命中（§9.3）。**概率下调，但不关闭**：① ASan 会改变堆布局与时序，"竞争诱发型"损坏可能因此不出现；② ASan 下累计只跑了约 10 分钟，**没做满 30 分钟 soak**；③ SDK 自己缓冲内部的越界看不见（同 §9.5 的边界）。 |
 | R5 | 死锁（锁序错误） | 中 | 高 | 严格 stage 升序锁；加 `--sessions 1` 回退开关；持锁超时告警 |
-| R6 | SDK 未文档化的同 context 并发限制 | 中 | 中 | 卡级锁已把并发"降级"为卡内串行，风险大幅降低。**但 TSan 实测发现：卡级锁只能串行化调用方，管不到 SDK 自己那条回调/传输线程**——竞争报告全部落在 `librknn3_api_rkcp.so` 内部（§9.5）。未能定性真伪（库未插桩），**不视为已关闭** |
+| R6 | SDK 未文档化的同 context 并发限制 | 中 | 中 | 卡级锁已把并发"降级"为卡内串行，风险大幅降低。**但 TSan 实测发现：卡级锁只能串行化调用方，管不到 SDK 自己那条回调/传输线程**——竞争报告**全部落在 `librknn3_api_rkcp.so` 的 16 MB `FreeListAllocator` arena 内**，且两侧持的常是**两把不同的 SDK 锁**（说明那两把锁没有互斥这段内存，§9.5）。**其中 4 条的写侧是我方的 `input_callback`（写 SDK 给的缓冲）**——静态看指向 SDK 内部的缓冲管理，但**未能定性真伪（库未插桩），不视为已关闭** |
 | R7 | `libtokenizer.a` 是否线程安全未知 | 低 | 中 | 每会话各自持一个 `Tokenizer` 实例（而非共享），或给解码加锁；`init_tokenizer_and_embedding`（`main.cc:1459`）要改成可重入 |
 | R8 | 每 token 新建线程（`main.cc:1893`）× N 会话 → 线程风暴 | 低 | 低 | 实测 host 开销仅 0.17%，暂不处理；P3 换常驻池 |
 | R9 | N=4 时利用率 >100%，排队抖动放大 | 高 | 中 | 产品配置定为 N=2~3，N=4 仅压测 |
@@ -668,6 +675,7 @@ git checkout -b feature/multisession-concurrency
 #   075a7a4  multicard: interactive multi-session over --sessions (P3)
 #   4690d3a  docs: P3 交互式多会话完成记录 + 30 分钟稳定性 / TSan 实测（v1.3）
 #   9d2d167  multicard: take the card lock around clear_kvcache in both workers (R11)
+#   15f160e  docs: R11 清 KV 卡锁验证与补锁记录（v1.4）
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
@@ -703,7 +711,11 @@ git tag r11-kvlock      # 指向 R11 的代码 commit
 | P3 源码快照 | `rt_work/main.cc.p3_interactive` | `ff85aa377f91eb3b5e543dfa8754e4c6` |
 | R11 源码快照 | `rt_work/main.cc.r11_kvlock` | `c1fcc366958c34941b99c46c8f22cd62` |
 | 板卡二进制 | 见 §5 各阶段完成记录的表 | P0 `a6739a6e…` / P0+插桩 `205232b8…` / P1 `6f5aa9d7…` / P2 `8f6e900d…` / P3 `d30ce8af…` / **R11 补锁后 `1b01b960904c7412f64a173b222240a1`** |
-| TSan 二进制 | 板卡 `<板卡临时目录>/rknn_multicard_demo.tsan` | `acb78c120353c73f74725ed1c7a30ed2` |
+| TSan 二进制（首轮，**不含 R11 锁**） | 板卡 `<板卡临时目录>/rknn_multicard_demo.tsan` | `acb78c120353c73f74725ed1c7a30ed2` |
+| TSan 二进制（补轮，**含 R11 锁**） | 板卡 `<板卡临时目录>/rknn_multicard_demo.tsanr11` | **`7f19e6d505ac443829604765bcb2b142`** |
+| ASan 二进制 | 板卡 `<板卡临时目录>/rknn_multicard_demo.asan` | `80344d4bdc81d8b7a6aa94a78f62eeaa` |
+| ASan 运行时（GCC 11 的 `libasan.so.6`） | 板卡 `<板卡临时目录>/libasan.so.6` | `1dc1577ea7882fbd5239039432b34c1e` |
+| ASan 阳性对照源码 | `rt_work/asan_probe.cc` | 编译产物 `asan_probe2` @ `-O0` |
 
 **红线（2026-09-14 更新）：**
 
@@ -925,11 +937,68 @@ readelf -n rknn_multicard_demo/rknn_multicard_demo | grep -i 'build id'
 > 无法排除这是模型加载/teardown 的一次性峰值。所以结论只能说到
 > **"没有与泄漏相符的证据"**，不能写成"无泄漏"。要定性需要更密的采样或分阶段（加载/推理/销毁）拆开量。
 
-#### ASan：**仍未跑** ❌
+#### ASan：**已跑，四个阶段零报告；且阳性对照已证明这套 ASan 在这块板上真会报** ✅（2026-09-15）
 
-- `cmake -DENABLE_ASAN=ON`（`cpp/CMakeLists.txt:10` 已支持；注意它只追加到 `CMAKE_CXX_FLAGS_DEBUG`，
-  必须配 `-d Debug` 才生效）。ASan 能查的是 `unaligned tcache chunk` 这类堆损坏（R4），
-  **和 TSan 查的数据竞争是两件事**——TSan 跑过不等于 ASan 的需求消失。
+`cmake -DENABLE_ASAN=ON`（`cpp/CMakeLists.txt:10` 已支持；注意它只追加到 `CMAKE_CXX_FLAGS_DEBUG`，
+必须配 `-d Debug` 才生效）。ASan 能查的是 `unaligned tcache chunk` 这类堆损坏（R4），
+**和 TSan 查的数据竞争是两件事**——TSan 跑过不等于 ASan 的需求消失。
+
+**先说这个工具在这里的能见度**（与 TSan 那条边界同理，不重复论证）：
+ASan 用**进程级替换 malloc/free**（interposition）+ 编译期红区/影子内存检查。
+**前者对所有代码生效**——包括闭源的 `librknn3_api_rkcp.so`：它越界写到红区、或 free 掉已释放的指针，
+ASan 在分配器这一层拦得住；**后者只插桩我们自己的代码**——SDK 自己缓冲**内部**的一次普通越界
+（没碰到红区）不会在访问那一刻被报。所以结论只能写成「ASan 没报」而不是「一定没有堆损坏」。
+
+**运行时依赖的坑与 TSan 完全同形**：板卡自带 `libasan.so.8`（GCC 13），而交叉工具链是 GCC 11.4
+→ 需要 `libasan.so.6`，SONAME 对不上。自带一份并让 `LD_LIBRARY_PATH` 把它排在 `./lib` **前面**。
+
+> ⚠️ **构建系统的一个陷阱（踩到了）**：`build-linux.sh` 的 `INSTALL_DIR` 是
+> `install/${TARGET_PLATFORM}/${TARGET_SDK}`，**不含 `BUILD_TYPE`**。所以一次 `-d Debug` 构建
+> 会 `rm -rf` 掉同一路径下的 Release 安装目录——**ASan/TSan 构建会把已验收的 Release 二进制删掉**。
+> 必须在构建前把 Release 的安装目录整体另存一份，跑完再拷回来。
+
+| 阶段 | 形态 | 结果 |
+|---|---|---|
+| AS-0 | 指纹与运行时确认 | 二进制 `80344d4bdc81d8b7a6aa94a78f62eeaa`；`libasan.so.6` `1dc1577ea7882fbd5239039432b34c1e` |
+| AS-1 | 单会话黄金等价（`--interactive`，与 P1 黄金同路径） | ✅ **逐字节 IDENTICAL，1539 token** |
+| AS-2 | 并发 + 强制清 KV（**与 R11 的 T2 完全同 workload**） | ✅ rc=0；**恰好 4 次清 KV @ `context 3987/4096`**；四会话 prefill 504 / decode 4800，全部 `ok`，纯 decode 9.60~9.66 tok/s |
+| AS-3 | 交互式多会话 soak（`--interactive`，48 行输入） | ✅ 52 块 = 48 回合 + 4 次清 KV 提示；**无穿插**（52 = 52）；四路各 4812 token dump |
+| AS-4 | 泄漏检查（单独 `detect_leaks=1`，`--sessions 2 --rounds 2 -n 32`） | ✅ LSan **一行未打印**（无泄漏） |
+| AS-5 | 汇总 | **`asan_report.*` 文件数 = 0** |
+
+**AS-1 顺带是个 UB 探针**：ASan/Debug 改了优化级别与内存布局，token 仍与黄金逐字节一致，
+说明这条路径里没有依赖未定义行为的成分。
+
+**交叉验证（本次最硬的一条）**：AS-2 的四路 dump（各 4812 token）与 **R11 的 T2 post dump
+（由 Release 二进制产出）逐字节一致**（4/4）。即 **ASan/Debug 构建没有改变任何数值行为**——
+所以 ASan 的"零报告"不能被"构建不同跑了另一条路"解释掉。
+
+##### 阳性对照：证明"零报告"是有意义的零，而不是工具没生效
+
+一整轮 ASan 下来一个报告都没出，这个事实有两种解释：① 真的没有堆错误；② **工具压根没生效**
+（插桩被优化掉、SONAME 没接上、影子内存没映射……）。只跑被测程序**区分不了这两种**。
+这与 TSan 那轮是同一条纪律（先证明"故意制造的竞争能报出来"，才轮得到"我们代码干净"）。
+
+`rt_work/asan_probe.cc` 在**这块板卡上、用随二进制下发的那份 `libasan.so.6`** 实测：
+
+| 对照 | 机制 | 结果 |
+|---|---|---|
+| 堆越界写（`malloc(16)` 写偏移 24） | 编译期红区/影子内存检查 | ✅ 报出 heap-buffer-overflow |
+| use-after-free | 分配器层拦截 | ✅ 报出 heap-use-after-free |
+| 故意泄漏 4096 字节 | LSan | ✅ 报出（证 AS-4 的 `detect_leaks=1` 在工作） |
+| 栈越界写 | 栈红区 | ❌ 未报 —— **我的构造有问题**（数组是死代码，GCC 把 store 删了），**不作为证据** |
+
+> **第一版对照失败留档**：第一版用 `p[16] = 'X'` 这种**常量下标**，`-O1` 下 GCC 把访存整个优化掉了
+> （`nm` 里只有 1 个 `__asan_report_*` 引用，而 demo 二进制有 10 个）→ 前两个对照一个都没报。
+> **这是对照写坏了，不是 ASan 坏了**，不能据此说"工具的地址检查无效"。改法：下标走 `volatile`，
+> 编译器无法折叠成常量；并在 `-O0` 下编译（与 demo 的 Debug 构建对齐）。
+> 这条同时也说明：**`-O1` + ASan 下，编译期能算出来的越界会被优化掉**，探针必须防这个。
+
+**R4 的判定**：ASan 已跑、阳性对照成立、最重的那条 workload（4 会话 × 4800 decode + 4 次清 KV）
+零报告，因此 **R4 的概率从"中"下调到"低"**（影响等级不变）。但**不能就此关闭**：
+① ASan 会改变堆布局与时序，这类"竞争诱发型"堆损坏可能因此**不出现**；
+② ASan 下累计只跑了约 10 分钟（AS-2 约 8.5 分钟 + AS-3），**没有**做满 30 分钟 soak；
+③ 边界同 §9.5——SDK 自己缓冲内部的越界看不见。要关闭需要在 ASan 下跑满长时 soak。
 
 ### 9.4 调试辅助
 
@@ -938,57 +1007,142 @@ readelf -n rknn_multicard_demo/rknn_multicard_demo | grep -i 'build id'
 | `--dump-tokens <file>` | ✅ 已有 | 每步输出 token ID；并发模式下自动变成 `<file>.s<i>`（每会话一个） |
 | 每会话 perf 表 | ✅ 已有 | prefill/decode token 数、纯 decode tok/s、墙钟，区分"哪个会话慢" |
 | `--conv-trace` | ❌ 未加 | 打印 `[conv A][stage2] enter/exit card_lock`，排查死锁与相位 |
-| TSan 构建 | ✅ 已加 | `-fsanitize=thread` 独立构建（板卡上 `rknn_multicard_demo.tsan`），见 §9.5 |
+| TSan 构建 | ✅ 已加 | `-fsanitize=thread` 独立构建（板上 `rknn_multicard_demo.tsanr11`，**含 R11 锁**），见 §9.5 |
+| ASan 构建 | ✅ 已加 | `cmake -DENABLE_ASAN=ON` + `-d Debug`；注意 `INSTALL_DIR` 不含 `BUILD_TYPE`，**Debug 构建会删掉 Release 安装目录，先另存**，见 §9.3 |
 
-### 9.5 TSan 跑一轮：**我们代码零竞争；SDK 内部有报告（含边界说明）**（2026-09-14）
+### 9.5 TSan 两轮：**多会话路径（含 R11 清 KV）没有"两侧都在我方代码内"的竞争；SDK 内部报告未定性**（2026-09-14 首轮 / 2026-09-15 补轮）
 
 **先说这个工具能看到什么**：TSan 靠**编译器插桩** + 运行时影子内存算 happens-before。
 它**只能插桩我们自己编的代码**——`librknn3_api_rkcp.so` 是闭源预编译库、**没有被插桩**，
 它内部的访存 TSan 既看不见、也不会成为别人 happens-before 链上的边。
 **所以"TSan 干净"只证明我们的代码干净，不证明 SDK 干净**（反之，它报的 SDK 内部"竞争"
-也可能是"看不见原子操作"导致的假阳性）。TSan 下执行慢约 **2.5×**（90s → 233s），
-跑出的 tok/s 无参考价值，本文不引用。
+也可能是"看不见原子操作"导致的假阳性）。
 
-**三轮设计（顺序是刻意的）**：并发路径与交互式（新代码）排前面，单会话老路排最后——
-TSan 下每次启动都要重走一遍模型加载，万一要中途收尾，先拿到的是最有信息量的两段。
-而**单会话那一轮是决定性的对照**：它完全不进多会话路径。
+> ⚠️ **首轮对速度的估计过于乐观**：首轮记的是"慢约 2.5×（90s → 233s）"，那是**短会话**的数字。
+> 补轮实测：长上下文下每会话纯 decode 只有 **0.10 tok/s**（3754 prefill + 96 decode 用掉
+> 单会话 1252 s 墙钟），比 Release 的 12.38 tok/s 慢**两个数量级**；另有**每进程约 230~240 s
+> 的固定成本**（模型加载）。所以 TSan 下的 tok/s 无参考价值，本文不引用；跑时长必须按
+> "decode 产出"倒推，不能照 Release 估。
 
-| 阶段 | 形态 | 报告数 | 竞争访存在**我们代码**里 |
-|---|---|---|---|
-| TS-A | `--sessions 2 --rounds 1`（并发路径） | 9 | **0** |
-| TS-B | `--sessions 2 --interactive`（**P3 新代码**） | 11 | **0** |
-| TS-C | **不指定 `--sessions`**（单会话老路径，对照） | 4 | **0** |
+**为什么要补第二轮**：首轮（2026-09-14）的三个阶段**一次都没走到 `clear_kvcache`**——
+负载太短够不到阈值。而 **R11 恰恰是在 `clear_kvcache` 上新加了两把卡锁**
+（`run_conversation_worker` / `run_interactive_session_worker`），板上那份首轮二进制
+（`acb78c12…`）里**根本没有那把锁**。也就是说：**R11 那段新代码从未在 TSan 下执行过。**
+补轮换用含锁的重编版本（`7f19e6d5…`），把清 KV 路径真正压进去，并补一个控制组。
 
-（报告条数以 TSan 页脚 `reported N warnings` 为准；分类脚本逐条解析调用栈，不靠肉眼。）
+| 轮次 | 阶段 | 形态 | 报告数 | 竞争访存在**我们代码**里 | 清 KV |
+|---|---|---|---|---|---|
+| 首轮 | TS-A | `--sessions 2 --rounds 1`（并发路径） | 9 | 0 | ✗ 未到达 |
+| 首轮 | TS-B | `--sessions 2 --interactive`（**P3 新代码**） | 11 | 0 | ✗ 未到达 |
+| 首轮 | TS-C | **不指定 `--sessions`**（单会话老路径，对照） | 4 | 0 | ✗ 未到达 |
+| 补轮 | TS-A | `--sessions 2 --rounds 1 -n 8`（复刻首轮 TS-A） | 8 | 0 | ✗ |
+| 补轮 | **TS-B** | **同 TS-A + `ignore_noninstrumented_modules=1`（控制组）** | **0**（rc=0） | — | ✗ |
+| 补轮 | TS-C（**中止**） | `--sessions 4 --rounds 12 -n 400`（靠 decode 累积上下文） | 11 | 1 | ✗ 未到达（跑 36 min 仅约 1/5，已中止，报告单独留档） |
+| 补轮 | TS-C2 | `--sessions 4 --rounds 10 -n 8`（**轮数不够，没撞到阈值**） | 18 | 1 | ✗ **0 次**（见下） |
+| 补轮 | TS-C3 | `--sessions 4 --rounds 12 -n 8`，中等长度 prompt | 14 | 1 | ✅ **恰好 4 次 @ `context 3765/4096`** |
+| 补轮 | TS-D3 | `--interactive` 48 行长输入 / 4 会话 | 16 | 1 | ✅ **每会话 13 块 = 12 回合 + 1 次清 KV，各清 1 次、52 块无穿插** |
+| 补轮 | TS-E | `--sessions 1 -n 8`（**单会话对照，复刻首轮 TS-C**） | 4 | 0 | ✗ |
 
-**结论一：我们自己的代码没有竞争。**
-**没有任何一条报告的竞争访存第一处本地帧落在我们的代码里**——全部在
-`librknn3_api_rkcp.so` 内部：`rknn3_session_output_callback`、`rknn3_mem_sync_range`、
-`utils_read`，以及它自己那块 16 MB `FreeListAllocator` arena。我们的帧只以两种身份出现：
-**调用者**（如 `run_chat_turn` main.cc:2238，它下面才是 SDK 的 memcpy）和
-**线程/锁的创建点**——两者都不是竞争证据。卡级锁、tokenizer 互斥、每会话队列与
-`block_out` 都干净。
+（首轮条数以 TSan 页脚 `reported N warnings` 为准；补轮条数为分类脚本逐条解析调用栈所得，
+两者口径一致——首轮 TS-A/TS-B/TS-C 的 9/11/4 与脚本解析的 5+4 / 7+4 / 0+4 完全吻合。）
 
-**结论二：有一组报告与本次改造无关。** TS-C（单会话，**完全不进多会话路径**）照样报出
+**为什么要用中等长度 prompt 去顶清 KV 阈值**（这是补轮的关键设计）：清 KV 的守卫是
+`context_tokens + prefill_reserve(512) >= 4096`，即 `context_tokens >= 3584`。
+补轮第一版 TS-C 那种"靠 decode 累积"的路子，在 TSan 的 0.10 tok/s 下要跑 **100 分钟以上**（实测
+36 分钟才到约 1/5，已主动中止）。但 **prefill 每个 token 比 decode 快一个数量级**，而
+`--rounds` 每轮都会把 `--prompt` **重新追加一遍**（不是只发一次）——所以用一个 368 token
+的 prompt，每轮上下文增 376，第 11 轮前撞到 3584 清一次，decode 只需 96 token/会话。
+全程最高上下文 `10 × 376 = 3760 ≤ 4096`，**不会顶穿**（prompt 一旦超过 512 就可能顶穿，
+落在守卫包线之外，所以不能更长）。
+
+> 补轮第一次（TS-C2）**清了 0 次**：我按 4 字符/token 估 prompt 是 443 token，实测是 **368**
+> （1776 字符 ≈ 368 token，约 4.8 字符/token），10 轮只到 3384 < 3584——**差一轮**。
+> 改成 `--rounds 12` 后正好清 4 次。这条数字是硬的（`prefill 3754 / decode 96` 反推出来的），
+> 不依赖对 tokenizer 的估计精度。
+
+**结论一：控制组把"我们代码干净"从一个说法变成了一个有边界的结论。**
+补轮 TS-B 是**同负载 + `ignore_noninstrumented_modules=1`**：该选项把"两侧访存都在未插桩模块内"
+的报告**整体抑制**。结果是 **rc=0、0 条**——TS-A 那 8 条**全被压掉**。这精确说明：
+**那些报告没有一条是"两侧都在我方插桩代码内"的竞争**。卡级锁、tokenizer 互斥、
+每会话队列与 `block_out` 都干净。
+
+**结论二（**对首轮结论的收窄，务必看这条**）：首轮"我方代码零竞争"的说法在补轮里被推翻了一部分。**
+首轮报告里确实没有任何一条竞争的访存第一处本地帧落在我方代码；但补轮在**4 会话并发**盘里
+出现了 **4 条**这样的竞争（3 条在完成轮 + 1 条在中止轮），形态完全一致：
+
+```
+Read of size 8  by T1 (mutexes: write M301):           ← 读侧
+  #2 rknn3_session_output_callback(Context*, RK::MsgHeader*)   [SDK+0xd9be4]
+Previous write of size 1 by T2 (mutexes: write M305):  ← 写侧
+  #2 memcpy (string_fortified.h:29)
+  #3 input_callback  main.cc:1545            ← **我方代码在写**
+  #4 rknn3_session_input_callback(Context*, RK::MsgHeader*)    [SDK+0xdd428]
+Location is heap block of size 16777216 ... allocated by FreeListAllocator::Init()
+```
+
+`main.cc:1545` 就是 `input_callback` 里把 rope cache 拷进 SDK 给的输入 tensor 的那句
+`memcpy(dst, src, copy_stride)`，`dst = input_tensors[i].mem->virt_addr`
+（**地址是 SDK 给的、缓冲是 SDK 的**）。所以准确的写法是：
+
+- **我方代码确实执行了这 4 次竞争写**——但写的是 **SDK 交给我们的那块的缓冲**，
+  是在 SDK 自己调进来的回调里、持着 SDK 自己的锁做的，**正是回调契约要求我们做的事**；
+- **两侧持的是两把不同的 SDK `recursive_mutex`**（实测组合：M301/M305、M301/M307、
+  M301/M304、M307/M311，创建点都是同一个 SDK 位置）→ **那两把锁没有在互斥这段内存**；
+- 读写地址相隔 **7 字节**（`0x…4310` 读 8 字节 / `0x…4317` 写 1 字节），落在
+  同一个 16 MB arena 里。**这到底是"同一对象"还是"相邻对象的假共享"，只有 SDK 源码能定。**
+
+**结论三：聚合统计（去重后）。** 首轮 3 份 + 补轮 7 份（剔除中止轮的重复副本），
+**完成轮共 52 条数据竞争 + 40 条 `unlock of an unlocked mutex`**；中止轮另留档 11 条
+（其中 1 条为我方访存侧）→ 合计 63 + 40。地址形态高度一致：
+
+| 统计项 | 结果 |
+|---|---|
+| 两处访存区间**确实重叠** | **52/52**（中止轮 11/11） |
+| 落在 SDK 的 **16 MB `FreeListAllocator` arena** | **52/52**（中止轮 11/11） |
+| 访存宽度 | 只有 size=1 与 size=8，没有其他宽度 |
+| 一侧是 `rknn3_session_output_callback` | **52/52**（每条都有一侧是它） |
+| **一侧是我方 `input_callback`（main.cc:1545）** | **3/52**（中止轮 1/11） |
+| 另一侧的其他本地帧 | `rknn3_session_input_callback`、`rknn3_mem_sync_range`、`utils_read`、`rknn3_session_get_next_input_embed_callback`，均在 SDK 内 |
+
+> **重叠率 100% 不是发现，是预期**：TSan 只在两处访存落到同一地址时才报竞争，
+> 所以"区间重叠"必然 100%。**真正有信息量的是"全部落在那一个 16 MB arena 里"
+> 和"一侧永远是 output_callback"这两件。** 这条写在这里是为了防止后人把 100% 当成异常。
+
+**结论四：条数不是一个稳定指标，别拿它做判据。** 同一形态的负载，实测条数为
+**首轮 TS-A 5 / 补轮 TS-A 4**、4 会话并发 **14 / 10 / 12**（TS-C2/C3/D3，且 TS-C2 与 TS-C3
+是同一 workload 只差轮数）。**稳定的是"位置与形态"，不是条数**——所以本文的结论一律
+按"落在哪里/两侧是谁"来写，不写"共 N 条"作为论据。
+
+**结论五：有一组报告与本次改造无关。** 单会话对照在**两轮里都稳定复现**：
 **4 条 `rknn3_destroy+0xfb068` 的 "unlock of an unlocked mutex"**，每卡 1 条，
 全部在**主线程单线程收尾**时触发（栈：`rknn3_destroy` ← `destroy_contexts` main.cc:528 ←
-`main`）。它在三个阶段里都是同样的 4 条 → **是 SDK 收尾路径的固有现象，不是 P2/P3 引入的**。
-（`pthread_mutex_unlock` 是被 TSan 拦截的，"unlock of an unlocked mutex"不能简单当作
-未插桩导致的假阳性；但它**在零并发的对照里也稳定复现**，所以与改造无关这一点是确定的。）
+`main`），**数据竞争 0 条**。首轮 TS-C、补轮 TS-E 形状完全一致 → **是 SDK 收尾路径的固有
+现象，不是 P2/P3/R11 引入的**。（`pthread_mutex_unlock` 是被 TSan 拦截的，"unlock of an
+unlocked mutex"不能简单当作未插桩导致的假阳性；但它**在零并发的对照里也稳定复现**，
+所以"与改造无关"这一点是确定的。）
 
-**结论三：数据竞争只在 ≥2 会话并发时出现**（TS-A 5 条 / TS-B 7 条 / **TS-C 0 条**），
-且全在 SDK 的传输线程与 arena 之间。
+**结论六：数据竞争只在 ≥2 会话并发时出现。** 单会话（首轮 TS-C、补轮 TS-E）**0 条数据竞争**，
+4 条 unlock 是收尾路径的固有现象；两轮 TS-A（2 会话）都是 4~5 条；4 会话并发 10~14 条。
 
-> ⚠️ **为什么这条不能简单判定为"SDK 的 bug"**：我们的卡级锁只能串行化**调用方**，
-> 而报告里的读方是 SDK **自己创建的**回调/传输线程（`Thread T3 ... created by main at
-> main.cc:3853`，即 SDK 初始化时起的）——**它不在我们的锁内，任何应用层的锁都管不到它**。
-> 这些位置要么是 SDK 内部有我们看不见的同步协议（lock-free 环 + 原子操作，TSan 盲区），
-> 要么是真竞争。**TSan 到此为止，定性需要 SDK 源码或原厂答复。** 因此 R6 **不视为已关闭**。
+> ⚠️ **为什么这些不能简单判定为"SDK 的 bug"**：我们的卡级锁只能串行化**调用方**，
+> 而报告里至少有一侧是 SDK **自己创建的**回调/传输线程——**它不在我们的锁内，
+> 任何应用层的锁都管不到它**。这些位置要么是 SDK 内部有我们看不见的同步协议
+> （lock-free 环 + 原子操作，TSan 盲区），要么是真竞争。**TSan 到此为止，
+> 定性需要 SDK 源码或原厂答复。** 因此 R6 **不视为已关闭**。
 
-**复现**（红线内的中间产物，**不进 git**）：脚本 `rt_work/run_tsan.sh`（板上 `<板卡临时目录>`），
-分类脚本 `rt_work/tsan/classify.py` + 三份原始报告 `rt_work/tsan/report_ts*.txt`。
+**这一轮真正拿到的正面结论是**：**R11 新加锁的那段代码（两处 `clear_kvcache`）在 TSan 下
+真的执行到了**（TS-C3 清 4 次、TS-D3 四路各清 1 次），**而它没有引入任何新的竞争形态**——
+清 KV 路径的出现没有让报告的形状发生变化（仍全在 SDK arena 内、一侧仍是 `output_callback`）。
+首轮那个"R11 代码从未在 TSan 下跑过"的盲区，**已关闭**。
+
+**复现**（红线内的中间产物，**不进 git**）：脚本 `rt_work/run_tsan.sh`（首轮）、
+`rt_work/run_tsan2.sh`/`run_tsan3.sh`/`run_tsan4.sh`（补轮，板上 `<板卡临时目录>`），
+分类脚本 `rt_work/tsan/classify.py` + 原始报告 `rt_work/tsan/report_ts*.txt`、
+`rt_work/tsan_all/tsan{2,3,4}/report.*`。
 板上另需一份 GCC 11 的 `libtsan.so.0`（板卡自带的是 `libtsan.so.2`，SONAME 对不上，
 必须随二进制一起下发并让 `LD_LIBRARY_PATH` 把它排在 `./lib` **前面**）。
+**补轮二进制 `7f19e6d505ac443829604765bcb2b142`（含 R11 锁）**，首轮旧件
+`acb78c120353c73f74725ed1c7a30ed2`（不含 R11，仅留档）。
 
 ### 9.6 R11：回合之间清 KV 要不要卡锁 —— 验证与补锁（2026-09-14）
 
@@ -1099,9 +1253,9 @@ TSan 下每次启动都要重走一遍模型加载，万一要中途收尾，先
 | **主要改造** | ✅ 4 处全局状态已全部下沉到 `Conversation`；并发靠 **`StageContext::run_mutex`（每卡一把锁）**，持锁覆盖整个 `session_run` |
 | **正确性** | ✅ N=1/2/4 共 7 路 token id 与单会话路径**逐字节一致**；单会话路径本身零回归（3 组黄金 token 全中）。**交互式多会话同样逐 token 等价**（1539/3078），N=4 时 12 个输入块无穿插、四路各分到 3 轮 |
 | **工作量** | P0/P1/P2/P3(交互式) 已完成（各一个 commit）；**P3 服务化（HTTP/WebSocket）未开始** |
-| **剩余风险** | `unaligned tcache chunk` 堆损坏（30 分钟稳定性 0 命中，**但 ASan 仍未跑**，等级不下调）；5 上限的成因未知（非阻塞）；**SDK 内部 TSan 报告未定性**（卡级锁管不到 SDK 自己的传输线程，§9.5 / R6） |
+| **剩余风险** | `unaligned tcache chunk` 堆损坏（30 分钟稳定性 0 命中 + **ASan 四阶段 0 报告且阳性对照成立** → 概率**下调**，但未关闭：ASan 会改变堆布局、且没做满 30 分钟 soak）；5 上限的成因未知（非阻塞）；**SDK 内部 TSan 报告未定性**（卡级锁管不到 SDK 自己的传输线程；其中 4 条的写侧是我方 `input_callback`，写的是 SDK 给的缓冲，§9.5 / R6） |
 | **版本管理** | 四个代码 commit（`d59a239`/`6347f57`/`446cbdf`/P3）+ 四个 tag；回归对照物是独立保存的源码/二进制快照 + 黄金 token 文件；下发靠 **md5 + BuildID 双校验**（§8.4） |
-| **下一步** | ① 定性 SDK 内部的 TSan 报告（需原厂/SDK 源码）；② ASan 跑一轮（R4 的堆损坏只它查得到）；③ ~~交互 worker 的 `clear_kvcache` 是否需要卡锁（R11）~~ → **已验：需要，两处已补锁，T1/T2/T3 全部通过（§9.6）**；④ HTTP/WebSocket 前端服务化（M5）；⑤ 每卡卡级统计拆到会话维度 |
+| **下一步** | ① 定性 SDK 内部的 TSan 报告（需原厂/SDK 源码）——**优先那 4 条写侧在我方 `input_callback` 的**；② ~~ASan 跑一轮~~ → **已跑（§9.3）**；要把 R4 彻底关闭需在 ASan 下跑满 30 分钟 soak；③ ~~交互 worker 的 `clear_kvcache` 是否需要卡锁（R11）~~ → **已验：需要，两处已补锁，T1/T2/T3 全部通过（§9.6）**；④ HTTP/WebSocket 前端服务化（M5）；⑤ 每卡卡级统计拆到会话维度 |
 
 **关键数据速查**
 
@@ -1116,15 +1270,24 @@ TSan 下每次启动都要重走一遍模型加载，万一要中途收尾，先
 并发增益          N=4 相对 N=1 为 3.33×（扩展效率 83%）
 30 分钟稳定       6 轮 N=4 全 rc=0，41.26→41.62 tok/s 无衰减，首末轮 token 逐字节一致
 交互式多会话      N=4 + 12 行输入 → 12 个 [s<i>] 块无穿插，四路各 3 轮，37.70 tok/s
-TSan              三轮（并发/交互/单会话对照）竞争访存全在 SDK 内部，我方 0 条
+TSan              两轮共 10 份报告：完成轮 52 race + 40 unlock，52/52 落在 SDK 的 16 MB
+                  FreeListAllocator arena、一侧恒为 output_callback；单会话 0 竞争
+                  控制组（ignore_noninstrumented_modules=1）→ 并发盘的报告全压到 0
+                  **但要如实写：3/52 的写侧是我方 input_callback（写 SDK 给的缓冲）**
+                  条数不稳定（同 workload 实测 14/10/12），稳定的是位置与形态
+ASan              四阶段 0 报告（AS-1 黄金逐字节 / AS-2 = R11 T2 同 workload、4 次清 KV
+                  且四路 dump 与 Release T2 dump 逐字节一致 / AS-3 52 块无穿插 / AS-4 无泄漏）
+                  **阳性对照：堆越界、use-after-free、LSan 三项都报出来了** → 零报告是有意义的零
 清 KV 卡锁        两处 worker 已补（§9.6）；补锁前后 token 逐字节一致（四路各 4812 行）
                   T3 soak 8 次清 KV、T2 post 4 次清 KV，均无穿插无崩溃
+                  **TSan 补轮：TS-C3 清 4 次 @ 3765/4096、TS-D3 四路各清 1 次，无新竞争形态**
 模型上下文        4096（固化，不可运行时调大）
 ```
 
 ---
 
-*文档版本：v1.4（2026-09-15）—— R11 补锁记录：更新 §5(待确认项关闭) / §7(R11) / §8.1 / §9.6(新增) / §10*
+*文档版本：v1.5（2026-09-15）—— **ASan 四阶段 + 阳性对照**（§9.3 新增）；**TSan 补轮**重写 §9.5（R11 清 KV 路径已覆盖 / 控制组 / 聚合统计 / **首轮"我方零竞争"结论的收窄**）；联动 §0(第 8 条) / §5(待确认项 + P2 欠账) / §7(R4/R6) / §8.1 / §9.4 / §10*
+*v1.4（2026-09-15）—— R11 补锁记录：更新 §5(待确认项关闭) / §7(R11) / §8.1 / §9.6(新增) / §10*
 *v1.3（2026-09-14）—— 依据板卡实测更新 §0(第 8 条) / §5(P3 完成记录 + P2 欠账状态) / §6(M3~M5) / §7(R4/R6/R10/R11) / §8.1 / §9.1~§9.5 / §10*
 *基线：`examples/multicard/cpp/main.cc` @ `446cbdf`，md5 `ef943467048fd5f985a89e1ec725f248`；P3 后 `ff85aa377f91eb3b5e543dfa8754e4c6`（commit `075a7a4`）；**R11 补锁后 `c1fcc366958c34941b99c46c8f22cd62`（commit `9d2d167`，tag `r11-kvlock`）***
 *v1.2（2026-09-14）—— §5(P2 完成记录) / §6 / §8.1 / §8.5 / §9*
