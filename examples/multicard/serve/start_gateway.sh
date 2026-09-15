@@ -16,7 +16,9 @@
 #   MODEL_DIR    模型目录（*.rknn / *.weight / *.tokenizer.gguf / *.embed.bin / *.safetensors）
 #   GATEWAY_DIR  本脚本与网关所在目录；默认 = 脚本自己所在目录
 #   B            后端二进制名；默认 ./rknn_multicard_demo.serve（由 build_serve.sh 产出）
-#   NSESSION     会话数（= KV 上限内的并发路数）；默认 4
+#   NSESSION     会话数 = **同时活跃的对话数上限**（板卡硬上限实测 5）；默认 4
+#   IDLE_TTL     一段对话静默超过这么多秒就把它占的会话收回给排队者；默认 300（0=不回收）
+#   QUEUE_TIMEOUT 取不到会话时最多排队等这么多秒，超了返回 503；默认 600（要 > IDLE_TTL）
 #   PORT         监听端口；默认 8080
 #   NP           每轮 max_new_tokens 的进程默认值；默认 512
 #   HOST         监听地址；默认 0.0.0.0 = 局域网可达
@@ -37,6 +39,8 @@ INSTALL_DIR=${INSTALL_DIR:-$REPO_ROOT/install-Qwen/rk3588_linux_aarch64/rknn_mul
 MODEL_DIR=${MODEL_DIR:-$REPO_ROOT/Qwen3.5-27B}
 B=${B:-./rknn_multicard_demo.serve}
 NSESSION=${NSESSION:-4}
+IDLE_TTL=${IDLE_TTL:-300}
+QUEUE_TIMEOUT=${QUEUE_TIMEOUT:-600}
 PORT=${PORT:-8080}
 NP=${NP:-512}
 HOST=${HOST:-0.0.0.0}
@@ -49,6 +53,7 @@ export LD_LIBRARY_PATH=./lib
 exec taskset f0 python3 "$GATEWAY_DIR/rkllm_gateway.py" \
   --host "$HOST" --port "$PORT" \
   --sessions "$NSESSION" --verbose \
+  --idle-ttl "$IDLE_TTL" --queue-timeout "$QUEUE_TIMEOUT" \
   --backend-log "$LOG" \
   -- "$B" \
      --model "$MODEL_DIR/Qwen3.5-27B-llm_seg0.rknn" \

@@ -4,10 +4,17 @@
 // 这里跑的就是 `<script>` 里的原文（正则抽出来原样喂给 vm），只有 DOM 是假的。
 //
 // 它守的几条都是**踩过坑才加的**：
-//   1. 四个默认问题必须互不相同  —— 相同的话网关会把它们钉到同一个会话上，变成排队
-//   2. 流结束后必须清掉 active   —— render() 曾经把刚算好的 tok/s 统计行覆盖掉
-//   3. 四路必须落在四个不同会话 —— 退化成串行时，屏幕上看不出来，只有会话号能戳穿
-//   4. 统计行必须带会话号        —— 拿不到 X-KV-Reuse 时（缺 Expose-Headers）会静默变空
+//   1. 四路必须各自带**显式身份**（`X-Conversation-Id: web-1..4`）—— 靠"首问不同"认对话
+//      是会撞的，而且撞了之后答案全对、只是变慢，屏幕上根本看不出来
+//   2. 每一路占到的会话，在 `/v1/pool` 里必须记着**它自己的**名字 —— 光看会话号还不够：
+//      身份没送出去的话会话号照样是四个不同值，但占的是四段**匿名**对话
+//   3. 关页面 / 点「清空」都必须把会话**真的还回去**（两条不同的代码：sendBeacon 与 fetch）
+//      —— 页面占着 4 个会话不放，会把后来的客户端（终端、第二个浏览器）全堵在队列里，
+//      直到 IDLE_TTL 超时
+//   4. 四个默认问题不许有重复     —— 现在并发不靠它了，这是演示素材的抄写检查
+//   5. 流结束后必须清掉 active    —— render() 曾经把刚算好的 tok/s 统计行覆盖掉
+//   6. 四路必须落在四个不同会话   —— 退化成串行时，屏幕上看不出来，只有会话号能戳穿
+//   7. 统计行必须带会话号         —— 拿不到 X-KV-Reuse 时（缺 Expose-Headers）会静默变空
 //
 // 用法（**必须在 serve/ 目录下跑**，它按相对路径读 demo_4chat.html）：
 //   node page_check.js http://<板卡IP>:8080
@@ -80,12 +87,34 @@ if (process.env.MAXTOK) {
   if (script === before) { console.log("FAIL: 没能替换 MAXTOK"); process.exit(1); }
   console.log("（本次 MAXTOK=" + process.env.MAXTOK + "）");
 }
+// 记下每次请求带的身份头：验证"四路确实是以四段不同对话的身份发出去的"，不能只看结果。
+const sentIds = [];
+const abs = (url) => (url.startsWith("http") ? url : BASE + url);
+const winListeners = {};
 const ctx = {
   document, performance, TextDecoder, console, JSON, Promise, Math, Date,
   setTimeout, Error,
   // 页面里的 API 是 ""（同源相对路径），浏览器会自动按页面来源补全；node 不会，
   // 所以这里替它补——**只是替浏览器补全这一步，请求本身没做任何改写**。
-  fetch: (url, opts) => fetch(url.startsWith("http") ? url : BASE + url, opts),
+  fetch: (url, opts) => {
+    const h = (opts && opts.headers) || {};
+    sentIds.push(h["X-Conversation-Id"] || null);
+    return fetch(abs(url), opts);
+  },
+  // 页面用到的浏览器全局。桩的职责是**把环境补齐**，页面代码不该为了能在桩里跑而变形。
+  window: {
+    addEventListener(ev, fn) { (winListeners[ev] = winListeners[ev] || []).push(fn); },
+  },
+  // sendBeacon 在桩里**真的把那句话发出去**（浏览器里也是这么发的）。要是这里摆个空函数，
+  // "关页面有没有把会话还回去"就只能靠嘴说了——而这恰恰是最容易泄漏的一条路。
+  navigator: {
+    sendBeacon(url, body) {
+      fetch(abs(url), { method: "POST", body: body,
+                        headers: { "Content-Type": "text/plain;charset=UTF-8" } })
+        .catch(() => {});
+      return true;
+    },
+  },
 };
 ctx.globalThis = ctx;
 // 页面脚本没导出任何东西，补一行把内部函数交出来供测试调用
@@ -100,12 +129,27 @@ if (panels.length !== 4) { console.log("FAIL: 面板数不是 4"); process.exit(
 const qs = panels.map(p => p.input.value);
 console.log("四个默认问题:", JSON.stringify(qs, null, 0));
 if (new Set(qs).size !== 4) {
-  // 首问相同的话，网关会把它们钉到同一个会话上 → 变成排队而不是并发
-  console.log("FAIL: 四个默认问题必须互不相同（否则会抢同一个会话）");
+  // 四路是不是四段对话，现在由显式身份保证，**不再依赖问题不同**——所以这不是
+  // 并发问题，是素材问题：这四问是挑过的演示默认值（见 demo_4chat.html 的注释），
+  // 短了会四路参差、长了会顶到 max_tokens，重复说明改的时候抄错了。
+  console.log("FAIL: 四个默认问题有重复（不影响并发，但这四个默认值是挑过的，请对齐页面注释）");
   process.exit(1);
 }
 
 (async () => {
+  // 等 `id:web-*` 全部从会话池里消失（交还是异步发出的，给最多 4 秒）。
+  // 返回**还占着的那几个**：空数组才算干净，非空就直接进 FAIL 信息里。
+  async function waitReleased() {
+    let held = [];
+    for (let k = 0; k < 40; k++) {
+      const p = await (await fetch(BASE + "/v1/pool")).json();
+      held = (p.slots || []).map(s => s.key).filter(x => x && x.startsWith("id:web-"));
+      if (!held.length) { return []; }
+      await new Promise(r => setTimeout(r, 100));
+    }
+    return held;
+  }
+
   const t0 = Date.now();
   const rs = await Promise.all(panels.map(p => send(p)));
   const wall = (Date.now() - t0) / 1000;
@@ -128,16 +172,74 @@ if (new Set(qs).size !== 4) {
     if (!r.exact) { console.log("  WARN: usage 没到，token 数是数块数出来的"); }
   });
 
+  // 身份**有没有真的送出去**。这一条是最要紧的：四路匿名时，会话号照样是四个不同值
+  // （按首问内容各分一个），四路也照样并发——但占的是四段**匿名**对话，认不出也关不掉，
+  // 页面就这么把四个会话全扣在手里，后来的客户端一个都进不来。这个坑真踩过。
+  console.log("\n四路带出去的身份:", JSON.stringify(sentIds));
+  const wantIds = ["web-1", "web-2", "web-3", "web-4"];
+  if (JSON.stringify(sentIds) !== JSON.stringify(wantIds)) {
+    console.log("FAIL: 四路带出去的身份不是 " + JSON.stringify(wantIds)
+                + "（匿名对话会把会话扣住不放，后面的客户端全被堵住）");
+    // 匿名对话**关不掉名字**（它没有名字），所以这一项失败时池子里会留下几个清不掉的
+    // 会话，后面每一次重跑都会撞上它们。把清理办法直接写在这里，省得下一个人从头查。
+    console.log("      清理：读 /v1/pool 的 slots[].key（形如 h:...），"
+                + "逐个 POST /v1/conversations/close {\"key\": ...}；"
+                + "或者用 IDLE_TTL 不为 0 的网关重跑");
+    bad++;
+  }
+
   const sess = panels.map(p => p.kvSession);
   console.log("\n四路落到的会话:", JSON.stringify(sess));
   if (new Set(sess).size !== 4) {
     console.log("FAIL: 四路没有落在四个不同会话上（会退化成串行！）");
     bad++;
   }
+  // 会话池里那四个会话，是不是**记着各自的名字**（光有会话号不够：身份没送出去时
+  // 会话号也是四个不同值，但池子里躺着的是四个 `h:...` 摘要）。
+  const pool = await (await fetch(BASE + "/v1/pool")).json();
+  const holder = {};
+  (pool.slots || []).forEach(s => { holder[s.session] = s.key; });
+  console.log("跑完四路后 /v1/pool 的归属:",
+              JSON.stringify((pool.slots || []).map(s => s.session + "=" + s.key)));
+  panels.forEach((p, i) => {
+    const got = holder[p.kvSession];
+    if (got !== "id:web-" + (i + 1)) {
+      console.log("  FAIL: 面板 %d 占着 s%s，但池子里记的是 %s（该是 id:web-%d）",
+                  i + 1, p.kvSession, JSON.stringify(got), i + 1);
+      bad++;
+    }
+  });
+
   const total = rs.reduce((a, r) => a + (r ? r.tok : 0), 0);
   console.log("合计 " + total + " tok / 墙钟 " + wall.toFixed(1) + "s → 聚合 "
               + (total / wall).toFixed(2) + " tok/s");
   console.log("\n统计行渲染后的全局栏:", byId["gstats"].textContent || byId["gstats"].innerHTML);
+  // 从这里开始验"页面走了以后，会话有没有还回去"。两条路，代码不是同一段：
+  // 关页面走 sendBeacon（beforeunload），点「清空」走 closeConv（fetch）。
+  console.log("");
+
+  // 路一：关页面。这是**最容易出事**的一种——演示完顺手关掉标签页，四个会话就被一个
+  // 已经消失的页面扣着，直到 IDLE_TTL（默认 300 秒）超时。后来的人全堵在队列里，
+  // 而且没有任何地方能看到"是谁占着"（页面都没了）。
+  winListeners["beforeunload"].forEach(function (fn) { fn(); });
+  const afterUnload = await waitReleased();
+  console.log("关页面之后还占着的会话:", JSON.stringify(afterUnload));
+  if (afterUnload.length) {
+    console.log("FAIL: 关页面没把会话还回去（后来的人要等 IDLE_TTL 超时）");
+    bad++;
+  }
+
+  // 路二：点「清空」= 这四段对话不要了。再占一次会话来验，否则上一步已经清干净了，
+  // 这一条会变成"空跑也算过"。
+  await send(panels[0]);
+  document.getElementById("clear")._listeners["click"][0]();
+  const afterClear = await waitReleased();
+  console.log("点「清空」之后还占着的会话:", JSON.stringify(afterClear));
+  if (afterClear.length) {
+    console.log("FAIL: 清空了但会话没还回去（后来的人要等 IDLE_TTL 超时）");
+    bad++;
+  }
+
   console.log(bad ? "\n===== 有 " + bad + " 项 FAIL =====" : "\n===== 全部通过 =====");
   process.exit(bad ? 1 : 0);
 })().catch(e => { console.error("炸了:", e); process.exit(2); });

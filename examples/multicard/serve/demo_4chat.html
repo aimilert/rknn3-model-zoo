@@ -66,8 +66,10 @@ const API = "";                       // 空 = 同源（页面由网关自己发
 const MODEL = "qwen3.5-27b";
 const MAXTOK = 256;
 
-// 四路**故意用四个不同的问题**：网关按对话内容把请求钉到会话上，
-// 首问相同会被当成同一段对话、落到同一个会话上排队——那看起来就是"轮流"而不是并发。
+// 这四问是**四个面板各自的第一问**。它们相同也没关系——四路是四段对话这件事
+// 由显式身份（`web-1`..`web-4`，见 streamChat）保证，不再靠"问题不一样"来区分。
+// （v1.9 之前靠内容区分：网关按 `system + 首问` 认对话，两路问同一句话就会被当成
+// 同一段对话、落到同一个会话上排队——那是"轮流"，不是并发，而且答案全对、看不出来。）
 //
 // 为什么默认问题这么"机械"：这种列举型任务模型会**直接开始输出**，不会先写一大段
 // 思考过程。换成"介绍一下杭州"这类需要组织语言的问题，实测在关思考的软开关下
@@ -102,6 +104,7 @@ function buildPanels() {
 
     const p = {
       el: el,
+      id: i,                   // 面板号，用来生成它的对话身份（见 streamChat 的 convId）
       log: el.querySelector('[data-role=log]'),
       stat: el.querySelector('[data-role=stat]'),
       sess: el.querySelector('[data-role=sess]'),
@@ -160,12 +163,19 @@ function parseKV(s) {
 
 // 一次流式对话的核心：发请求、按 SSE 逐块解析、把增量交给 onDelta。
 // 面板和"单路基线"共用它，免得解析逻辑写两份、改一处忘一处。
-async function streamChat(messages, onDelta) {
+//
+// convId 是**显式身份**（X-Conversation-Id），不是可有可无的装饰：不给身份时网关只能按
+// "system + 首问"的内容摘要认对话，这样造出来的对话**认不出也关不掉**（只能从 /v1/pool
+// 读原始 key 再关），会一直占着会话到 IDLE_TTL 超时。这一页四个面板本来就该是四段对话，
+// 给它一个稳定的名字，是谁、占着哪几个会话、要不要放掉，就都是明面上的事了。
+async function streamChat(messages, onDelta, convId) {
   const t0 = performance.now();
   let ntok = 0, nchunk = 0, answer = "";
+  const headers = { "Content-Type": "application/json" };
+  if (convId) { headers["X-Conversation-Id"] = convId; }
   const res = await fetch(API + "/v1/chat/completions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: headers,
     body: JSON.stringify({
       model: MODEL,
       messages: messages,
@@ -215,6 +225,36 @@ async function streamChat(messages, onDelta) {
   return { tok: tok, el: el, rate: tok / el, text: answer, kv: kv, exact: !!ntok };
 }
 
+// 问完了就主动把会话还回去（POST /v1/conversations/close）。
+// **这不是讲礼貌**：网关只排队、不抢占，一段"问一次就再也不问"的对话如果一直挂着身份，
+// 它占的会话就一直占着，直到 IDLE_TTL（默认 300 秒）超时——排队的人白等五分钟，
+// 而屏幕上一点异常都看不出来（排队在吞吐上是隐形的）。基线正是这种一次性对话。
+// 面板**不调它**：那四段对话留着，下一批就是它们的第二轮，KV 复用演示靠的就是这个。
+async function closeConv(convId) {
+  try {
+    await fetch(API + "/v1/conversations/close", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversation_id: convId }),
+    });
+  } catch (e) { /* 交还失败不影响演示：最坏就是退回"等 TTL 超时"的老行为 */ }
+}
+
+// 关页面 = 这次演示结束了，把五个身份都还回去（四个面板 + 基线）。
+// 用 `sendBeacon` 而**不是** `fetch`：页面正在卸载时 fetch 会被浏览器直接取消，
+// 这段代码就等于没写；sendBeacon 由浏览器代发，是 unload 里唯一靠得住的方式。
+// 只在关页面时还、不在面板跑完就还：同一页里那四段对话是要留着的（第二轮看 KV 复用）。
+// 正文用普通字符串（text/plain）就行——网关的 `_read_json` 只认 Content-Length，
+// 不看 Content-Type；而且这个类型是"安全"的，连预检都不用发。
+window.addEventListener("beforeunload", function () {
+  ["web-1", "web-2", "web-3", "web-4", "web-baseline"].forEach(function (id) {
+    try {
+      navigator.sendBeacon(API + "/v1/conversations/close",
+                           JSON.stringify({ conversation_id: id }));
+    } catch (e) { /* 老浏览器没有 sendBeacon：最坏就是等 TTL 超时，不影响本页演示 */ }
+  });
+});
+
 async function send(p) {
   const text = p.input.value.trim();
   if (!text || p.streaming) { return null; }
@@ -227,6 +267,8 @@ async function send(p) {
   render(p);
   updateGlobal();
   try {
+    // 这一路的名字**必须稳定**："web-1" 永远是这一格。改了名字就是换了对话，
+    // 网关会当成新人重新分会话，多轮的 KV 复用也就没了。
     const r = await streamChat(p.messages, function (soFar, el, n) {
       bubble.textContent = soFar;
       p.log.scrollTop = p.log.scrollHeight;
@@ -235,7 +277,7 @@ async function send(p) {
       } else {
         setStat(p, "⏳ " + el.toFixed(1) + "s · " + n + " 块");
       }
-    });
+    }, "web-" + (p.id + 1));
     const kv = r.kv;
     p.kvSession = kv.session;
     if (kv.session !== undefined) { p.sess.textContent = "会话 " + kv.session; }
@@ -279,18 +321,25 @@ function updateGlobal() {
 // 基线**故意不占任何面板**：它要是走了面板 1，面板 1 就会多出一段历史，
 // 后面"4 路同时提问"就不再是从零开始的四段对话了（而且面板 1 的输入框会被清空，
 // 那一批里它会直接不发）。所以这里单独发一次请求量数，量完就丢。
+//
+// 但"丢"要丢得干净：量完必须 close。只有 4 个会话，基线占着 1 个不还，点「②」时
+// 四路里就有一路拿不到会话，会排到 IDLE_TTL 超时——看起来就是"某一路卡住不动"，
+// 而三条腿的画面最容易被当成"并发坏了"。
 document.getElementById("baseline").addEventListener("click", async function () {
   if (panels.some(function (p) { return p.streaming; })) { return; }
   const el = document.getElementById("gstats");
   el.textContent = "单路基线测量中…（约 20 秒）";
   try {
     const r = await streamChat([{ role: "user", content: "用一句话介绍杭州。" }],
-                               function () {});
+                               function () {}, "web-baseline");
     lastSingleRate = r.rate;
     el.innerHTML = "单路基线：<b>" + r.rate.toFixed(2) + " tok/s</b>（" + r.tok
                  + " tok / " + r.el.toFixed(1) + "s）→ 现在点「② 4 路同时提问」";
   } catch (err) {
     el.textContent = "基线测量失败：" + err.message;
+  } finally {
+    // 失败也要交还：失败的那次如果已经把会话绑上了，不还就是同样堵路。
+    closeConv("web-baseline");
   }
 });
 
@@ -333,6 +382,9 @@ function resetAll() {
     p.stat.textContent = "";
     p.input.value = DEFAULT_Q[i];
     p.lastRate = null;
+    // 「清空」= 这四段对话我不要了。历史已经删了，留着会话也只是占着不放：
+    // 显式交还，后面的人（或下一次演示）立刻能用满 4 个会话。
+    closeConv("web-" + (i + 1));
   });
   lastSingleRate = null;
   updateGlobal();

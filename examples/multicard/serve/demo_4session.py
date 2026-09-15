@@ -9,8 +9,11 @@ http_scaling.py 量的是数，这个脚本要的是**眼睛能看见**：屏幕
 
 三个刻意的设计，都有原因：
 
-1. 每路的首条 user 内容**必须不同**。网关按对话内容把请求钉到会话上，相同 prompt
-   会被当成同一段对话、落到同一个会话上排队——那量到的是"排队"不是"并发"。
+1. **每一路都显式带自己的身份**（`X-Conversation-Id: demo4-<路号>`），而不是靠"首条 prompt
+   不同"去让网关认出这是 4 段对话。内容认对话是**会撞的**：一旦两路问同一句话，它们就是
+   同一段对话、落到同一个会话上排队，而答案全对、肉眼只看得出"这路慢了点"。
+   多人接入时靠内容认身份就是这个下场——这里改用显式身份，既稳当，也是给观众的正面示范。
+   （v1.9 之前靠内容不同，前提是"4 路一定问不一样的话"；现在不依赖这个前提了。）
 2. usage 走 `stream_options.include_usage`（OpenAI 的字段）：拿到的是后端自己数的
    decode token 数，和 http_scaling.py 同一口径。不这么写就只能数 SSE 块，而**块 ≠ token**，
    演示出来的数会和测量脚本对不上。
@@ -55,9 +58,13 @@ def one_stream(i, out, state, lock):
             "stream_options": {"include_usage": True}}
     if NOTHINK:
         body["chat_template_kw"] = {"enable_thinking": False}
-    req = urllib.request.Request(BASE + "/v1/chat/completions",
-                                 data=json.dumps(body).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        BASE + "/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        # 身份显式给（见文件头第 1 条）。注意**基线那一路（N=1）用的是同一个 id**，
+        # 这样"再量 4 路"时它命中同一段对话——仍然是 4 段对话 4 个会话，占比是对的。
+        headers={"Content-Type": "application/json",
+                 "X-Conversation-Id": "demo4-%d" % tag})
     t0 = time.time()
     ntok = 0
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
@@ -185,3 +192,25 @@ print("     聚合 %.2f tok/s   基线 %.2f tok/s   **伸缩 %.2fx**"
       % (agg, base_rate, agg / base_rate))
 print("     单请求延迟 %.1fs → %.1fs（并发不是零代价）"
       % (wall1, sum(r[0] for r in resn) / len(resn)))
+
+
+def close_all():
+    """问完就把这几段对话还回去。
+
+    不做这一步的话，网关会一直替它们占着会话到 `IDLE_TTL` 超时（默认 300 秒）——
+    演示时"再点一次②"就会因为拿不到会话而失败，而且失败的样子是**基线那路报 503**，
+    看起来像并发坏了，其实是上一次自己没走。网关不知道对话什么时候结束，得客户端说。
+    """
+    for tag in range(1, N + 1):
+        try:
+            req = urllib.request.Request(
+                BASE + "/v1/conversations/close",
+                data=json.dumps({"conversation_id": "demo4-%d" % tag}).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10).read()
+        except Exception:                                     # noqa: BLE001
+            pass
+    print("(已交还 %d 段对话的会话，可以直接重跑)" % N)
+
+
+close_all()

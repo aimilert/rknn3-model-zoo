@@ -45,6 +45,19 @@ BACKEND_READY_TIMEOUT = 900.0     # 模型加载约 230-240s，留足余量
 REQUEST_TIMEOUT = 1800.0          # 单轮最长等待（长上下文 prefill 很慢）
 DEFAULT_MAX_NEW_TOKENS = 512
 
+# 会话不够时怎么办。板卡上会话的硬上限实测是 5 个（第 6 个 session_init 在 stage0 失败），
+# 而且只能在启动时建，运行期建不了。所以**同时活跃的对话数**就是并发上限，第 N+1 段对话
+# 只能等——等谁腾出来。
+#
+# 谁腾？一段对话静默超过 IDLE_TTL 就把它的会话收回。这两个默认值是**配对**的：
+# 队列最长也就等到"最闲的那段对话静默满 TTL"，所以 QUEUE_TIMEOUT 要留得比 IDLE_TTL 大，
+# 否则会出现"明明马上就轮到了，请求却先超时报 503"。
+#
+# IDLE_TTL 别调太小：10 个人活跃、只有 5 个会话时，每个人都在 TTL 后被踢掉、又排队等回来，
+# 每一轮都要全量重算 prefill（多花 2~3 秒）。它必须明显大于"正常人相邻两轮之间的间隔"。
+DEFAULT_IDLE_TTL = 300.0          # 秒；0 = 不回收（= 第 N+1 段对话永远排队）
+DEFAULT_QUEUE_TIMEOUT = 600.0     # 秒；排队超过它就返回 503，不要让终端用户干等
+
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>\n"
 # 与 examples/multicard/cpp/main.cc 的 QWEN35_CHAT_TEMPLATE 保持一致：
@@ -298,14 +311,37 @@ class Backend(object):
 # 2. 会话池（粘性 + 前缀校验）
 # ===========================================================================
 
-class Lease(object):
-    __slots__ = ("session", "sent_prompt", "base", "reset")
+_VERBOSE = False        # 由 main() 按 --verbose 置位。模块级，因为会话池拿不到 Gateway
 
-    def __init__(self, session, sent_prompt, base, reset):
+
+def _note(fmt, *args):
+    """会话池的事件（排队、回收）。
+
+    为什么要单独一条日志：**多用户场景下"谁在等、谁被回收了"是唯一能看见调度的地方**。
+    只盯着 tok/s 看不出排队——第 6 个人没拿到会话时他不会变慢，他是拿不到。
+    """
+    if _VERBOSE:
+        sys.stderr.write("[pool] " + (fmt % args) + "\n")
+        sys.stderr.flush()
+
+
+def _key_label(key):
+    """把会话身份缩短，好进日志。显式的 id 原样保留（`id:alice`），内容摘要截断。"""
+    if key is None:
+        return "(anon)"
+    return key if len(key) <= 24 else key[:21] + "..."
+
+
+class Lease(object):
+    __slots__ = ("session", "sent_prompt", "base", "reset", "key", "waited")
+
+    def __init__(self, session, sent_prompt, base, reset, key=None, waited=0.0):
         self.session = session
         self.sent_prompt = sent_prompt
         self.base = base            # acquire 时该会话已知的文本（reset 时为 ""）
         self.reset = reset
+        self.key = key              # 这段对话的身份，release 时要靠它续期
+        self.waited = waited        # 排队等了多久（0 = 没等）
 
 
 class SessionPool(object):
@@ -320,7 +356,8 @@ class SessionPool(object):
         必须 RESET。这一态是踩过坑才加的：见 release() 的注释。
     """
 
-    def __init__(self, backend):
+    def __init__(self, backend, idle_ttl=DEFAULT_IDLE_TTL,
+                 queue_timeout=DEFAULT_QUEUE_TIMEOUT):
         self.backend = backend
         self.n = backend.sessions
         self.cv = threading.Condition()
@@ -328,8 +365,18 @@ class SessionPool(object):
         self.busy = [False] * self.n
         self.dead = [False] * self.n
         self.bound = {}          # conversation key -> session index
-        # bound 的上限：键是"system + 首条 user"的摘要，长期运行的 Agent 会攒很多段
-        # 对话。超了丢最老的（见 acquire）——丢绑定只影响速度，不影响正确性。
+        self.last_used = {}      # conversation key -> 最后一次提问的 monotonic 时刻
+        self.waiting = {}        # conversation key -> 进队列的 monotonic 时刻（仅用于观测）
+        # 空闲回收：一段对话静默超过 idle_ttl 就把它占的会话收回给排队的人。
+        # **这不是优化，是"排队"能成立的前提**：没有它，5 个会话被 5 段对话绑着时第 6 段
+        # 对话永远等不到——网关根本不知道谁"说完了"（客户端不发结束消息，浏览器关了也
+        # 没人通知）。0 或负数 = 不回收（那就等价于第 6 段对话永远排队）。
+        self.idle_ttl = float(idle_ttl or 0)
+        self.queue_timeout = float(queue_timeout)
+        self.reaped = 0          # 累计回收了几次（观测用）
+        # bound 的上限：键是"system + 首条 user"的摘要或被回收之前攒下的对话。有了空闲
+        # 回收，正常情况这张表只装活跃对话；这个上限只是长期运行的安全网——丢绑定只影响
+        # 速度，不影响正确性。
         self.bound_cap = 4096
         backend.on_clear = self._on_clear
 
@@ -357,67 +404,192 @@ class SessionPool(object):
             for key, s in list(self.bound.items()):
                 if s == session:
                     del self.bound[key]
+                    self.last_used.pop(key, None)
             self.cv.notify_all()
 
-    def acquire(self, key, prompt, timeout=REQUEST_TIMEOUT):
-        """返回 Lease；拿不到（全忙/全死）抛 BackendError。"""
+    def _reap_idle_locked(self, now):
+        """把静默超过 TTL 的对话占的会话收回。调用方必须已持 self.cv。
+
+        只收**没在跑**的会话；正在跑的那一轮不能被打断（打断也没意义，它马上就还回来）。
+        回收只解绑 + 作废 known，**不动 KV**——下一个拿到这个会话的对话若前缀对不上，
+        `_make_lease` 自己会 RESET。所以回收本身不会有额外的清 KV 开销。
+        """
+        if self.idle_ttl <= 0:
+            return
+        for k, s in list(self.bound.items()):
+            if self.busy[s]:
+                continue
+            last = self.last_used.get(k, now)
+            if now - last > self.idle_ttl:
+                del self.bound[k]
+                self.last_used.pop(k, None)
+                if 0 <= s < self.n:
+                    self.known[s] = None        # 里面的内容从此未知，下一轮必须 RESET
+                self.reaped += 1
+                _note("会话回收：%s 静默 %.1fs > %.1fs，s%d 交还给排队者"
+                      % (_key_label(k), now - last, self.idle_ttl, s))
+
+    def acquire(self, key, prompt, timeout=None):
+        """返回 Lease；排队超过 timeout 仍拿不到就抛 BackendError。
+
+        **不抢占**：所有会话都被别的对话绑着时，这里只等，不把谁的会话夺过来。
+        抢夺看着"响应快"，代价却是被抢的那段对话下一轮前缀对不上、要全量重算 prefill
+        （多花 2~3 秒），而且**谁被抢取决于请求到达顺序**——同一份脚本时好时坏。
+        等，加上 `_reap_idle_locked` 把真正闲下来的会话交出来，行为才是可预期的。
+        """
+        if timeout is None:
+            timeout = self.queue_timeout
         deadline = time.time() + timeout
+        t_enter = time.time()
+        queued = False
         with self.cv:
             while True:
                 # 优先复用已经绑在这一段对话上的会话：只有它才可能已经有这段历史。
                 cand = self.bound.get(key)
                 if cand is not None and not self.dead[cand] and not self.busy[cand]:
-                    return self._make_lease(cand, prompt)
+                    if queued:
+                        self.waiting.pop(key, None)
+                        _note("排队结束：%s 等了 %.1fs，拿到 s%d"
+                                              % (_key_label(key), time.time() - t_enter, cand))
+                    return self._make_lease(cand, prompt, t_enter, key)
                 if cand is not None and not self.dead[cand]:
                     pass        # 同一段对话的上一轮还在跑：等它，不能换会话
                 else:
-                    # 挑一个空闲会话：优先没装过东西的（省一次 RESET）。unknown（None）
-                    # 排在有内容的前面：反正都要 RESET，清空的会话至少不用先扔垃圾。
+                    # 挑一个空闲会话。**"空闲"不等于"没主"**：会话可能正被另一段对话绑着
+                    # （bound 里挂着），只是它此刻没在跑。把新对话派到那种会话上，两段对话
+                    # 就会钉在同一个会话上——后端同一个会话一次只跑一条，于是它们只能互相
+                    # 等，答案照样对、吞吐掉一半。所以候选里必须排除有主的。
+                    now = time.time()
+                    self._reap_idle_locked(now)
+                    owned = set(self.bound.values())
                     free = [s for s in range(self.n)
-                            if not self.dead[s] and not self.busy[s]]
+                            if not self.dead[s] and not self.busy[s] and s not in owned]
                     if free:
-                        # **空闲不等于没主**：会话可能正被另一段对话绑着（bound 里挂着），
-                        # 只是它此刻没在跑。把新对话派到那种会话上，两段对话就会钉在同一个
-                        # 会话上——后端同一个会话一次只跑一条，于是它们只能互相等，
-                        # 答案照样对、吞吐掉一半。这个退化还**看请求到达顺序**：谁先抢到
-                        # 谁的绑定就赢，所以同一份脚本会时好时坏（实测同一构建同一脚本
-                        # 量到过 3.40x，也量到过 1.90x / 1.00x）。判据必须包含"有没有主"，
-                        # 不能只看 busy。
-                        owned = set(self.bound.values())
-                        candidates = [s for s in free if s not in owned] or free
-                        best = min(candidates, key=lambda s: (self.known[s] is not None,
-                                                              s))
+                        # 优先没装过东西的（省一次 RESET）：unknown（None）排在有内容的前面，
+                        # 反正都要 RESET，清空的会话至少不用先扔垃圾。
+                        best = min(free, key=lambda s: (self.known[s] is not None, s))
+                        if queued:
+                            self.waiting.pop(key, None)
+                            _note("排队结束：%s 等了 %.1fs，拿到 s%d"
+                                                  % (_key_label(key), time.time() - t_enter, best))
+                        # key 是 None（请求里既没有 conversation_id 也没有 user，连一条
+                        # user 消息都没有 => conversation_key 返回 None）= **无身份的请求，
+                        # 不能记绑定**。记了的话所有匿名请求都会共用 bound[None] 这一个
+                        # 条目，于是它们全被钉到同一个会话上互相等——两段素不相识的对话
+                        # 排成一队，正是这个池子存在的意义反面。
                         if key is not None:
-                            # 抢占（所有空闲会话都有主时才会走到）：把旧主人解绑，
-                            # 否则它下一轮还会回到这个会话上，重新变成上面那种互相等。
-                            # 解绑只是让它下次重新挑会话（多一次 RESET），不影响正确性。
-                            for k, s in list(self.bound.items()):
-                                if s == best and k != key:
-                                    del self.bound[k]
                             self.bound[key] = best
+                            self.last_used[key] = now
                             if len(self.bound) > self.bound_cap:
-                                # 这个表会长到跟对话数一样大（键是"system + 首条 user"
-                                # 的摘要）。丢掉最老的绑定只让那段对话下次重新挑会话，
-                                # 正确性不受影响；不丢就是一条随对话数线性增长的慢泄漏。
-                                self.bound.pop(next(iter(self.bound)))
-                        return self._make_lease(best, prompt)
+                                # 安全网，正常有回收就走不到。丢绑定只让那段对话下次重新
+                                # 挑会话，正确性不受影响；不丢就是一条随对话数线性增长的
+                                # 慢泄漏。
+                                oldest = next(iter(self.bound))
+                                self.bound.pop(oldest)
+                                self.last_used.pop(oldest, None)
+                        return self._make_lease(best, prompt, t_enter, key)
                 if time.time() >= deadline:
-                    raise BackendError("no session available within %.0fs "
-                                       "(all %d busy or dead)" % (timeout, self.n))
-                self.cv.wait(min(1.0, max(0.05, deadline - time.time())))
+                    self.waiting.pop(key, None)
+                    raise BackendError(
+                        "no session available: all %d sessions are bound to other "
+                        "conversations (waited %.0fs; idle_ttl=%.0fs). Retry later or "
+                        "reuse a conversation_id that already has a session."
+                        % (self.n, timeout, self.idle_ttl))
+                if not queued:
+                    queued = True
+                    self.waiting[key] = t_enter
+                    _note("进入排队：%s 等空闲会话（当前 %d/%d 被占，"
+                                          "队列 %d 人）"
+                                          % (_key_label(key), len(self.bound), self.n,
+                                             len(self.waiting)))
+                # 唤醒间隔取小值：等待期间会有别人 release / 到点该回收，靠它重查。
+                self.cv.wait(min(0.5, max(0.05, deadline - time.time())))
 
-    def _make_lease(self, session, prompt):
+    def close(self, key):
+        """客户端主动说"这段对话结束了"：立刻把会话交还给池子。
+
+        为什么必须有这个口子：网关**不知道一段对话什么时候结束**（客户端不发关闭消息），
+        所以只能靠 `IDLE_TTL` 超时回收。对"来问一句就走"的客户端（脚本、Agent）这很糟：
+        他一个人连着问 4 个不相干的问题，就占满 4 个会话、把后面所有人挡在队列里
+        **整整一个 IDLE_TTL**。排队策略要想在真实使用里成立，就得有一条"我走了"的路。
+
+        返回放掉的 session 号；`None` = 这段对话本来就没有会话（幂等，重复 close 不报错）。
+        `busy` 时抛 `BackendError`（这一轮还在跑，不能抽走它脚下的会话；等它答完再来）。
+        """
+        if key is None:
+            raise BackendError("no conversation id given")
+        with self.cv:
+            s = self.bound.get(key)
+            if s is None:
+                return None
+            if self.busy[s]:
+                raise BackendError("conversation is still generating; retry after it "
+                                   "finishes")
+            del self.bound[key]
+            self.last_used.pop(key, None)
+            if 0 <= s < self.n:
+                # 内容从此未知：下一个拿到它的人必须 RESET，否则会把新 prompt 追加在
+                # 上一段对话的 KV 后面（= 坑 1 那个"两份历史"）。**不能写 ""**。
+                self.known[s] = None
+            self.cv.notify_all()
+            _note("会话交还：%s 放掉 s%d" % (_key_label(key), s))
+            return s
+
+    def snapshot(self):
+        """给 `GET /v1/pool` 看的一眼状态：谁占着哪个会话、谁在等。
+
+        为什么需要它：多用户场景下"第 6 个人在排队"这件事**从吞吐上是看不出来的**
+        ——他没拿到会话，不是变慢了。终端用户和排障的人都得有个地方能看。
+        """
+        now = time.time()
+        with self.cv:
+            by_sess = {}
+            for k, s in self.bound.items():
+                by_sess[s] = k
+            slots = []
+            for s in range(self.n):
+                k = by_sess.get(s)
+                slots.append({
+                    "session": s,
+                    "state": ("dead" if self.dead[s] else
+                              "busy" if self.busy[s] else
+                              "idle" if k is not None else "free"),
+                    # null = 没人占（不要写成字符串 "(anon)"，那看起来像"有个叫 anon 的
+                    # 用户在占着"，正交性会丢）
+                    "conversation": None if k is None else _key_label(k),
+                    # 原始键。`conversation` 是给人看的（长了会截断），这个是给机器用的：
+                    # 匿名对话（`h:...`）的键客户端算不出来，只能从这儿读出来，再用
+                    # `POST /v1/conversations/close {"key": ...}` 把它放掉。没有这一条，
+                    # 一段匿名对话会一直占到 IDLE_TTL 超时——**看得到却踢不掉**。
+                    "key": k,
+                    "idle_s": (round(now - self.last_used.get(k, now), 1)
+                               if k is not None and not self.busy[s] else None),
+                })
+            waiting = [{"conversation": _key_label(k), "waited_s": round(now - t, 1)}
+                       for k, t in sorted(self.waiting.items(), key=lambda kv: kv[1])]
+            return {
+                "sessions": self.n,
+                "idle_ttl_s": self.idle_ttl,
+                "queue_timeout_s": self.queue_timeout,
+                "reaped_total": self.reaped,
+                "slots": slots,
+                "waiting": waiting,
+            }
+
+    def _make_lease(self, session, prompt, t_enter=None, key=None):
         self.busy[session] = True
+        waited = max(0.0, time.time() - t_enter) if t_enter else 0.0
         base = self.known[session]
         if base and prompt.startswith(base):
-            return Lease(session, prompt[len(base):], base, False)
+            return Lease(session, prompt[len(base):], base, False, key=key, waited=waited)
         # 复用不了，两种情况必须分开：
         #   base 非空但前缀对不上 => 里面确实装着别的对话，必须 RESET，否则这次的全量
         #     prompt 会**追加**在旧上下文后面，模型看到两份历史；
         #   base 是 None（清过 KV，内容未知）=> 同样必须 RESET。这里不能写成
         #     `bool(base)`：None 和 "" 都是假值，会把"未知"当"空"处理，正好踩中
         #     上面那个追加的坑。
-        return Lease(session, prompt, "", base is None or bool(base))
+        return Lease(session, prompt, "", base is None or bool(base),
+                     key=key, waited=waited)
 
     def release(self, lease, generated_text, was_cleared):
         """本轮结束后，把「KV 里现在确定装着什么」写回去。
@@ -443,6 +615,10 @@ class SessionPool(object):
                 else:
                     self.known[s] = lease.base + lease.sent_prompt + generated_text
                 self.busy[s] = False
+            # 续期：TTL 数的是"这段对话多久没提问了"，所以在这一轮**开始和结束**都刷新。
+            # 只刷开始的话，一轮跑很久（长上下文几十秒）会被自己在跑到一半时判成空闲。
+            if lease.key is not None and lease.key in self.bound:
+                self.last_used[lease.key] = time.time()
             self.cv.notify_all()
 
 
@@ -624,7 +800,10 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in CORS_HEADERS.items():
             self.send_header(k, v)
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # X-Conversation-Id 必须列进来，否则浏览器里发这个头会被预检拦掉（curl/python
+        # 不发预检，所以这个问题只在网页端现形，很容易查错方向）。
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, X-Conversation-Id")
         self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -657,19 +836,71 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/demo", "/demo_4chat.html"):
             return self._static_demo()
         if path in ("/health", "/healthz"):
+            pool = self.gateway.pool.snapshot()
             return self._json(200, {"status": "ok",
                                     "model": MODEL_ID,
                                     "sessions": self.gateway.backend.sessions,
+                                    # 会话全被占 + 有人在等 = 到上限了。放进 /health 是因为
+                                    # 监控/看护脚本本来就在轮询这个端点，不必再教它一个新路径。
+                                    "sessions_busy": sum(1 for s in pool["slots"]
+                                                         if s["state"] == "busy"),
+                                    # busy + idle = 有主的（free 才是没人占；dead 的会话
+                                    # 在 mark_dead 里已经被解绑了，所以不会是 dead+有主）
+                                    "sessions_bound": sum(1 for s in pool["slots"]
+                                                          if s["state"] in ("busy", "idle")),
+                                    "waiting": len(pool["waiting"]),
                                     "uptime_s": round(time.time() - self.gateway.started_at, 1)})
+        if path == "/v1/pool":
+            # 非 OpenAI 标准端点，纯观测：谁占着哪个会话、闲了多久、谁在排队。
+            return self._json(200, self.gateway.pool.snapshot())
         if path == "/v1/models":
             return self._json(200, {"object": "list", "data": [{
                 "id": MODEL_ID, "object": "model",
                 "created": int(self.gateway.started_at), "owned_by": "local"}]})
         return self._error(404, "unknown path: %s" % path)
 
+    def _close_conversation(self):
+        """`POST /v1/conversations/close`：把这段对话占的会话立刻交还（不等 `IDLE_TTL`）。
+
+        body 给 `conversation_id`（或 `user`），或只给 `X-Conversation-Id` 头——与
+        `/v1/chat/completions` 同一套身份优先级。
+
+        **匿名对话要用 `key` 关**（`{"key": "h:faa51b39..."}`，键从 `GET /v1/pool` 的
+        `slots[].key` 读）：匿名请求的身份是网关按 system+首问算的内容摘要，客户端自己
+        算不出来，不给它一条路的话那段对话会一直占到 `IDLE_TTL` 超时。**只给了身份没法
+        关的那种情况**（既没 id 也没 key）回 400，把原因写清楚，别让人以为是网关坏了。
+        """
+        req = self._read_json()
+        if req is None:
+            req = {}
+        raw_key = req.get("key")
+        explicit = (req.get("conversation_id")
+                    or self.headers.get("X-Conversation-Id")
+                    or req.get("user"))
+        if raw_key:
+            key = str(raw_key)
+        elif explicit:
+            key = conversation_key([], explicit=explicit)
+        else:
+            return self._error(400, "conversation_id (or X-Conversation-Id / user) is "
+                                    "required; anonymous conversations must be closed by "
+                                    "their raw `key` from GET /v1/pool, because their id "
+                                    "is derived from message content")
+        try:
+            session = self.gateway.pool.close(key)
+        except BackendError as exc:
+            return self._error(409, str(exc), "server_error")
+        self.gateway.log("close: %s -> %s", explicit or key, session)
+        return self._json(200, {"conversation_id": str(explicit) if explicit else None,
+                                "key": key,
+                                "closed": session is not None,
+                                "session": session})
+
     def do_POST(self):
         self._responded = False
         path = self.path.split("?")[0]
+        if path == "/v1/conversations/close":
+            return self._close_conversation()
         if path != "/v1/chat/completions":
             return self._error(404, "unknown path: %s" % path)
         req = self._read_json()
@@ -684,8 +915,16 @@ class Handler(BaseHTTPRequestHandler):
         ctk = req.get("chat_template_kw") or {}
         enable_thinking = ctk.get("enable_thinking") if isinstance(ctk, dict) else None
         prompt = render_messages(messages, enable_thinking=enable_thinking)
+        # 会话身份，优先级从高到低：
+        #   1. 请求体的 conversation_id —— 本项目自己的扩展，语义最明确
+        #   2. X-Conversation-Id 请求头 —— 同上，给不方便改 body 的客户端
+        #   3. OpenAI 标准的 user 字段 —— 多用户场景直接写用户名就行，不用教调用方新东西
+        #   4. 都没有 => 退回"按 system + 首条提问做摘要"
+        # 第 4 条在多人场景下**是会撞的**：两个人问同一句话就是同一段对话，会被钉到同一个
+        # 会话上串行（答案照对，吞吐掉一半）。所以多人接入时务必显式给前三者之一。
         key = conversation_key(messages, explicit=req.get("conversation_id")
-                               or self.headers.get("X-Conversation-Id"))
+                               or self.headers.get("X-Conversation-Id")
+                               or req.get("user"))
         self.gateway.log("chat: %d messages, %d prompt bytes, stream=%s, max_new=%d",
                          len(messages), len(prompt.encode("utf-8")), stream, max_new)
 
@@ -1067,13 +1306,21 @@ def selftest(backend, pool):
         上游改动而失去意义（本次就撞上了：加了"优先挑没主的会话"之后，原断言里"所有
         会话都脏"这个前提不成立了）。显式摆状态，测试才是在测它声称要测的东西。
         """
-        saved = (list(pool.known), dict(pool.bound))
+        saved = (list(pool.known), dict(pool.bound), dict(pool.last_used),
+                 list(pool.busy), pool.idle_ttl)
         pool.known = list(known)
         pool.bound = dict(bindings or {})
+        # last_used 必须一起清：空闲回收（reap）是按它判定的，留着上一段的时刻会让
+        # "某段对话静默了多久"变成一个随执行顺序变化的量，断言就失去意义了。
+        # 清空之后 reap 里的 `last_used.get(k, now)` 会给所有 key 默认"刚刚才用过"，
+        # 于是只有测试显式往前拨过的那些 key 会被回收——这正是我们要的确定性。
+        pool.last_used = {}
         return saved
 
     def restore(saved):
-        pool.known, pool.bound = list(saved[0]), dict(saved[1])
+        (pool.known, pool.bound, pool.last_used,
+         pool.busy, pool.idle_ttl) = (list(saved[0]), dict(saved[1]), dict(saved[2]),
+                                      list(saved[3]), saved[4])
 
     # 初态：每个会话都"清过 KV、内容未知"（实测里这是常态——每次 RESET 都伴随 CLEAR），
     # 且没有任何绑定。
@@ -1108,15 +1355,109 @@ def selftest(backend, pool):
     check("新对话没有落到 owner-x 占着的会话上（s0）",
           lease_y.session != 0 or pool.n == 1,
           "新对话拿到 s%d（共 %d 个会话）" % (lease_y.session, pool.n))
-    # 抢占路径：所有会话都有主时，新对话必须还能拿到会话，并且把旧主人解绑——
-    # 不解绑的话旧对话下一轮又会回到那个会话，重新变成上面那种互相等。
+    # 上限路径：所有会话都有主时，新对话**排队等**，不许把谁的会话夺过来。
+    # 这条以前断言的是相反的（"仍能派活且旧主人被解绑"）——那时的取舍是"响应快"，
+    # 代价是被抢的那段对话下一轮前缀对不上、要全量重算，而且谁被抢**取决于请求到达
+    # 顺序**。现在改成可预期的排队：等 + 空闲回收（见下一条）。
     arrange([None] * pool.n, dict(("fill-%d" % i, i) for i in range(pool.n)))
-    lease_z, _ = pool_turn("intruder", render_messages([{"role": "user", "content": "来抢"}]))
-    owners_of_z = [k for k, s in pool.bound.items() if s == lease_z.session]
-    check("会话全都有主时仍能派活，且旧主人被解绑",
-          owners_of_z == ["intruder"],
-          "s%d 的主人 %r（原主 fill-0..%d）"
-          % (lease_z.session, owners_of_z, pool.n - 1))
+    before = dict(pool.bound)
+    try:
+        pool.acquire("intruder", render_messages([{"role": "user", "content": "来抢"}]),
+                     timeout=0.3)
+        check("会话全都有主时排队等待（不抢占）", False, "竟然拿到了会话")
+    except BackendError as exc:
+        check("会话全都有主时排队等待（不抢占）",
+              dict(pool.bound) == before and "no session available" in str(exc),
+              "超时报错且绑定未变（%d 个会话全都有主）" % pool.n)
+    check("排队失败后不留残留", "intruder" not in pool.waiting and "intruder" not in pool.bound)
+
+    # 空闲回收：一段对话静默超过 TTL，它的会话要交出来——**这是"排队"能结束的唯一机制**，
+    # 没有它，第 N+1 段对话永远等不到（网关不知道谁"说完了"，客户端不发结束消息、浏览器
+    # 关了也没人通知）。构造：所有会话都有主 + 显式把 fill-0 的"最后提问时刻"往前拨。
+    saved_ttl, saved_reaped = pool.idle_ttl, pool.reaped
+    pool.idle_ttl = 0.2
+    pool.last_used["fill-0"] = time.time() - 10.0
+    # 这里直接 acquire 而不是 pool_turn：要断言的 reset/known 是 **acquire 那一刻**的状态，
+    # pool_turn 会顺手 release 掉，把 known 又写成确定值，断言就落空了。
+    lease_w = pool.acquire("waiter", render_messages([{"role": "user", "content": "轮到我了吗"}]))
+    check("静默超时的对话被回收，排队的立刻拿到会话",
+          pool.reaped == saved_reaped + 1 and "fill-0" not in pool.bound
+          and lease_w.waited < 1.0,
+          "reaped %d->%d，waiter 等了 %.2fs 拿到 s%d"
+          % (saved_reaped, pool.reaped, lease_w.waited, lease_w.session))
+    check("回收后该会话内容未知 => 强制 RESET（否则新对话的全量 prompt 会追加在旧上下文后）",
+          lease_w.reset is True and pool.known[lease_w.session] is None,
+          "known=%r reset=%s" % (pool.known[lease_w.session], lease_w.reset))
+    pool.release(lease_w, "", True)
+    # 回收只影响**闲着的**那段对话。正在跑的那一轮不能被收走：收走也没用（它马上
+    # 就还回来），只会让它在跑到一半时被判成"空闲"、正跑着的 KV 被标成"内容未知"。
+    s1_busy = pool.bound["fill-1"]
+    pool.last_used["fill-1"] = time.time() - 10.0
+    pool.busy[s1_busy] = True
+    n_reaped = pool.reaped
+    with pool.cv:
+        pool._reap_idle_locked(time.time())
+    pool.busy[s1_busy] = False
+    check("正在跑的会话不被回收",
+          pool.reaped == n_reaped and "fill-1" in pool.bound,
+          "fill-1 在 s%d 上跑着，仍在 bound 里" % s1_busy)
+    pool.idle_ttl = saved_ttl
+
+    # 无身份的请求（key=None）**不许记绑定**：记了的话 bound[None] 只有一条，所有匿名
+    # 请求都会读到它，于是素不相识的几段对话被钉到同一个会话上互相等——正好是这个池子
+    # 存在的意义的反面。这条是差点被我改丢的：原来的代码有 `if key is not None`，
+    # 重写排队逻辑时漏了，而漏了它**不会报任何错**，只是并发静默退化。
+    arrange([None] * pool.n)
+    lease_n1 = pool.acquire(None, render_messages([{"role": "user", "content": "匿名甲"}]))
+    pool.release(lease_n1, "", True)
+    lease_n2 = pool.acquire(None, render_messages([{"role": "user", "content": "匿名乙"}]))
+    pool.release(lease_n2, "", True)
+    check("无身份的请求不记绑定（否则所有匿名请求会共用一个会话）",
+          None not in pool.bound and lease_n1.session != lease_n2.session,
+          "bound 里没有 None；两次匿名请求落在 s%d / s%d"
+          % (lease_n1.session, lease_n2.session))
+
+    # 主动交还（`POST /v1/conversations/close`）：客户端说"我走了"，会话立刻回到池子里，
+    # 不用等 IDLE_TTL。这是"排队"在真实使用里能成立的前提之一——否则一个连着问 4 个
+    # 不相干问题的脚本会把 4 个会话全占住，后面的人等满一个 TTL。
+    arrange([None] * pool.n)
+    lease_c = pool.acquire("alice", render_messages([{"role": "user", "content": "甲"}]))
+    pool.release(lease_c, "答完了", True)
+    s_alice = lease_c.session
+    check("交还前：这段对话占着会话", pool.bound.get("alice") == s_alice,
+          "alice 在 s%d" % s_alice)
+    got = pool.close("alice")
+    check("close 放掉了它占的会话", got == s_alice and "alice" not in pool.bound
+          and pool.last_used.get("alice") is None,
+          "关闭返回 s%s，bound=%s" % (got, dict(pool.bound)))
+    check("交还后内容标成未知（下一个拿到的人必须 RESET，不能把新 prompt 追加在旧 KV 后）",
+          pool.known[s_alice] is None, "known[s%d]=%r" % (s_alice, pool.known[s_alice]))
+    check("重复 close 是幂等的（返回 None，不报错）", pool.close("alice") is None)
+    # 交还之后，**新的**对话应该能立刻拿到这个会话，而不是排队等 TTL
+    saved_ttl2 = pool.idle_ttl
+    pool.idle_ttl = 999.0          # 关掉回收：这里要证明的是 close 起了作用，不是 TTL 起了作用
+    pool.busy = [False] * pool.n   # 其余会话都装成"忙"，只留 s_alice 一个是空的
+    for s in range(pool.n):
+        if s != s_alice:
+            pool.busy[s] = True
+    t0c = time.time()
+    lease_d = pool.acquire("bob", render_messages([{"role": "user", "content": "乙"}]))
+    check("交还出来的会话能被新对话立刻拿到（不用等 TTL）",
+          lease_d.session == s_alice and lease_d.waited < 0.5,
+          "bob 等了 %.2fs 拿到 s%d" % (lease_d.waited, lease_d.session))
+    # 正在跑的那一轮**不许**被抽走会话：那会让它脚下的 KV 被下一个人 RESET 掉。
+    pool.busy[lease_d.session] = True
+    try:
+        pool.close("bob")
+        busy_refused = False
+    except BackendError:
+        busy_refused = True
+    pool.busy[lease_d.session] = False
+    check("正在生成时 close 被拒（不能抽走跑着的会话）",
+          busy_refused and pool.bound.get("bob") == lease_d.session)
+    pool.release(lease_d, "", True)
+    pool.idle_ttl = saved_ttl2
+    restore(saved)
 
     print("== RESET 语义 ==")
     q = backend.submit(render_messages([{"role": "user", "content": "你好"}]), 8,
@@ -1160,12 +1501,22 @@ def selftest(backend, pool):
 # ===========================================================================
 
 def main():
+    global _VERBOSE
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--sessions", type=int, default=4,
                     help="期望的会话数；与后端 READY 报的对不上就退出")
     ap.add_argument("--backend-log", default="gateway_backend.log")
+    ap.add_argument("--idle-ttl", type=float, default=DEFAULT_IDLE_TTL,
+                    help="一段对话静默超过这么多秒就把它占的会话收回给排队者"
+                         "（0 = 不回收，等于第 N+1 段对话永远排队）。默认 %.0f"
+                         % DEFAULT_IDLE_TTL)
+    ap.add_argument("--queue-timeout", type=float, default=DEFAULT_QUEUE_TIMEOUT,
+                    help="取不到会话时最多排队等这么多秒，超了返回 503。"
+                         "默认 %.0f；应大于 --idle-ttl，否则会出现"
+                         "「马上就要轮到了，请求却先超时」"
+                         % DEFAULT_QUEUE_TIMEOUT)
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--selftest", action="store_true",
                     help="只验帧协议（不起 HTTP），用于把 C++ 侧和 HTTP 侧分开定位")
@@ -1181,6 +1532,7 @@ def main():
     demo_argv = argv[cut + 1:]
     if not demo_argv:
         ap.error("empty backend command after '--'")
+    _VERBOSE = bool(args.verbose)
 
     backend = Backend(demo_argv, args.backend_log,
                       frame_fd="stdout" if args.frames_stdout else None)
@@ -1196,7 +1548,10 @@ def main():
         print("[gateway] warning: --sessions %d but backend reports %d"
               % (args.sessions, backend.sessions), file=sys.stderr)
 
-    pool = SessionPool(backend)
+    pool = SessionPool(backend, idle_ttl=args.idle_ttl, queue_timeout=args.queue_timeout)
+    print("[gateway] 会话调度: 最多 %d 段对话同时活跃，多的排队；"
+          "静默 %.0fs 回收，排队 %.0fs 未轮到则返回 503"
+          % (backend.sessions, pool.idle_ttl, pool.queue_timeout), flush=True)
     try:
         if args.selftest:
             return selftest(backend, pool)

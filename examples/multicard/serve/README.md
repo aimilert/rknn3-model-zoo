@@ -27,6 +27,7 @@
 | `nothink_check.py` | 关思考（`enable_thinking=false`）下的粘性复用回归 |
 | `http_scaling.py` | HTTP 层并发伸缩（自研门面存在的唯一理由） |
 | `determinism_probe.py` | 记录"贪婪解码不可逐字节复现"这个事实，供验收标准参考 |
+| `demo_multiuser.py` | **多用户接入**演示：N 个用户各带身份从终端提问，超过会话数的排队 |
 | `fake_backend.py` | 假后端，本地无板卡时跑网关回归（Windows 上用它，`pass_fds` 不可用） |
 
 ## 起服务
@@ -47,14 +48,85 @@ MODEL_DIR=<模型目录> \
 
 环境变量（都有默认值，见脚本头部注释）：`INSTALL_DIR`（含后端二进制与 `lib/`）、
 `MODEL_DIR`、`GATEWAY_DIR`、`B`（后端二进制名）、`NSESSION`（默认 4）、`PORT`（默认 8080）、
-`NP`（每轮 max_new_tokens 默认值）、`HOST`（默认 `0.0.0.0`）、`LOG`。
+`NP`（每轮 max_new_tokens 默认值）、`HOST`（默认 `0.0.0.0`）、`LOG`、
+`IDLE_TTL`（默认 300，一段对话静默这么久就把它占的会话收回给排队者；0=不回收）、
+`QUEUE_TIMEOUT`（默认 600，取不到会话时最多排队等这么久，超了返回 503；要大于 `IDLE_TTL`）。
+
+`NSESSION` 的硬上限是 **5**（第 6 个会话在 stage0 就起不来），而且会话**只在启动时**创建，
+运行时不新建。所以"同时能服务多少人"= `NSESSION`，多出来的人在队列里等。
 
 ## 接口
 
-- `GET /health` → `{"status":"ok","model":...,"sessions":N,"uptime_s":...}`
+- `GET /health` → `{"status":"ok","model":...,"sessions":N,"sessions_busy":b,"sessions_bound":k,"waiting":w,"uptime_s":...}`
 - `GET /v1/models` → OpenAI 格式的模型列表
 - `POST /v1/chat/completions` → 兼容 OpenAI；`stream: true` 走 SSE，`stream: false` 一次性返回
+- `GET /v1/pool` → 会话池快照，**多用户场景诊断用**（见下）
+- `POST /v1/conversations/close` → **"这段对话说完了"**：立刻把它占的会话交还给排队者（见下）
 - `GET /`、`GET /demo` → 网页演示页（网关把同目录的 `demo_4chat.html` 读出来发出去）
+
+### 多用户：会话是按「身份」分的，不是按内容
+
+网关默认按 `sha1(system + 首条 user 内容)` 认对话。多人接入时这**不够用**：两个人问同一句话
+会撞成同一段对话、被钉在同一个会话上串行——答案全对，但吞吐掉一大截，从输出上看不出来。
+所以每个用户必须把自己的身份显式给出来，三选一（优先级从高到低）：
+
+| 位置 | 例子 | 说明 |
+|---|---|---|
+| 请求体 `conversation_id` | `"conversation_id": "alice"` | 最直观 |
+| 请求头 `X-Conversation-Id` | `-H 'X-Conversation-Id: alice'` | 不改 body 就能加，终端用户推荐 |
+| 请求体 `user` | `"user": "alice"` | OpenAI 的既有字段，兼容用 |
+
+```sh
+# 两个用户各自接入，各占一个会话（不传身份的话这两个请求会被当成同一段对话）
+curl -N -s http://<板卡>:8080/v1/chat/completions -H 'X-Conversation-Id: alice' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5-27b","messages":[{"role":"user","content":"你好"}],"stream":true}'
+
+curl -N -s http://<板卡>:8080/v1/chat/completions -H 'X-Conversation-Id: bob' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5-27b","messages":[{"role":"user","content":"你好"}],"stream":true}'
+```
+
+调度规则（`NSESSION` 个会话，第 N+1 个人来了怎么办）：
+
+- 有会话空闲 → 立刻给，并**记住这个身份以后就归它**；同一身份的后续轮次继续用它（KV 复用）。
+- 全都有主且都在跑、或全都被别的身份占着 → **排队**，不抢占。抢占要付的代价是把受害者
+  的 KV 丢掉（它下一轮要重新 prefill），而且**抢谁取决于到达顺序**，同一份代码能测出
+  3.40×/1.90×/1.00× 三种结果——演示场合最不该有的就是这种不确定性。
+- 一段对话静默超过 `IDLE_TTL` → 它占的会话被收回给排队者。被收回的人下次提问前缀对不上，
+  会走一次 RESET + 完整 prefill（多约 2–3 秒），**正确性不受影响**（上下文一直在客户端手上）。
+- 排队超过 `QUEUE_TIMEOUT` → 返回 **503** + `Retry later or reuse a conversation_id...`，
+  不让终端用户无限期干等。
+
+**说完了要说一声**：网关**不知道**一段对话什么时候结束（客户端不发结束消息，浏览器关了也没人
+通知），所以默认只能靠 `IDLE_TTL` 超时回收。这对"来问一句就走"的客户端很糟——一个脚本连问
+4 个不相干的问题就把 4 个会话占满，把后面所有人挡在队列里整整一个 `IDLE_TTL`。所以有这个端点：
+
+```sh
+curl -s http://<板卡>:8080/v1/conversations/close -H 'Content-Type: application/json' \
+     -d '{"conversation_id": "alice"}'
+# → {"conversation_id": "alice", "key": "id:alice", "closed": true, "session": 0}
+```
+
+返回的 `closed` 为 `false` 表示这段对话本来就没占着会话（**幂等**，重复调不报错）。
+这一轮还在生成时返回 **409**（不能抽走跑着的会话脚下的 KV）。
+
+`GET /v1/pool` 就是在多用户场景下回答"现在是谁在占着、谁在排队"的——**排队在吞吐上看不出来**，
+排队的人不是变慢了，是还没拿到：
+
+```json
+{"sessions": 4, "idle_ttl_s": 300.0, "queue_timeout_s": 600.0, "reaped_total": 2,
+ "slots": [{"session": 0, "state": "busy", "conversation": "id:alice", "key": "id:alice", "idle_s": null},
+           {"session": 1, "state": "free", "conversation": null, "key": null, "idle_s": null}],
+ "waiting": [{"conversation": "id:dave", "waited_s": 12.4}]}
+```
+
+`state` 是 `busy` / `idle`（有主但现在没在跑）/ `free`（无主）。
+`conversation` 是给人看的标签（长了会截断），`key` 是**原始键**——两者都要有，因为
+**匿名对话只能用 `key` 关**（那种对话的身份是网关按 `system + 首问` 算出来的摘要，客户端自己
+算不出来）：`curl -d '{"key": "h:faa51b39..."}' .../v1/conversations/close`。
+没有这条，"谁占着"看得见却踢不掉。**多人接入还是显式给身份最省事**——匿名对话既认不出也关不掉，
+只能等 `IDLE_TTL`。
 
 浏览器跨域是通的：网关对 `OPTIONS` 预检回 204，响应上带 `Access-Control-Allow-Origin: *`
 和 `Access-Control-Expose-Headers: X-KV-Reuse`（**没有最后这个头，前端读不到 `X-KV-Reuse`**，
@@ -80,6 +152,7 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
 
 - **多轮会话粘性**：`messages` 里带上完整历史即可，网关按历史自动把同一段对话钉在同一个会话上，
   跨轮只给后端发**差异部分**（KV 复用）。想强制不复用就换一段全新的对话（首条 user 内容不同）。
+  **多人接入时不要靠内容认对话**，用上面的 `X-Conversation-Id` 显式给身份。
 - **`X-KV-Reuse` 响应头**：`session=<i>; reset=<0|1>; sent=<n>; base=<n>; full=<n>`——
   复用有没有生效只看这里。**答案正确但慢 3~4 倍**这类问题，正确性测试抓不到，全靠这个头。
 
@@ -87,9 +160,24 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
 
 - **没有鉴权**。`HOST=0.0.0.0` 时局域网内谁能连上谁就能用满全部算力；Agent 跑在板卡本机时
   建议 `HOST=127.0.0.1`。要对外提供服务请自行加反向代理鉴权。
+  **排队策略也架不住这一点**：网关只能按请求上带的身份分会话，没有任何办法核实身份是真的。
+  一个客户端只要用 5 个不同的 `X-Conversation-Id` 各发一次，就能占满全部会话，
+  让后来的人（包括真人）在队列里等到 `QUEUE_TIMEOUT`。**"超过 5 个排队"只在参与者都守规矩时成立。**
+- **排队的公平性是"先到先得"，但不保证严格顺序**：醒来后谁先抢到锁谁先拿，同一批排队的
+  用户完成顺序可能与到达顺序不同（实测 5 人 2 会话时是 u3/u5/u4）。不承诺 FIFO 严格性。
+- **`IDLE_TTL=0` = 永不回收**（诊断/压测用得着，见测试一节）。这时唯一能释放会话的手段
+  就是 `POST /v1/conversations/close`；用匿名对话的客户端**没有**这个手段，会话会被它占到
+  网关重启。默认值是 300，不要为了"省事"把它设成 0 跑多人场景。
+- **匿名对话占住的会话认得出、踢得掉，但不是常规操作**：得从 `/v1/pool` 读 `key` 再 close。
+  按 `conversation_id` 关不掉匿名对话——它没有 id。这是"多人接入应该显式给身份"最硬的理由。
 - **CORS 是 `Access-Control-Allow-Origin: *`**（为了演示页开箱能跑）。它不加"谁能访问"这层
   限制——没有鉴权时本来就谁都能访问——但它意味着**任何网页**都能在访客的浏览器里驱动
   这块板卡。只在受控内网里跑演示，别把这个端口暴露到不可信网络。
+- **演示页开着时占着 4 个会话**（`demo_4chat.html`，身份 `web-1` … `web-4`）。这是有意的：
+  同一页里再点一次「②」就是这四段对话的第二轮，KV 复用演示靠它们活着。点「清空」或
+  **关掉标签页**会交还（后者走 `sendBeacon`——`beforeunload` 里 `fetch` 会被浏览器取消）。
+  所以先演示网页版再演示多用户接入时，中间要关掉页面，否则后来的人全在排队。
+  忘了关也能救：`/v1/pool` 里读 `id:web-N`，`POST /v1/conversations/close` 逐个收回来。
 - `tool` 角色的渲染**未测**（`render_messages` 只处理 system/user/assistant）——接 function
   calling 之前要先补这个测试。
 - `finish_reason` 是**反推值**（`decode_tok >= max_new_tokens` → `length`，否则 `stop`）。
@@ -106,12 +194,42 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
 
 # 网页演示页（需要 node，不在上面那套里）
 node page_check.js http://<板卡IP>:8080             # 用桩 DOM 跑页面里的真实 JS，打到真板卡
+# 它除了原先那几条，还会验：四路带出去的身份是 web-1..web-4、池子里四个会话分别记着
+# 自己的名字、关页面与点「清空」之后会话真的还了回去（后面这一条肉眼看不出来）
+
+# 多用户接入演示（终端，纯标准库；不用 Web 前后端，直接接 API）
+python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --stagger 1.5
+python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --close      # 问完主动交还，排队的人立刻补上
+python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --no-id      # 对照：不带身份会退化成串行
 
 # 本地（无板卡，用假后端；Windows 上 pass_fds 不可用，靠 --frames-stdout）
 python3 rkllm_gateway.py --selftest
 python3 fake_backend.py --frames-stdout &
 python3 serve_http_test.py http://127.0.0.1:8080 quick
 python3 check_template.py
+```
+
+**`serve_http_test.py` 的每个请求都带 `conversation_id`**（v1.9 起）：网关现在只排队不抢占，
+"每问一个新问题就开一段新对话"的写法在会话数用完（默认 4）之后会一路排队到 `IDLE_TTL`，
+套件自己就把自己堵死了。**这也正是多人接入该有的写法：身份要显式给，离开要显式说。**
+
+本地桩后端跑整套 HTTP 回归时**要带 `--think-prefix`**，否则"开思考时原样透传"那一项会误报
+FAIL——桩默认不出 `<think>`，而真板卡默认出。**建议把 `--idle-ttl 0`（关掉回收）也加上**：
+套件能过就说明它真的在靠自己 `close`、而不是碰巧被 TTL 救了：
+
+```sh
+python3 rkllm_gateway.py --port 8099 --sessions 4 --idle-ttl 0 --queue-timeout 25 --verbose \
+    --frames-stdout -- python3 fake_backend.py --sessions 4 --delay 0.05 --think-prefix
+python3 serve_http_test.py http://127.0.0.1:8099        # 全绿（连跑两遍也全绿）
+python3 demo_multiuser.py http://127.0.0.1:8099 5 40 --stagger 0.4 --plain --close
+```
+
+想单独看"排队 + TTL 回收"这条路，另起一个网关并给一个短的 TTL：
+
+```sh
+python3 rkllm_gateway.py --port 8098 --sessions 2 --idle-ttl 3 --queue-timeout 60 --verbose \
+    --frames-stdout -- python3 fake_backend.py --sessions 2 --delay 0.05 --think-prefix
+python3 demo_multiuser.py http://127.0.0.1:8098 5 20 --stagger 0.3 --plain   # 5 人 2 会话，排队可见
 ```
 
 `check_template.py` 守的是一条**必须守住的不变量**：服务模式下 prompt 由网关渲染、后端逐字节透传，
