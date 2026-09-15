@@ -527,6 +527,21 @@ def conversation_key(messages, explicit=None):
 # 4. HTTP / OpenAI
 # ===========================================================================
 
+# 演示页（4 个对话框那个）与网关同目录，用 GET /demo 直接打开。
+# 为什么由网关自己发而不是另起一个静态服务器：**同源**，浏览器就不会有 CORS 的坑，
+# 演示时也只有一个进程要管。CORS 头照样给（见下），是为了页面被存到本地用
+# file:// 打开、或者被别的 Agent 前端引用时也能用。
+VIEW_DIR = os.path.dirname(os.path.abspath(__file__))
+DEMO_PAGE = "demo_4chat.html"
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    # 浏览器默认**不让 JS 读自定义响应头**，X-KV-Reuse 必须显式 expose 出来，
+    # 否则页面上"复用到底有没有生效"这一栏永远是空的。
+    "Access-Control-Expose-Headers": "X-KV-Reuse",
+}
+
+
 class Gateway(object):
     def __init__(self, backend, pool, verbose=False):
         self.backend = backend
@@ -557,6 +572,8 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
@@ -595,9 +612,50 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 路由 ----
 
+    def do_OPTIONS(self):
+        """CORS 预检。
+
+        带 `Content-Type: application/json` 的 POST **不是**简单请求，浏览器会先发一个
+        OPTIONS 问一句"能不能发"。不处理这一条，页面上每个请求都会在控制台里失败，
+        而在 curl/python 那一侧完全看不出来——因为它们压根不发预检。
+        """
+        self._responded = False
+        self.send_response(204)
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self._responded = True
+
+    def _static_demo(self):
+        """把演示页发出去。
+
+        页面从这里取就是同源的（地址栏和接口都是同一个 host:port），CORS 这一关天然过。
+        头照样发，是为了页面被另存到本地、或被人挂到别的域名下时也能用。
+        """
+        path = os.path.join(VIEW_DIR, DEMO_PAGE)
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except (IOError, OSError):
+            return self._error(404, "demo page missing: %s (应与网关放在同一目录)" % path)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self._responded = True
+
     def do_GET(self):
         self._responded = False
         path = self.path.split("?")[0]
+        if path in ("/", "/demo", "/demo_4chat.html"):
+            return self._static_demo()
         if path in ("/health", "/healthz"):
             return self._json(200, {"status": "ok",
                                     "model": MODEL_ID,
@@ -684,6 +742,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
         for k, v in kv_reuse_headers(q.kv).items():
             self.send_header(k, v)
 
@@ -1146,6 +1206,8 @@ def main():
         httpd.daemon_threads = True
         print("[gateway] listening on http://%s:%d  (sessions=%d, model=%s)"
               % (args.host, args.port, backend.sessions, MODEL_ID), flush=True)
+        print("[gateway] 演示页（4 个对话框）: http://%s:%d/demo"
+              % (args.host, args.port), flush=True)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

@@ -14,7 +14,8 @@
 | 文件 | 作用 |
 |---|---|
 | **`DEMO.md`** | **演示手册**：给第一次接触项目的人，从零到跑通一次 4 路并发演示的完整流程 |
-| **`demo_4session.py`** | 4 路并发的"看得见"演示：4 行实时进度条一起往前爬（**展示时用这个**） |
+| **`demo_4chat.html`** | **网页演示**：4 个对话框并排，四路回答同时流式输出（网关通过 `GET /demo` 发出，无需额外 web 服务） |
+| **`demo_4session.py`** | 命令行演示：4 行实时进度条一起往前爬（终端里用这个） |
 | `rkllm_gateway.py` | 网关本体（python3 **标准库**，无第三方依赖）。父进程，自己拉起后端子进程 |
 | `start_gateway.sh` | 启动网关（含后端子进程）；参数走环境变量 |
 | `restart_gateway.sh` | 杀掉重启（含两个测试陷阱的注释，别改成命令行一行流） |
@@ -53,6 +54,12 @@ MODEL_DIR=<模型目录> \
 - `GET /health` → `{"status":"ok","model":...,"sessions":N,"uptime_s":...}`
 - `GET /v1/models` → OpenAI 格式的模型列表
 - `POST /v1/chat/completions` → 兼容 OpenAI；`stream: true` 走 SSE，`stream: false` 一次性返回
+- `GET /`、`GET /demo` → 网页演示页（网关把同目录的 `demo_4chat.html` 读出来发出去）
+
+浏览器跨域是通的：网关对 `OPTIONS` 预检回 204，响应上带 `Access-Control-Allow-Origin: *`
+和 `Access-Control-Expose-Headers: X-KV-Reuse`（**没有最后这个头，前端读不到 `X-KV-Reuse`**，
+就只能靠猜来判断复用有没有生效）。页面**必须从 `http://<板卡>:8080/demo` 打开**，
+双击本地文件走 `file://` 会被浏览器的跨域策略挡掉。
 
 ```sh
 # 非流式
@@ -80,6 +87,9 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
 
 - **没有鉴权**。`HOST=0.0.0.0` 时局域网内谁能连上谁就能用满全部算力；Agent 跑在板卡本机时
   建议 `HOST=127.0.0.1`。要对外提供服务请自行加反向代理鉴权。
+- **CORS 是 `Access-Control-Allow-Origin: *`**（为了演示页开箱能跑）。它不加"谁能访问"这层
+  限制——没有鉴权时本来就谁都能访问——但它意味着**任何网页**都能在访客的浏览器里驱动
+  这块板卡。只在受控内网里跑演示，别把这个端口暴露到不可信网络。
 - `tool` 角色的渲染**未测**（`render_messages` 只处理 system/user/assistant）——接 function
   calling 之前要先补这个测试。
 - `finish_reason` 是**反推值**（`decode_tok >= max_new_tokens` → `length`，否则 `stop`）。
@@ -92,6 +102,10 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
 ```sh
 # 板上（网关已起）
 ./run_all_board_tests.sh http://127.0.0.1:8080      # 结果落 board_tests.log，末尾有 FAIL 汇总
+# 注：这套是纯 python3 的，可以直接在能连到板卡的机器上对着 http://<板卡IP>:8080 跑
+
+# 网页演示页（需要 node，不在上面那套里）
+node page_check.js http://<板卡IP>:8080             # 用桩 DOM 跑页面里的真实 JS，打到真板卡
 
 # 本地（无板卡，用假后端；Windows 上 pass_fds 不可用，靠 --frames-stdout）
 python3 rkllm_gateway.py --selftest

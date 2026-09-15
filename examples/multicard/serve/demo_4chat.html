@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>4 路并发推理演示</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef;
+          --dim:#8b94a7; --accent:#4da3ff; --ok:#3ddc84; --warn:#ffb454; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  header { display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+           padding:12px 18px; border-bottom:1px solid var(--line); background:#12151b; }
+  h1 { font-size:17px; margin:0; font-weight:600; letter-spacing:.3px; }
+  .spacer { flex:1; }
+  button { background:var(--accent); color:#06121f; border:0; border-radius:6px;
+           padding:8px 15px; font-size:14px; font-weight:600; cursor:pointer; }
+  button.ghost { background:#222836; color:var(--fg); font-weight:500; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  label.tog { color:var(--dim); font-size:13px; display:flex; align-items:center; gap:5px; }
+  #gstats { color:var(--dim); font-size:13px; font-variant-numeric:tabular-nums; }
+  #gstats b { color:var(--ok); font-size:15px; }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:12px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           display:flex; flex-direction:column; height:calc(50vh - 60px); min-height:300px; }
+  .panel.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .phead { display:flex; align-items:center; gap:8px; padding:9px 12px;
+           border-bottom:1px solid var(--line); font-size:13px; }
+  .phead .name { font-weight:600; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#3a4150; }
+  .dot.on { background:var(--accent); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.25; } }
+  .log { flex:1; overflow-y:auto; padding:10px 12px; }
+  .msg { margin-bottom:9px; white-space:pre-wrap; word-break:break-word; }
+  .msg .who { color:var(--dim); font-size:11px; display:block; }
+  .msg.u .body { color:var(--accent); }
+  .msg.a .body { color:var(--fg); }
+  .msg.err .body { color:#ff6b6b; }
+  .pfoot { border-top:1px solid var(--line); padding:8px 10px;
+           display:flex; gap:7px; align-items:center; }
+  .pfoot input { flex:1; background:#0d1017; border:1px solid var(--line); color:var(--fg);
+                 border-radius:6px; padding:8px 10px; font-size:14px; font-family:inherit; }
+  .pfoot input:focus { outline:0; border-color:var(--accent); }
+  .stat { padding:4px 12px 8px; color:var(--dim); font-size:12px;
+          font-variant-numeric:tabular-nums; min-height:22px; }
+  .stat b { color:var(--ok); }
+  .hint { color:var(--dim); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>4 路并发推理 · Qwen3.5-27B · RK1828 ×4</h1>
+  <span id="gstats">待机</span>
+  <span class="spacer"></span>
+  <label class="tog"><input type="checkbox" id="think"> 开思考（默认关，屏幕更干净）</label>
+  <button id="baseline" class="ghost">① 先量单路基线</button>
+  <button id="all">② 4 路同时提问</button>
+  <button id="clear" class="ghost">清空</button>
+</header>
+
+<main id="grid"></main>
+
+<script>
+"use strict";
+const API = "";                       // 空 = 同源（页面由网关自己发出，见 GET /demo）
+const MODEL = "qwen3.5-27b";
+const MAXTOK = 256;
+
+// 四路**故意用四个不同的问题**：网关按对话内容把请求钉到会话上，
+// 首问相同会被当成同一段对话、落到同一个会话上排队——那看起来就是"轮流"而不是并发。
+//
+// 为什么默认问题这么"机械"：这种列举型任务模型会**直接开始输出**，不会先写一大段
+// 思考过程。换成"介绍一下杭州"这类需要组织语言的问题，实测在关思考的软开关下
+// 仍会吐 <think>，而且常常在 think 段里就被 max_tokens 截断——网关此时按设计
+// **原样吐出**（宁可露标签也不静默吞内容），投影出来就是满屏 "Analyze the Request"。
+// 演示时当然可以随便问，只是默认这四问是挑过的。
+// 四个都挑过：实测 150~190 tok、13~17 秒、**都不吐 <think>**。时长接近是有意的——
+// 四路里最短的那路一下线，屏幕上就只剩三行在动，"四路同时"的画面只维持很短一段。
+const DEFAULT_Q = [
+  "List the numbers from 1 to 40 separated by commas.",
+  "List the multiples of 5 from 5 to 200 separated by commas.",
+  "Count down from 50 to 1 separated by commas.",
+  "List the even numbers from 2 to 80 separated by commas.",
+];
+
+const panels = [];
+let lastSingleRate = null;     // 单路基线（只有一路在跑时记下来）
+
+function buildPanels() {
+  const grid = document.getElementById("grid");
+  for (let i = 0; i < 4; i++) {
+    const el = document.createElement("div");
+    el.className = "panel";
+    el.innerHTML =
+      '<div class="phead"><span class="dot"></span><span class="name">面板 ' + (i + 1) +
+      '</span><span class="hint" data-role="sess"></span></div>' +
+      '<div class="log" data-role="log"></div>' +
+      '<div class="stat" data-role="stat"></div>' +
+      '<div class="pfoot"><input data-role="in" placeholder="输入问题后回车…">' +
+      '<button data-role="go">发送</button></div>';
+    grid.appendChild(el);
+
+    const p = {
+      el: el,
+      log: el.querySelector('[data-role=log]'),
+      stat: el.querySelector('[data-role=stat]'),
+      sess: el.querySelector('[data-role=sess]'),
+      input: el.querySelector('[data-role=in]'),
+      go: el.querySelector('[data-role=go]'),
+      dot: el.querySelector('.dot'),
+      messages: [],            // 这一路自己的对话历史 —— 多轮就靠它，也是 KV 复用的前提
+      streaming: false,
+      kv: "",
+    };
+    p.input.value = DEFAULT_Q[i];
+    p.input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { send(p); }
+    });
+    p.go.addEventListener("click", function () { send(p); });
+    panels.push(p);
+    render(p);
+  }
+}
+
+function addMsg(p, kind, who, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + kind;
+  const w = document.createElement("span");
+  w.className = "who";
+  w.textContent = who;
+  const b = document.createElement("span");
+  b.className = "body";
+  b.textContent = text;
+  d.appendChild(w);
+  d.appendChild(b);
+  p.log.appendChild(d);
+  p.log.scrollTop = p.log.scrollHeight;
+  return b;
+}
+
+// 只负责"外观状态"。**不要在这里碰 p.stat**：send() 的 finally 会调 render()，
+// 顺手把统计行也重写的话，流结束时刚算好的 tok/s 会被当场抹掉（踩过）。
+function render(p) {
+  p.el.classList.toggle("active", p.streaming);
+  p.dot.classList.toggle("on", p.streaming);
+  p.go.disabled = p.streaming;
+}
+
+function setStat(p, text) { p.stat.textContent = text; }
+
+function parseKV(s) {
+  // 形如 session=2; reset=0; sent=118; base=248; full=366
+  const o = {};
+  (s || "").split(";").forEach(function (part) {
+    const kv = part.split("=");
+    if (kv.length === 2) { o[kv[0].trim()] = kv[1].trim(); }
+  });
+  return o;
+}
+
+// 一次流式对话的核心：发请求、按 SSE 逐块解析、把增量交给 onDelta。
+// 面板和"单路基线"共用它，免得解析逻辑写两份、改一处忘一处。
+async function streamChat(messages, onDelta) {
+  const t0 = performance.now();
+  let ntok = 0, nchunk = 0, answer = "";
+  const res = await fetch(API + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: messages,
+      max_tokens: MAXTOK,
+      stream: true,
+      stream_options: { include_usage: true },
+      chat_template_kw: { enable_thinking: document.getElementById("think").checked },
+    }),
+  });
+  if (!res.ok) {
+    throw new Error("HTTP " + res.status + " " + (await res.text()).slice(0, 200));
+  }
+  // 自定义响应头能被 JS 读到，靠网关的 Access-Control-Expose-Headers
+  const kv = parseKV(res.headers.get("X-KV-Reuse") || "");
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const r = await reader.read();
+    if (r.done) { break; }
+    buf += dec.decode(r.value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith("data:")) { continue; }
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") { continue; }
+      let d;
+      try { d = JSON.parse(payload); } catch (e) { continue; }
+      // 末尾那块带 usage（stream_options.include_usage），以它的 completion_tokens 为准：
+      // 自己数块数会把"块"当"token"，和板上的测量脚本口径对不上
+      if (d.usage && typeof d.usage.completion_tokens === "number") {
+        ntok = d.usage.completion_tokens;
+      }
+      const ch = d.choices && d.choices[0];
+      const piece = ch && ch.delta && ch.delta.content;
+      if (!piece) { continue; }
+      nchunk++;
+      answer += piece;
+      onDelta(answer, (performance.now() - t0) / 1000, nchunk);
+    }
+  }
+  const el = (performance.now() - t0) / 1000;
+  const tok = ntok || nchunk;          // usage 没到就退化成数出来的块数
+  return { tok: tok, el: el, rate: tok / el, text: answer, kv: kv, exact: !!ntok };
+}
+
+async function send(p) {
+  const text = p.input.value.trim();
+  if (!text || p.streaming) { return null; }
+  p.input.value = "";
+  addMsg(p, "u", "你", text);
+  p.messages.push({ role: "user", content: text });
+  const bubble = addMsg(p, "a", "模型", "");
+
+  p.streaming = true;
+  render(p);
+  updateGlobal();
+  try {
+    const r = await streamChat(p.messages, function (soFar, el, n) {
+      bubble.textContent = soFar;
+      p.log.scrollTop = p.log.scrollHeight;
+      if (p.kvSession !== undefined) {
+        setStat(p, "⏳ " + el.toFixed(1) + "s · " + n + " 块 · 会话 " + p.kvSession);
+      } else {
+        setStat(p, "⏳ " + el.toFixed(1) + "s · " + n + " 块");
+      }
+    });
+    const kv = r.kv;
+    p.kvSession = kv.session;
+    if (kv.session !== undefined) { p.sess.textContent = "会话 " + kv.session; }
+    p.messages.push({ role: "assistant", content: r.text });
+    // 复用到底有没有生效只看 base：base 是**真正被复用的前缀长度**。
+    // 别拿 reset 当判据——首次对话落在"已知为空"的会话上时是 reset=0 但 base=0，
+    // 一个字都没省；照 reset 标"（复用）"就是骗人（第一版就是这么写的）。
+    setStat(p, "<b>" + r.rate.toFixed(2) + " tok/s</b> · " + r.tok + " tok · "
+            + r.el.toFixed(1) + "s · 会话 " + (kv.session !== undefined ? kv.session : "?")
+            + (kv.full ? " · KV " + kv.sent + "/" + kv.full
+                       + (Number(kv.base) > 0
+                          ? "（复用 " + kv.base + "，省 "
+                            + Math.round(100 * (1 - kv.sent / kv.full)) + "%）"
+                          : "（全量）") : ""));
+    return r;
+  } catch (err) {
+    bubble.textContent = "出错：" + err.message;
+    bubble.parentNode.className = "msg err";
+    setStat(p, "失败：" + err.message);
+    return null;
+  } finally {
+    p.streaming = false;
+    render(p);
+    updateGlobal();
+  }
+}
+
+function updateGlobal() {
+  const busy = panels.filter(function (p) { return p.streaming; }).length;
+  const el = document.getElementById("gstats");
+  if (busy > 0) {
+    el.innerHTML = "并发中：<b>" + busy + "</b> 路";
+  } else {
+    el.textContent = "待机" + (lastSingleRate
+      ? " · 单路基线 " + lastSingleRate.toFixed(2) + " tok/s" : "");
+  }
+}
+
+// --- 按钮 ---
+
+// 基线**故意不占任何面板**：它要是走了面板 1，面板 1 就会多出一段历史，
+// 后面"4 路同时提问"就不再是从零开始的四段对话了（而且面板 1 的输入框会被清空，
+// 那一批里它会直接不发）。所以这里单独发一次请求量数，量完就丢。
+document.getElementById("baseline").addEventListener("click", async function () {
+  if (panels.some(function (p) { return p.streaming; })) { return; }
+  const el = document.getElementById("gstats");
+  el.textContent = "单路基线测量中…（约 20 秒）";
+  try {
+    const r = await streamChat([{ role: "user", content: "用一句话介绍杭州。" }],
+                               function () {});
+    lastSingleRate = r.rate;
+    el.innerHTML = "单路基线：<b>" + r.rate.toFixed(2) + " tok/s</b>（" + r.tok
+                 + " tok / " + r.el.toFixed(1) + "s）→ 现在点「② 4 路同时提问」";
+  } catch (err) {
+    el.textContent = "基线测量失败：" + err.message;
+  }
+});
+
+document.getElementById("all").addEventListener("click", async function () {
+  if (panels.some(function (p) { return p.streaming; })) { return; }
+  // 全都是空的就填回默认问题（第二轮之后输入框是空的，历史还在——
+  // 这一批就变成"四段对话各自的第二轮"，顺带能看到 KV 复用）
+  if (panels.every(function (p) { return !p.input.value.trim(); })) {
+    panels.forEach(function (p, i) { p.input.value = DEFAULT_Q[i]; });
+  }
+  const el = document.getElementById("gstats");
+  const n = panels.filter(function (p) { return p.input.value.trim(); }).length;
+  el.innerHTML = "并发中：<b>" + n + "</b> 路";
+  const t0 = performance.now();
+  const rs = await Promise.all(panels.map(function (p) { return send(p); }));
+  const wall = (performance.now() - t0) / 1000;
+  const ok = rs.filter(function (r) { return r; });
+  if (!ok.length) { updateGlobal(); return; }
+  const total = ok.reduce(function (a, r) { return a + r.tok; }, 0);
+  const agg = total / wall;
+  let html = ok.length + " 路并发：合计 <b>" + total + "</b> tok / 墙钟 "
+           + wall.toFixed(1) + "s → 聚合 <b>" + agg.toFixed(2) + " tok/s</b>";
+  if (lastSingleRate) {
+    html += " · <span style='color:var(--warn)'>伸缩 "
+          + (agg / lastSingleRate).toFixed(2) + "×</span>（基线 "
+          + lastSingleRate.toFixed(2) + " tok/s）";
+  } else {
+    html += " · （先点「①」量个单路基线，就能看到伸缩比）";
+  }
+  el.innerHTML = html;
+});
+
+document.getElementById("clear").addEventListener("click", resetAll);
+
+function resetAll() {
+  panels.forEach(function (p, i) {
+    p.messages = [];
+    p.log.innerHTML = "";
+    p.sess.textContent = "";
+    p.stat.textContent = "";
+    p.input.value = DEFAULT_Q[i];
+    p.lastRate = null;
+  });
+  lastSingleRate = null;
+  updateGlobal();
+}
+
+buildPanels();
+updateGlobal();
+</script>
+</body>
+</html>
