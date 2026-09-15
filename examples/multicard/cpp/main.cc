@@ -2328,7 +2328,22 @@ static void run_conversation_worker(Conversation& conv, std::vector<StageContext
     if (conv.context_tokens > 0 && context_limit > 0 &&
         conv.context_tokens + prefill_reserve >= context_limit) {
       // 与交互模式同一条策略：快满了就清 KV 重开一段对话（只影响本会话）。
+      //
+      // 清 KV 也要取卡级锁（逐卡取、取一张放一张）。理由：SDK 要求「同一个
+      // rknn3_context 的并发使用由调用方保证线程安全」，而本会话的 session 和
+      // 别的会话的 session 同处一张卡的**同一个 context** 上——清 KV 虽然只动
+      // 本会话自己的 KV 缓冲（P0 探针已证 KV 隔离），但它仍是对该 context 的
+      // 一次 SDK 调用，可能与另一路正在跑的 session_run 并发。
+      // 粒度仍是「同时只持一张卡的锁」，不破坏 §3.4 的锁序不变量。
+      //
+      // 用 VLOG 而不是 printf：--rounds 是已验收路径，默认输出必须逐字节不变。
+      // 但这条清 KV 分支原本**没有任何日志**，测试时无法证明它真被走到了（这正是
+      // 之前 30 分钟稳定性测试的盲区：那轮 workload 根本没到清 KV 的阈值）。
+      // --verbose 打开即可计数。
+      VLOG("[conv] context %llu/%llu nearly full, clearing KV cache\n",
+           (unsigned long long)conv.context_tokens, (unsigned long long)context_limit);
       for (size_t i = 0; i < stages.size(); ++i) {
+        std::lock_guard<std::mutex> card_lock(stages[i].run_mutex);
         rknn3_session_clear_kvcache(conv.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
       }
       conv.context_tokens = 0;
@@ -2455,11 +2470,14 @@ static void run_interactive_session_worker(int index, Conversation& conv,
     // 与单会话交互模式同一条策略：上下文快满了就清 KV 重开一段对话，
     // 只影响本会话。context_tokens/first_turn 都是会话私有的。
     //
-    // 注意这里**没有**取卡级 run_mutex：清 KV 只动本会话自己的 KV 缓冲（P0 探针已证
-    // KV 隔离），但这毕竟是同一张卡 context 上的一次 SDK 调用，而另一路会话可能正在
-    // 同一 context 里跑 session_run。这条写法是从 --rounds 路径原样继承的（那一路的
-    // token 已逐字节验收过），当前没有证据说它有问题，也**没有验证过它一定安全**。
-    // 列为待确认项，不要因为"从别处抄的"就当它已经验过。
+    // 清 KV 要取卡级锁（逐卡取、取一张放一张）：SDK 要求「同一个 rknn3_context
+    // 的并发使用由调用方保证线程安全」，而本会话的 session 和别的会话的 session
+    // 同处一张卡的**同一个 context** 上——清 KV 虽然只动本会话自己的 KV 缓冲
+    // （P0 探针已证 KV 隔离），但它仍是对该 context 的一次 SDK 调用，可能与另一路
+    // 正在跑的 session_run 并发。粒度仍是「同时只持一张卡的锁」（§3.4 锁序不变量）。
+    //
+    // 注意：先前这里**没有**取锁，且是从 --rounds 路径原样继承来的——那条路径当时
+    // 也只被逐字节验收过 token，没有验过并发下的安全性。两处现在一起补上了。
     if (conv.context_tokens > 0 && context_limit > 0 &&
         conv.context_tokens + prefill_reserve >= context_limit) {
       print_session_block(index,
@@ -2467,6 +2485,7 @@ static void run_interactive_session_worker(int index, Conversation& conv,
           std::to_string(context_limit) +
           " tokens nearly full, clearing KV cache to start a fresh conversation)");
       for (size_t i = 0; i < stages.size(); ++i) {
+        std::lock_guard<std::mutex> card_lock(stages[i].run_mutex);
         rknn3_session_clear_kvcache(conv.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
       }
       conv.context_tokens = 0;
