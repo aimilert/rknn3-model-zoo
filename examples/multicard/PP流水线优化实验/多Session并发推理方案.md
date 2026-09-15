@@ -737,9 +737,9 @@ git tag m5-multiuser    # 指向多用户接入（身份/排队/交还）的代�
 | P3 源码快照 | `rt_work/main.cc.p3_interactive` | `ff85aa377f91eb3b5e543dfa8754e4c6` |
 | R11 源码快照 | `rt_work/main.cc.r11_kvlock` | `c1fcc366958c34941b99c46c8f22cd62` |
 | M5 源码快照（`--serve` 帧协议 / `TokenSink`） | `rt_work/main.cc.m5_serve` | `108706c0c96c231f1632c489fc5963b3` |
-| M5 板端网关（**已入库**，多用户版） | `examples/multicard/serve/rkllm_gateway.py` | `f35fd2b84ec9968d83795c70cc3d6e0d`（`bc7f013`） |
-| └ **板卡上正在跑的仍是旧版** | 板卡上的部署副本 | `e09ac2b941de767443c0d1d635bd305b` —— **与上面这个不同 md5**。§9.8 的改动（身份/排队/`close`/`/v1/pool` 的 `key`）**板上还没有**，要用得先重新下发 + 重启网关（重载模型约 240s） |
-| 网页演示页（**已入库**，带身份/交还版） | `examples/multicard/serve/demo_4chat.html` | `1db0882d98850b20232d0f96e325c9a1`（`bc7f013`）—— 板卡上的副本同样是旧版（匿名对话，会占住 4 个会话，见 §9.8 第 5 条） |
+| M5 板端网关（**已入库**）演进 | `examples/multicard/serve/rkllm_gateway.py` | M5 入库 `db3fe3d` = `e09ac2b941de767443c0d1d635bd305b` → 修坑 4 `213a131` = `1eb4347a3aae6ec9e69e0f624bdaf62e` → 加网页演示 `570c406` = `a7dde57a99cdb89d343e3f984000cec6` → **多用户版 `bc7f013` = `f35fd2b84ec9968d83795c70cc3d6e0d`（当前 HEAD）** |
+| └ **板卡上正在跑的副本不是以上任何一个** | 板卡上的部署副本 | 本表早前把 `e09ac2b9` 记作"与板卡副本同 md5"，**那在 `213a131` 之后就不成立了**（另有 `009d0e26` 一说）——**2026-09-15 本轮没有上板核实，别引用具体哈希**。能确定的是：它**没有** §9.8 的身份/排队/`close`/`/v1/pool` 的 `key`，要用得先重新下发 + 重启网关（重载模型约 240s） |
+| 网页演示页（**已入库**） | `examples/multicard/serve/demo_4chat.html` | `570c406` = `88a53e8b1935c7ef27bb04959ec7c211`（旧版，四个匿名对话）→ **`bc7f013` = `1db0882d98850b20232d0f96e325c9a1`**。**板卡上的是旧版**（早前记为 `af72406…`，本轮未核实）——它会以四个匿名对话占住全部 4 个会话（§9.8 咬到 5） |
 | M5 启动/构建/验收脚本（**已入库**） | `examples/multicard/serve/*.sh`、`*.py`、`README.md` | 见 `git ls-tree`；板卡路径全部走环境变量 |
 | M5 板端二进制（Release） | 板卡 `<板卡临时目录>/rknn_multicard_demo.serve` | `e223ea8f3f5d38e82a37cd560c29fb96`（1091328 B） |
 | 板卡二进制 | 见 §5 各阶段完成记录的表 | P0 `a6739a6e…` / P0+插桩 `205232b8…` / P1 `6f5aa9d7…` / P2 `8f6e900d…` / P3 `d30ce8af…` / **R11 补锁后 `1b01b960904c7412f64a173b222240a1`** |
