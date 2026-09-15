@@ -328,6 +328,9 @@ class SessionPool(object):
         self.busy = [False] * self.n
         self.dead = [False] * self.n
         self.bound = {}          # conversation key -> session index
+        # bound 的上限：键是"system + 首条 user"的摘要，长期运行的 Agent 会攒很多段
+        # 对话。超了丢最老的（见 acquire）——丢绑定只影响速度，不影响正确性。
+        self.bound_cap = 4096
         backend.on_clear = self._on_clear
 
     def _on_clear(self, session, ctx, limit):
@@ -373,10 +376,30 @@ class SessionPool(object):
                     free = [s for s in range(self.n)
                             if not self.dead[s] and not self.busy[s]]
                     if free:
-                        best = min(free, key=lambda s: (self.known[s] is not None,
-                                                       s))
+                        # **空闲不等于没主**：会话可能正被另一段对话绑着（bound 里挂着），
+                        # 只是它此刻没在跑。把新对话派到那种会话上，两段对话就会钉在同一个
+                        # 会话上——后端同一个会话一次只跑一条，于是它们只能互相等，
+                        # 答案照样对、吞吐掉一半。这个退化还**看请求到达顺序**：谁先抢到
+                        # 谁的绑定就赢，所以同一份脚本会时好时坏（实测同一构建同一脚本
+                        # 量到过 3.40x，也量到过 1.90x / 1.00x）。判据必须包含"有没有主"，
+                        # 不能只看 busy。
+                        owned = set(self.bound.values())
+                        candidates = [s for s in free if s not in owned] or free
+                        best = min(candidates, key=lambda s: (self.known[s] is not None,
+                                                              s))
                         if key is not None:
+                            # 抢占（所有空闲会话都有主时才会走到）：把旧主人解绑，
+                            # 否则它下一轮还会回到这个会话上，重新变成上面那种互相等。
+                            # 解绑只是让它下次重新挑会话（多一次 RESET），不影响正确性。
+                            for k, s in list(self.bound.items()):
+                                if s == best and k != key:
+                                    del self.bound[k]
                             self.bound[key] = best
+                            if len(self.bound) > self.bound_cap:
+                                # 这个表会长到跟对话数一样大（键是"system + 首条 user"
+                                # 的摘要）。丢掉最老的绑定只让那段对话下次重新挑会话，
+                                # 正确性不受影响；不丢就是一条随对话数线性增长的慢泄漏。
+                                self.bound.pop(next(iter(self.bound)))
                         return self._make_lease(best, prompt)
                 if time.time() >= deadline:
                     raise BackendError("no session available within %.0fs "
@@ -976,8 +999,25 @@ def selftest(backend, pool):
         backend.release_request(qq)
         return lease, qq
 
-    for k in ("dirty-a", "dirty-b"):       # 先把每个会话说脏（首轮不需要 RESET）
-        pool_turn(k, render_messages([{"role": "user", "content": "占位 " + k}]))
+    def arrange(known, bindings=None):
+        """把会话池摆到一个**确定**的初态，并返回原状态。
+
+        为什么要这么写：acquire 会优先挑"没主、没装过东西"的会话，所以池子的历史状态
+        会改变它走哪条分支——靠前面的 section 顺手留下的状态来构造场景，断言随时会因为
+        上游改动而失去意义（本次就撞上了：加了"优先挑没主的会话"之后，原断言里"所有
+        会话都脏"这个前提不成立了）。显式摆状态，测试才是在测它声称要测的东西。
+        """
+        saved = (list(pool.known), dict(pool.bound))
+        pool.known = list(known)
+        pool.bound = dict(bindings or {})
+        return saved
+
+    def restore(saved):
+        pool.known, pool.bound = list(saved[0]), dict(saved[1])
+
+    # 初态：每个会话都"清过 KV、内容未知"（实测里这是常态——每次 RESET 都伴随 CLEAR），
+    # 且没有任何绑定。
+    saved = arrange([None] * pool.n)
     m1 = [{"role": "user", "content": "请记住这句话：" + "麒麟九千" * 60}]
     lease_a, q_a = pool_turn("reuse-after-reset", render_messages(m1))
     check("会话都脏了 => 这一轮走的是 RESET", lease_a.reset)
@@ -993,6 +1033,30 @@ def selftest(backend, pool):
           % (len(lease_b.sent_prompt), len(p2), len(lease_b.base), lease_b.reset))
     check("复用那轮 prefill 确实更少", q_b.prefill_tokens < q_a.prefill_tokens,
           "%d vs %d tok" % (q_b.prefill_tokens, q_a.prefill_tokens))
+
+    print("== 会话池：新对话不许被派到别人占着的会话上（否则两段对话只能互相等）==")
+    # 这条是实测撞出来的：http_scaling 在同一构建上量到过 3.40x，也量到过 1.90x / 1.00x。
+    # 根因是 acquire 挑空闲会话时只看 busy、不看 bound——"空闲"的会话可能正被另一段
+    # 对话绑着（只是此刻没在跑），新对话被派过去之后两段对话共用一个会话，后端同一会话
+    # 一次只跑一条，于是它们**只能轮流跑**：答案全对、并发掉一半，而且退化成不成全看
+    # 请求到达顺序（谁先抢到谁的绑定就赢），所以是偶发。
+    # 构造要点：让被绑着的那些会话 known 都是 None（清过 KV 的常态——实测现场就是这样），
+    # 否则 min() 的备选项排序会"顺手"避开它，掩盖这个 bug。
+    restore(saved)
+    arrange([None] * pool.n, {"owner-x": 0})
+    lease_y, _ = pool_turn("owner-y", render_messages([{"role": "user", "content": "乙"}]))
+    check("新对话没有落到 owner-x 占着的会话上（s0）",
+          lease_y.session != 0 or pool.n == 1,
+          "新对话拿到 s%d（共 %d 个会话）" % (lease_y.session, pool.n))
+    # 抢占路径：所有会话都有主时，新对话必须还能拿到会话，并且把旧主人解绑——
+    # 不解绑的话旧对话下一轮又会回到那个会话，重新变成上面那种互相等。
+    arrange([None] * pool.n, dict(("fill-%d" % i, i) for i in range(pool.n)))
+    lease_z, _ = pool_turn("intruder", render_messages([{"role": "user", "content": "来抢"}]))
+    owners_of_z = [k for k, s in pool.bound.items() if s == lease_z.session]
+    check("会话全都有主时仍能派活，且旧主人被解绑",
+          owners_of_z == ["intruder"],
+          "s%d 的主人 %r（原主 fill-0..%d）"
+          % (lease_z.session, owners_of_z, pool.n - 1))
 
     print("== RESET 语义 ==")
     q = backend.submit(render_messages([{"role": "user", "content": "你好"}]), 8,

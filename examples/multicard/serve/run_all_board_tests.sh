@@ -31,9 +31,13 @@ run python3 nothink_check.py "$BASE"
 # 伸缩测量放最后：它会把 4 个会话都写脏
 run python3 http_scaling.py "$BASE" 96 1,2,4
 
+# 注意：先把统计结果抓进变量，最后才 >> 追加。直接在这里 `grep "$R"` 又 `>> "$R"`
+# 会让 grep 的输入文件同时是输出文件（实测报 "input file is also the output"）。
+NFAIL=$(grep -c '\[FAIL\]' "$R" || true)
+FAILLINES=$(grep -n '\[FAIL\]' "$R" || true)
 {
   echo "===== 汇总 ====="
-  echo "FAIL 行数：$(grep -c '\[FAIL\]' "$R")"
-  grep -n '\[FAIL\]' "$R" || echo "（无失败项）"
+  echo "FAIL 行数：$NFAIL"
+  if [ -n "$FAILLINES" ]; then echo "$FAILLINES"; else echo "（无失败项）"; fi
 } >> "$R"
 echo "done; see $R"
