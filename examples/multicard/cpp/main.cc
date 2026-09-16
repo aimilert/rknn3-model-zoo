@@ -1691,14 +1691,22 @@ static int stage_output_callback(void* userdata, rknn3_tensor* output_tensors, u
       } else if (state == RKLLM_OUTPUT_CALLBACK_PREFILL_FINISHED) {
         batch.n_tokens = remaining_tokens;
       } else {
-        batch.n_tokens = remaining_tokens > g_bucket_size ? g_bucket_size : remaining_tokens;
-      }
-
-      if (batch.n_tokens == 0) {
+        // 运行时给 prefill 分块用的是**固定大小**（模型的 max dynamic seq len，这里是
+        // 128），**不看 `--bucket-size`**。所以分块大小要从 output tensor 的元素数
+        // 反推——否则 `--bucket-size` 一旦不是 128，记账就与真实分块脱节，现场报的是
+        // "embed buffer too small"。取 min(chunk, remaining) 让单 token 的 decode 也
+        // 走同一条路。
+        //
+        // 这里从"只在 n_tokens == 0 时才反推"改成"每次都反推"，是因为那条兜底路径
+        // 在 decode 下根本进不去（remaining 通常为 1，min 出来是 1 不是 0），真正需要
+        // 它的场合是 prefill 分块——而那正是原来算错的地方。代价是每 token 多一次
+        // `pick_embed_tensor`（对 1~3 个 tensor 做几次子串查找），相对一次前向可以忽略。
+        uint64_t chunk = g_bucket_size;
         const TensorBlob* embed = pick_embed_tensor(batch.tensors);
         if (embed && embed->attr.n_elems > 0 && cb_ctx->embedding_dim > 0) {
-          batch.n_tokens = embed->attr.n_elems / (uint64_t)cb_ctx->embedding_dim;
+          chunk = embed->attr.n_elems / (uint64_t)cb_ctx->embedding_dim;
         }
+        batch.n_tokens = remaining_tokens > chunk ? chunk : remaining_tokens;
       }
       slot.emitted_tokens += batch.n_tokens;
       slot.batches.push_back(std::move(batch));
