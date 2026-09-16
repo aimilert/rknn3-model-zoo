@@ -700,6 +700,7 @@ git checkout -b feature/multisession-concurrency
 #   462cec8  multicard/serve: add a demo runbook and the concurrent-streaming demo it drives
 #   570c406  multicard/serve: serve the 4-panel chat demo from the gateway itself
 #   bc7f013  multicard/serve: multiuser edge-server mode (identity, queue, release)
+#   1dde346  multicard: reject an over-long turn instead of silently clearing KV  (服务侧收尾加固 + 一次由执行发现的竞态)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
