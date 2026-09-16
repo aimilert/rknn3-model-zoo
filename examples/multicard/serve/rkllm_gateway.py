@@ -196,10 +196,18 @@ class Backend(object):
                     self.default_max_new_tokens = int(f[1])
                     self._ready.set()
                 elif tag in (b"DELTA", b"ERR"):
-                    rid_s, _, n_s = rest.partition(b" ")
-                    n = int(n_s)
+                    # DELTA 是 `DELTA <rid> <n>`，ERR 多一个 session 字段：
+                    # `ERR <rid> <session> <n>`（写侧见 cpp/main.cc 的 serve_err）。
+                    # **两个不能共用一套解析**：按 DELTA 切第一刀的话，ERR 的 n 会拿到
+                    # "<session> <n>"，int() 抛异常 → 读线程死 → 所有在途请求被判
+                    # "backend exited" → 之后每个请求都 503，直到重启网关。一次"某轮
+                    # 失败"就能把 4 会话的服务整体打掉，所以这里按字段位置取：
+                    # 两种帧的 rid 都是第一个字段、n 都是最后一个字段。
+                    # （ERR 的 session 这里用不上：请求自己知道落在哪个会话上。）
+                    f = rest.split()
+                    n = int(f[-1])
                     payload = self._rfile.read(n) if n > 0 else b""
-                    self._dispatch_payload(tag, int(rid_s), payload)
+                    self._dispatch_payload(tag, int(f[0]), payload)
                 elif tag == b"DONE":
                     f = rest.split()
                     self._handle_done(f)
