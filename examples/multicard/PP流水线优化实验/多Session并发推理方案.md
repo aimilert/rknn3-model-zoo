@@ -1,7 +1,7 @@
 # 多 Session 并发推理方案（Qwen3.5-27B / 4×RK1828）
 
 > 项目：`rknn3-model-zoo/examples/multicard`
-> 核心代码：`cpp/main.cc`（4815 行）、`python/qwen3_5/`（模型转换）
+> 核心代码：`cpp/main.cc`（4823 行）、`python/qwen3_5/`（模型转换）
 > 目标模型：**Qwen3.5-27B**，4 段流水线 / 4 张 RK1828 卡
 > 部署现场：`CM3588-Plus:<板卡上模型目录>`（板卡在独立内网）
 > 安装目录：`../install-Qwen/rk3588_linux_aarch64`
@@ -673,7 +673,7 @@ P2 必须靠它——N 路会话并发时 stdout 会交错，文本对比不再�
 | R12 | **网关无鉴权**（M5 新增面；**多人接入后升级**） | 已确知（非概率） | **中 → 高**（若真的对多人开放） | `/v1/chat/completions` 一旦 `HOST=0.0.0.0` 暴露，局域网内任何人可占满 4 张卡。**§9.8 之后多了一层后果**：网关只能按请求上带的身份分会话、无法核实身份，所以一个客户端用 5 个不同 id 各发一次就能占满全部会话、把所有真人挤进队列等 `QUEUE_TIMEOUT`——**"超过 5 个就排队"这条策略只在参与者都守规矩时成立**。缓解：Agent/演示同机时用 `HOST=127.0.0.1`；要对外提供服务**必须先**加反向代理/鉴权，**本次未做**（§9.7 / §9.8） |
 | R13 | **网关侧会话账本与真实状态不一致 → 静默退化（全量 prefill / 并发变串行）** | 已发生 4 次（均已修） | 低（只慢不错） | 前 3 次的症状是"答案对、慢 3~4 倍"；第 4 次的症状是"答案对、单会话速度正常、**聚合吞吐不随 N 涨**"（会话租约算错 → 两段对话钉在同一会话上被串行执行），且**取决于到达顺序**（同二进制量到过 3.40× 与 1.00×）。缓解：响应头 `X-KV-Reuse` 暴露 `reset/sent/base/full`、网关日志暴露**租约落点**、`selftest()` 里 4 条回归用例（均在修复前代码上验证过失败），并用 `usage` 里的两个数（整段 `prompt_tokens` 与 `prompt_tokens_details.cached_tokens`）在 HTTP 层做端到端核对（§9.7） |
 
-| R14 | **prefill 分块大小取自 `--bucket-size`，与运行时的固定分块脱节 → `embed buffer too small`** | 已发生（修复处注释记录的现场症状） | 中（`--bucket-size` 非 128 时必现；**默认值下不触发**） | `stage_output_callback` 用 `min(remaining, g_bucket_size)` 记"这次回调吐了几个 token"，但**运行时是按模型的 max dynamic seq len（128）切的，与 `--bucket-size` 无关**。两者不一致时记账偏小，多出来的 token 被算进下一批，累积错位后报 `embed buffer too small`。改为从 output tensor 的元素数（÷ `embedding_dim`）**反推真实分块**，`g_bucket_size` 只作兜底。**默认 128 下两个口径恰好相等，所以这个 bug 一直没被默认配置撞到**——它的触发条件不是"代码坏了"，而是"有人改了 `--bucket-size`"。修法在 `main.cc` 的 `stage_output_callback`。**另注（2026-09-16）**：这个修复原先**只存在于构建服务器那份检出上**（未提交），本轮才移植进仓库——一个只活在某一台机器磁盘上的修复，等同于不存在 |
+| R14 | **prefill 分块大小取自 `--bucket-size`，与运行时的固定分块脱节 → `embed buffer too small`** | 已发生（修复处注释记录的现场症状） | 中（`--bucket-size` 非 128 时必现；**默认值下不触发**） | `stage_output_callback` 用 `min(remaining, g_bucket_size)` 记"这次回调吐了几个 token"，但**运行时是按模型的 max dynamic seq len（128）切的，与 `--bucket-size` 无关**。两者不一致时记账偏小，多出来的 token 被算进下一批，累积错位后报 `embed buffer too small`。改为从 output tensor 的元素数（÷ `embedding_dim`）**反推真实分块**，`g_bucket_size` 只作兜底。**默认 128 下两个口径恰好相等，所以这个 bug 一直没被默认配置撞到**——它的触发条件不是"代码坏了"，而是"有人改了 `--bucket-size`"。修法在 `main.cc` 的 `stage_output_callback`。**另注（2026-09-16）**：这个修复原先**只存在于构建服务器那份检出上**（未提交），本轮才移植进仓库——一个只活在某一台机器磁盘上的修复，等同于不存在。**同日已在板上复现并验证修好**：`--bucket-size 64` + 一段跨 128 token 分块的 prompt，改动前 `e223ea8f` 回 503 且后端日志 `[stage1] embed buffer too small: need=1361920, got=1310720` + `prefill failed`，改动后 `3355dc4f` 正常作答（详见 §9.7 末）。 |
 
 ---
 
@@ -703,6 +703,7 @@ git checkout -b feature/multisession-concurrency
 #   570c406  multicard/serve: serve the 4-panel chat demo from the gateway itself
 #   bc7f013  multicard/serve: multiuser edge-server mode (identity, queue, release)
 #   1dde346  multicard: reject an over-long turn instead of silently clearing KV  (服务侧收尾加固 + 一次由执行发现的竞态)
+#   b13bbdb  multicard: derive the prefill chunk from the output tensor, not --bucket-size  (R14；原先只在构建服务器磁盘上)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
@@ -740,11 +741,11 @@ git tag m5-multiuser    # 指向多用户接入（身份/排队/交还）的代�
 | P3 源码快照 | `rt_work/main.cc.p3_interactive` | `ff85aa377f91eb3b5e543dfa8754e4c6` |
 | R11 源码快照 | `rt_work/main.cc.r11_kvlock` | `c1fcc366958c34941b99c46c8f22cd62` |
 | M5 源码快照（`--serve` 帧协议 / `TokenSink`） | `rt_work/main.cc.m5_serve` | `108706c0c96c231f1632c489fc5963b3` |
-| M5 板端网关（**已入库**）演进 | `examples/multicard/serve/rkllm_gateway.py` | M5 入库 `db3fe3d` = `e09ac2b941de767443c0d1d635bd305b` → 修坑 4 `213a131` = `1eb4347a3aae6ec9e69e0f624bdaf62e` → 加网页演示 `570c406` = `a7dde57a99cdb89d343e3f984000cec6` → 多用户版 `bc7f013` = `f35fd2b84ec9968d83795c70cc3d6e0d` → **修 ERR 帧解析 `5c167f5` = `fcb9dcd3b15bf26190d142296055593c`（当前 HEAD）**（本行 md5 **2026-09-16 逐版本重算过，都对**） |
-| └ **板卡上正在跑的副本不是以上任何一个** | 板卡上的部署副本 | **2026-09-16 上板实测**：原副本 md5 `009d0e265c2530c4a44573f42611b810`——早前那句"`009d0e26` 一说"是对的，`e09ac2b9` 不是。它与 `570c406` **只差 `_static_demo` 的一处 docstring**（功能无差别，不是功能漂移；**何时分叉的没查**），所以 §9.7 里"入库后两份副本 md5 相同"那句**在 2026-09-16 实测时不成立**。它**没有** §9.8 的身份/排队/`close`/`/v1/pool` 的 `key`。**同日已就地打上 ERR 解析补丁**（见 §9.7 末），原件留 `rkllm_gateway.py.bak_err_parse`，补丁后 = `8fc1b7076c99c2f226a251a554b90137`——**没有拿 HEAD 整体覆盖**，因为那会顺带推上只在桩后端验过的排队/`close`/`pool`。要用 §9.8 那套仍需重新下发 + 重启网关（重载模型约 240s） |
-| 网页演示页（**已入库**） | `examples/multicard/serve/demo_4chat.html` | `570c406` = `88a53e8b1935c7ef27bb04959ec7c211`（旧版，四个匿名对话）→ **`bc7f013` = `1db0882d98850b20232d0f96e325c9a1`**。**板卡上的是旧版**（早前记为 `af72406…`，本轮未核实）——它会以四个匿名对话占住全部 4 个会话（§9.8 咬到 5） |
+| M5 板端网关（**已入库**）演进 | `examples/multicard/serve/rkllm_gateway.py` | M5 入库 `db3fe3d` = `e09ac2b941de767443c0d1d635bd305b` → 修坑 4 `213a131` = `1eb4347a3aae6ec9e69e0f624bdaf62e` → 加网页演示 `570c406` = `a7dde57a99cdb89d343e3f984000cec6` → 多用户版 `bc7f013` = `f35fd2b84ec9968d83795c70cc3d6e0d` → 修 ERR 帧解析 `5c167f5` = `fcb9dcd3b15bf26190d142296055593c` → **加 REJECT 帧解析 `1dde346` = `7a06e5ca2b9efb230d119582bbc56961`（当前 HEAD）**（本行 md5 **2026-09-16 逐版本重算过，都对**；另注：`5c167f5` 那格上的"当前 HEAD"**写的时候是对的，`1dde346` 之后就过期了**——一本流水账里最容易悄悄变错的就是"当前"这个词，2026-09-16 上板时才发现） |
+| └ **板卡上正在跑的副本不是以上任何一个** | 板卡上的部署副本 | **2026-09-16 上板实测**：原副本 md5 `009d0e265c2530c4a44573f42611b810`——早前那句"`009d0e26` 一说"是对的，`e09ac2b9` 不是。它与 `570c406` **只差 `_static_demo` 的一处 docstring**（功能无差别，不是功能漂移；**何时分叉的没查**），所以 §9.7 里"入库后两份副本 md5 相同"那句**在 2026-09-16 实测时不成立**。它**没有** §9.8 的身份/排队/`close`/`/v1/pool` 的 `key`。**同日已就地打上 ERR 解析补丁**（见 §9.7 末），原件留 `rkllm_gateway.py.bak_err_parse`，补丁后 = `8fc1b7076c99c2f226a251a554b90137`——**没有拿 HEAD 整体覆盖**，因为那会顺带推上只在桩后端验过的排队/`close`/`pool`。要用 §9.8 那套仍需重新下发 + 重启网关（重载模型约 240s）。**同日稍后（全套件验收时）已整体换新**：后端 `3355dc4f` + 网关 `7a06e5ca` + 演示页 `1db0882d` + 测试脚本，旧件全存 `bak_20260916/`（回滚 = 换回 `rknn_multicard_demo.bak_e223ea8f` 与 `bak_20260916/` 里的文件，再重启）。也就是说"**没有拿 HEAD 整体覆盖**"只在**当天前半段**成立，别按这行去推断板卡此刻的状态 |
+| 网页演示页（**已入库**） | `examples/multicard/serve/demo_4chat.html` | `570c406` = `88a53e8b1935c7ef27bb04959ec7c211`（旧版，四个匿名对话）→ **`bc7f013` = `1db0882d98850b20232d0f96e325c9a1`**。**板卡上的是旧版** `af7240627777f576a24d5f95bd522b38`（2026-09-16 核实，与早前记的 `af72406…` 吻合）——它会以四个匿名对话占住全部 4 个会话（§9.8 咬到 5）；**2026-09-16 已换成 `1db0882d…`**（不换的话，新网关的排队会让旧页面的四个对话互相堵住，演示当场卡死） |
 | M5 启动/构建/验收脚本（**已入库**） | `examples/multicard/serve/*.sh`、`*.py`、`README.md` | 见 `git ls-tree`；板卡路径全部走环境变量 |
-| M5 板端二进制（Release） | 板卡 `<板卡临时目录>/rknn_multicard_demo.serve` | `e223ea8f3f5d38e82a37cd560c29fb96`（1091328 B） |
+| M5 板端二进制（Release） | 板卡 `<板卡安装目录>/rknn_multicard_demo.serve` | `e223ea8f3f5d38e82a37cd560c29fb96`（1091328 B，M5）→ **`3355dc4f44a5f47332c8e0d7528be84d`（1076496 B，`b13bbdb`，2026-09-16 起在板上运行）** |
 | 板卡二进制 | 见 §5 各阶段完成记录的表 | P0 `a6739a6e…` / P0+插桩 `205232b8…` / P1 `6f5aa9d7…` / P2 `8f6e900d…` / P3 `d30ce8af…` / **R11 补锁后 `1b01b960904c7412f64a173b222240a1`** |
 | TSan 二进制（首轮，**不含 R11 锁**） | 板卡 `<板卡临时目录>/rknn_multicard_demo.tsan` | `acb78c120353c73f74725ed1c7a30ed2` |
 | TSan 二进制（补轮，**含 R11 锁**） | 板卡 `<板卡临时目录>/rknn_multicard_demo.tsanr11` | **`7f19e6d505ac443829604765bcb2b142`** |
@@ -1567,10 +1568,75 @@ N=1 时它完全无害（只有一个对话，`bound` 里就一条），所以�
 "断言抓得住缺陷"的判据；上面那条竞态就是它先红出来的（去掉二次判断 → 40 条活里 39 条入队、
 1 条永远没人取）。
 
+**夹具自己也出过一次错，值得记一笔**：收尾时"测试卡住"的救援手段原本是
+`dispatcher.active_workers = 0`。而 `active_workers` 在 `main.cc` 里是**不变量驱动**的计数、只由
+会话线程自己 `--`——手工拧成 0 之后，还没退出的会话线程接着把它减成 **-1**，于是 `dispatcher_push`
+里 `active_workers == 0` 这条退出条件**再也不成立**：救援反而把要救的那个等待锁得更死。同一个变异体
+一次能放行、一次卡到看门狗（退出码 99）超时，看着像"偶发"，其实是这条救援在**自己制造死锁**。有效的
+放行是**清空待办队列**——两侧谓词各有一半立刻为真，一个不变量都不用伪造。**测试装置里的"帮忙"和产品
+代码里的"帮忙"一样危险，它也会静默地把前提条件改掉。**
+
 **边界（说清楚比说满重要）**：桩只保证**调用次数与成败**，不保证张量语义——所以这套证明的是
 「服务侧状态机 + 帧协议」，**证明不了推理结果对不对**。`main.cc` 的**启动**路径（`init_stage`、
 张量/metadata 查询、embedding）也不在覆盖内：夹具是手工构造 stage 的，覆盖的是"会话已经开始
 服务之后"。**本轮未做 aarch64 交叉编译，也未上板**；板上的 `run_all_board_tests.sh` 仍是最终判据。
+
+#### 交叉编译与上板验收：把上面那段边界补掉（2026-09-16）
+
+**证据链**（每一环都可复核）：
+
+| 环节 | 值 |
+|---|---|
+| 源码 | `examples/multicard/cpp/main.cc` md5 `e0c49989c1fc5d1123d6f8201e2ee514` |
+| 交叉编译 | 构建服务器 `GCC_COMPILER=aarch64-linux-gnu`（linaro 6.3.1），走仓库自带的 `build_serve.sh`（Release，不带 sanitizer） |
+| 产物 | `rknn_multicard_demo.serve` md5 `3355dc4f44a5f47332c8e0d7528be84d`，1076496 B，aarch64 ELF |
+| 产物自检 | 比本次构建开始时刻新、`NEEDED` 里没有 libasan/libtsan、`--serve-fd` 与 `REJECT` 各出现 3 次（三条都是脚本里的断言，不满足就退出） |
+| 网关 | `rkllm_gateway.py` md5 `7a06e5ca2b9efb230d119582bbc56961`（= `1dde346`，与后端同一次改动） |
+
+**为什么网关必须和后端一起换，而不是"只换二进制更保守"**：这次后端会发 `REJECT` 帧，而板卡上那份
+网关是旧版、**不认识这个 tag**——不匹配任何分支时它既不处理、**也不读掉载荷**，payload 会被当成
+下一行读走，帧流自此错位（最坏情况读线程抛异常退出 → 之后每个请求 503）。所以混搭不是保守，是
+制造一个**已知会坏**的组合。板上据此做的是全栈替换：后端、网关、演示页、测试脚本一起换成仓库版本，
+旧文件全部留了备份（`bak_20260916/` 与 `rknn_multicard_demo.bak_e223ea8f`），回滚就是换回来重启。
+
+**`run_all_board_tests.sh` 全套（连跑两轮，状态即上面那份产物 + 网关）**：
+
+| 段 | 结果 |
+|---|---|
+| `check_template.py` | rc=0 |
+| `serve_http_test.py`（非流式 / 流式 / KV 复用 / 并发 / 关思考 / 多用户身份 / 池与 `close`） | rc=0，41s |
+| `serve_http_test.py … bigmax` | rc=0 |
+| `sticky_check.py` | rc=0 |
+| `nothink_check.py` | rc=0 |
+| `http_scaling.py … 96 1,2,4` | rc=0，30s |
+| 汇总 | **FAIL 0 / 非零 rc 0 / traceback 0——两轮都全绿** |
+
+两轮的伸缩：N=1 `10.97` / N=2 `20.26`、`20.22`（1.85×、1.84×）/ N=4 **`37.40`、`37.13`（3.41×、3.38×）**，
+对照官方 rkllm3-server 同板同条件 `1.03×`。两轮差 1% 以内，不是单次侥幸。
+
+**这一轮头一次在真后端上跑到的**（此前只在桩后端验过）：§9.8 的身份显式化 / 排队不抢占 /
+`POST /v1/conversations/close` / `GET /v1/pool`。另外 `usage` 的新口径在板上拿到了非零的
+`prompt_tokens_details.cached_tokens`（开思考 180 tok 里复用 168、关思考 188 里复用 172），
+这是"新网关 + 新测试脚本"配对成功的直接证据——旧判据（`prompt_tokens` 比全量小）在旧网关上**必然**
+失败，因为它把 `prompt_tokens` 当成了"本轮增量"。
+
+**R14 在板上复现、也修好了——这是本批唯一一条"改动前 vs 改动后"的板上对照**
+
+`--bucket-size` 默认 128 时，两种记账口径**恰好相等**，所以上面那份全绿**完全说明不了 R14 有没有修**。
+要让它现形必须把 `--bucket-size` 改成别的值，再喂一段跨过 128 token 分块的 prompt：
+
+| 后端 | `--bucket-size` | 同一段 prompt（366 字，`prompt_tokens`=261） |
+|---|---|---|
+| 改动前 `e223ea8f` | 64 | HTTP 503；后端日志 `[stage1] embed buffer too small: need=1361920, got=1310720` + `prefill failed` |
+| 改动后 `3355dc4f` | 64 | HTTP 200，2.1s，答出暗号，后端无失败记录 |
+
+同一份改动前的二进制在这段 prompt 不长时（15 / 42 token）**照常答对**——触发条件是**跨过一个分块**，
+不是"代码肉眼可见地坏了"。这与 R14 那条"默认值下不触发"是同一件事的两面。
+
+**边界（说清楚比说满重要）**：覆盖的是服务侧状态机、帧协议、HTTP 语义与分块记账；**张量语义仍不在
+覆盖内**——推理结果对不对还是靠答案本身目视。`main.cc` 的**启动**路径在板上是真跑的（240s 加载），
+但主机夹具不覆盖它。另外这一轮把 §9.8 那套多用户行为**第一次放到了真后端上**，而它在 4 路演示场景下
+是**新的默认行为**（旧演示页那种四个匿名对话会占满会话、被排队咬到），所以演示页也必须一起换新。
 
 ---
 
@@ -1755,6 +1821,7 @@ KV 复用（HTTP）   续聊 prefill 12 vs 全量 154 tok（开思考 0.08）/ 1
 
 ---
 
+*文档版本：v1.12（2026-09-16）—— **交叉编译 + 上板全套件验收**：把 v1.10 那个"未做 aarch64 交叉编译、未上板"的边界补掉。后端 `3355dc4f`（源码 `e0c49989`）+ 网关 `7a06e5ca` 一起下发，`run_all_board_tests.sh` **连跑两轮全绿**（FAIL 0 / 非零 rc 0 / traceback 0），伸缩 3.41× 与 3.38×（对照官方 server 1.03×）；§9.8 的身份/排队/`close`/`/v1/pool` **第一次在真后端上跑到**；`usage` 新口径在板上拿到非零 `cached_tokens`。**R14 在板上复现并验证修好**（`--bucket-size 64` + 跨分块的 prompt：改动前 `embed buffer too small` + `prefill failed`，改动后正常作答）——这是本批唯一一条板上"改动前 vs 改动后"对照，因为默认 128 下那条 bug 根本不触发。同时修掉一处**记录过期**：§8.1 网关那行的"当前 HEAD"在 `1dde346` 之后就错了*
 *文档版本：v1.11（2026-09-16）—— **把构建服务器上那份未提交的 prefill 分块修复移植进仓库**（新增 R14）：运行时分块按模型的 max dynamic seq len（128）切，不看 `--bucket-size`，所以分块大小必须从 output tensor 反推，否则记账错位报 `embed buffer too small`。**默认 128 下不触发**，这就是它一直没被撞到的原因，也是它在一个检出上躺了很久没进仓库的原因*
 *文档版本：v1.10（2026-09-16）—— **服务侧收尾加固**：新增 `REJECT` 帧（上下文将满改为"拒掉这一轮"，不再自动清 KV 把本轮跑完——那样模型会基于一段没有开头的对话给出一个自信的错答案）、会话线程退出清扫（不清扫则钉给死会话的活占满队列额度 → 输入线程与工作线程互等）、`max_new`/`session` 越界校验（不丢载荷会让帧流**永久**错位）、清 KV 收敛为单一实现；**并记录一次由执行发现的竞态**（`dispatcher_push` 等完队列空间后未重判目标会话存活 → 那条请求永远没有回帧，网关白等 1800s），以及本轮"把服务侧路径搬到主机上执行"的验证结果与它的边界（§9.7）。⚠️ 本轮**未做交叉编译、未上板**，板卡上跑的仍是旧二进制*
 *文档版本：v1.9（2026-09-15）—— **多用户接入（把板卡当边缘服务器）**：新增 §9.8（身份显式化 / **去掉抢占改排队** / **`POST /v1/conversations/close` 主动交还** / 空闲回收 `IDLE_TTL` / `GET /v1/pool` 可观测（槽位带原始 `key`）/ 排队超时 503 / CORS 放行 `X-Conversation-Id`；`demo_multiuser.py` 终端客户端、`--close` 与 `--no-id` 两个对照）；**修订 §9.7 坑 4 的修法描述**（原文写"挑不出干净的才允许窃取"，窃取已删除，改为排队）；联动 §10（新增"多用户接入"行、R12 风险升级为"排队策略可被单个客户端作废"、下一步加两条）。**`close` 是删掉抢占之后才暴露出来的缺口**：抢占时代"不再提问的对话占着会话"无所谓，排队之后它会**永久占住**到 `IDLE_TTL`——所以"排队"要有意义就必须给客户端一条说"我走了"的路。**这个改动会改变所有现有调用方的行为**（`serve_http_test.py` 当场就被自己堵死了：它原先每问一次就换一段新对话），修法是让套件像真实客户端那样显式命名 + 用完 `close`，并在 `IDLE_TTL=0`（**关掉回收**）+ 4 会话下连跑两遍全绿来证明它靠的是自己 `close`。本轮验证**全部在本地桩后端**完成，**板卡上的真后端多人演示尚未跑过***；补 `README.md` 的多用户章节与 `DEMO.md` 第 6 步*
