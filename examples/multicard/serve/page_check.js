@@ -15,6 +15,8 @@
 //   5. 流结束后必须清掉 active    —— render() 曾经把刚算好的 tok/s 统计行覆盖掉
 //   6. 四路必须落在四个不同会话   —— 退化成串行时，屏幕上看不出来，只有会话号能戳穿
 //   7. 统计行必须带会话号         —— 拿不到 X-KV-Reuse 时（缺 Expose-Headers）会静默变空
+//   8. 页面要的 id 必须真实存在   —— 桩不再给不存在的 id 现造元素，拼错的 id 会像浏览器一样
+//     返回 null（见 byId 那段注释）
 //
 // 用法（**必须在 serve/ 目录下跑**，它按相对路径读 demo_4chat.html）：
 //   node page_check.js http://<板卡IP>:8080
@@ -72,14 +74,33 @@ function makeEl(tag) {
   return el;
 }
 
+// ---------- 抽页面里的 script 原样跑 ----------
+const html = fs.readFileSync("demo_4chat.html", "utf8");
+
+// 页面里**静态声明**的 id 全部先建出来（下面 getElementById 只认这些）。
+// 为什么不是"要什么就现造一个"（2026-09-16 修）：桩以前是
+// `getElementById(id) { return (byId[id] = byId[id] || makeEl("div")); }` —— 任何 id
+// 都能凭空拿到一个元素。于是页面把 `getElementById("gstat")` 拼错成少一个 s，桩给一个
+// 空 div，检查照跑照绿；真浏览器里拿到的是 null，下一行取属性就 TypeError，整页白屏。
+// 也就是说**页面上的 id 拼写错误是这套检查唯一测不出来的东西**，而它正是最容易犯的错
+// （改页面时顺手改了 id、忘了改 JS）。现在只认 HTML 里真实存在的 id，要别的就返回 null
+// ——和浏览器一样，拼错立刻暴露。
 const byId = {};
+for (const m of html.matchAll(/\bid="([\w-]+)"/g)) {
+  if (!byId[m[1]]) { byId[m[1]] = makeEl("div"); }
+}
+const missingIds = [];
 const document = {
-  getElementById(id) { return (byId[id] = byId[id] || makeEl("div")); },
+  getElementById(id) {
+    if (byId[id]) { return byId[id]; }
+    missingIds.push(id);
+    console.log("  FAIL: 页面 getElementById(" + JSON.stringify(id)
+                + ") —— HTML 里没有这个 id（拼错了？浏览器这里会返回 null 并抛 TypeError）");
+    return null;
+  },
   createElement(tag) { return makeEl(tag); },
 };
 
-// ---------- 抽页面里的 script 原样跑 ----------
-const html = fs.readFileSync("demo_4chat.html", "utf8");
 let script = /<script>([\s\S]*?)<\/script>/.exec(html)[1];
 if (process.env.MAXTOK) {
   const before = script;
@@ -238,6 +259,14 @@ if (new Set(qs).size !== 4) {
   if (afterClear.length) {
     console.log("FAIL: 清空了但会话没还回去（后来的人要等 IDLE_TTL 超时）");
     bad++;
+  }
+
+  // 页面要过、但 HTML 里不存在的 id。上面每次命中都会打一行 FAIL，这里补一句汇总，
+  // 顺带把"拼错的到底是哪个"钉在最显眼的位置（页面拼错 id 时多半会紧接着 TypeError，
+  // 堆栈会把前面那几行冲掉）。
+  if (missingIds.length) {
+    console.log("\n页面问过的、HTML 里不存在的 id: " + JSON.stringify(missingIds));
+    bad += missingIds.length;
   }
 
   console.log(bad ? "\n===== 有 " + bad + " 项 FAIL =====" : "\n===== 全部通过 =====");

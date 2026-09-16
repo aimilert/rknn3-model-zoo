@@ -72,7 +72,19 @@ QWEN35_DEFAULT_SYSTEM = "You are Qwen, created by Alibaba Cloud. You are a helpf
 # ===========================================================================
 
 class BackendError(Exception):
-    pass
+    """后端给出的一次失败。
+
+    `soft` 区分两种失败，因为对客户端的语义完全不同：
+      · soft=False（默认）——后端出了问题，或者会话的驱动线程已经死了。503，
+        客户端该重试；会话同时被标死（见 SessionPool.mark_dead）。
+      · soft=True——**这一轮被后端拒了，但会话是好的**（目前只有"上下文装不下"，
+        见 main.cc 的 REJECT 帧）。这是客户端要改请求的错误（历史太长），所以回 400
+        而不是 503——503 会让客户端原样重试，而原样重试必然再次被拒。
+    """
+
+    def __init__(self, message, soft=False):
+        Exception.__init__(self, message)
+        self.soft = soft
 
 
 class _Request(object):
@@ -94,10 +106,18 @@ class _Request(object):
         self.prefill_ms = 0.0
         self.decode_ms = 0.0
         self.context_tokens = 0
-        self.was_cleared = False        # 后端在本轮里清过 KV（上下文将满）
+        self.was_cleared = False        # 后端在本轮里清过 KV（上下文将满 / RESET）
+        self.rejected = False           # 后端在 prefill 前拒了这一轮（会话没死，见 REJECT）
         self.on_delta = None            # 流式回调；在 reader 线程里被调用
         self.dead = False               # 后端进程没了
         self.kv = None                  # 会话池本轮的复用决策，用于 X-KV-Reuse 头
+        # 「谁把这一段字节交给客户端」的账本。reader 线程（有帧就投）和 HTTP 线程
+        # （接手时把等待期间攒下的补发）是两条线程，两边都要原子地决定这件事：
+        # `delivered` 是 raw 里**已经交出去**的字节数，两边都在 deliver_lock 里推进它，
+        # 于是每个字节恰好交一次（重复投递和整段重发都由此消失），且解码器按字节
+        # 顺序被喂——跨帧切开的 UTF-8 字符才拼得回来。
+        self.delivered = 0
+        self.deliver_lock = threading.Lock()
 
     def text(self):
         return self.raw.decode("utf-8", "replace")
@@ -195,9 +215,10 @@ class Backend(object):
                     self.sessions = int(f[0])
                     self.default_max_new_tokens = int(f[1])
                     self._ready.set()
-                elif tag in (b"DELTA", b"ERR"):
-                    # DELTA 是 `DELTA <rid> <n>`，ERR 多一个 session 字段：
-                    # `ERR <rid> <session> <n>`（写侧见 cpp/main.cc 的 serve_err）。
+                elif tag in (b"DELTA", b"ERR", b"REJECT"):
+                    # DELTA 是 `DELTA <rid> <n>`，ERR/REJECT 多一个 session 字段：
+                    # `ERR <rid> <session> <n>`、`REJECT <rid> <session> <n>`
+                    # （写侧见 cpp/main.cc 的 serve_err / serve_reject）。
                     # **两个不能共用一套解析**：按 DELTA 切第一刀的话，ERR 的 n 会拿到
                     # "<session> <n>"，int() 抛异常 → 读线程死 → 所有在途请求被判
                     # "backend exited" → 之后每个请求都 503，直到重启网关。一次"某轮
@@ -240,21 +261,46 @@ class Backend(object):
         if q is None:
             return          # 客户端已经放弃这个 rid 了，丢掉帧即可
         if tag == b"DELTA":
-            q.raw.extend(payload)
-            if q.on_delta is not None:
+            # 与 HTTP 线程的"接手补发"互斥：要么这一段由我投递（delivered 随之推进），
+            # 要么它还留在 raw 里等着被补发，两者只能发生一件。
+            with q.deliver_lock:
+                q.raw.extend(payload)
+                if q.on_delta is None:
+                    return          # 还没人接手（HTTP 线程尚未走到 attach）：先攒着
                 chunk = q.decoder.decode(bytes(payload))
-                if chunk:
-                    try:
-                        q.on_delta(chunk)
-                    except Exception:
-                        # 客户端断开了：不影响后端，继续把这一轮读完
-                        q.on_delta = None
+                q.delivered += len(payload)
+                cb = q.on_delta
+            if chunk:
+                try:
+                    cb(chunk)
+                except Exception:
+                    # 客户端断开了：不影响后端，继续把这一轮读完
+                    q.on_delta = None
+        elif tag == b"REJECT":
+            # 后端在 prefill **之前**拒了这一轮（上下文装不下）：会话还活着，只是这一轮
+            # 一个 token 都没跑。所以只失败这一条请求，**绝不能标死这个会话**。
+            q.rejected = True
+            q.error = payload.decode("utf-8", "replace")
+            q.done.set()
         else:               # ERR
             q.error = payload.decode("utf-8", "replace")
             q.done.set()
 
     def _handle_done(self, f):
         if len(f) < 8:
+            # 字段不齐的 DONE **不能静默 return**：这个请求从此既没有 DONE 也没有 ERR，
+            # 会一直挂在 HTTP 线程的 q.done.wait(REQUEST_TIMEOUT) 上（默认 1800s），
+            # 期间白占着一个会话租约——别的对话只能排队等它超时。按 rid 判它失败，
+            # 让客户端立刻拿到一个能看懂的错误，同时读线程照常活着（不牵连其他请求）。
+            try:
+                rid = int(f[0])
+            except (IndexError, ValueError):
+                sys.stderr.write("[gateway] malformed DONE frame: %r\n" % (f,))
+                return
+            q = self._get(rid)
+            if q is not None and not q.done.is_set():
+                q.error = "malformed DONE frame from backend: %r" % (f,)
+                q.done.set()
             return
         rid = int(f[0])
         q = self._get(rid)
@@ -307,7 +353,7 @@ class Backend(object):
         if not q.done.wait(timeout):
             raise BackendError("timeout after %.0fs waiting for request %d" % (timeout, q.rid))
         if q.error:
-            raise BackendError(q.error)
+            raise BackendError(q.error, soft=q.rejected)
         return q
 
     def release_request(self, q):
@@ -599,6 +645,23 @@ class SessionPool(object):
         return Lease(session, prompt, "", base is None or bool(base),
                      key=key, waited=waited)
 
+    def discard(self, lease):
+        """这一轮**根本没跑**（后端在 prefill 前拒了它）：只把会话还回去，不动 known。
+
+        不能走 release()：它会把「本轮发出的 prompt」算进"KV 里确定装着的内容"，而这一
+        轮一个 token 都没 prefill 进去。照 release 记账的话，下一轮网关会以为历史都在、
+        只发差异部分——模型看到的是一段没有开头的对话，答出来通顺但串味，正是这套记账
+        存在的意义反面。known 由 CLEAR 帧的 `_on_clear` 置成 None（后端在拒之前先发了
+        CLEAR），下一轮必定 RESET 全量重发，这才是对的。
+        """
+        with self.cv:
+            s = lease.session
+            if 0 <= s < self.n:
+                self.busy[s] = False
+            if lease.key is not None and lease.key in self.bound:
+                self.last_used[lease.key] = time.time()
+            self.cv.notify_all()
+
     def release(self, lease, generated_text, was_cleared):
         """本轮结束后，把「KV 里现在确定装着什么」写回去。
 
@@ -742,6 +805,12 @@ class Gateway(object):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "rkllm-openai-gateway/1.0"
+    # 读请求行的超时。默认（None = 不超时）+ ThreadingHTTPServer 是一个没有上限的组合：
+    # 只连上、一个字节都不发的客户端会把那一个线程**永久**占住（每个连接一个线程，没有
+    # 上限），几百个空连接就能把内存吃干。超时后按默认行为关连接、放掉线程。
+    # 注意它只作用于"读下一次请求"，不作用于我们正在生成的那一轮——生成期间我们在写、
+    # 不在读，长上下文一轮跑几百秒也不会被它打断。
+    timeout = 60.0
 
     gateway = None          # 由 main() 注入
 
@@ -956,23 +1025,35 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._blocking_response(req, q, enable_thinking)
         except BackendError as exc:
-            self._fail(503, str(exc), "server_error")
+            if exc.soft:
+                # 后端拒了这一轮（上下文装不下）：这是**客户端要改请求**的错误，不是
+                # 服务端故障。回 503 的话客户端会原样重试，而原样重试必然再被拒一次。
+                self._fail(400, str(exc), "invalid_request_error")
+            else:
+                self._fail(503, str(exc), "server_error")
         except Exception as exc:                        # noqa: BLE001
             self._fail(500, "%r" % (exc,), "server_error")
         finally:
             # 无论成功、失败还是客户端断开，都要把会话还回去；推理失败还要把会话标死。
             if lease is not None:
-                failed = q is None or q.error or q.dead
-                if failed:
-                    self.gateway.pool.mark_dead(lease.session)
-                    self.gateway.pool.release(lease, "", True)
+                if q is not None and q.rejected:
+                    # 后端在 prefill 前拒了这一轮：会话**没死**。标死它就等于每撞一次
+                    # 上下文超限就永久少一个会话。而且这一轮一个 token 都没进 KV，
+                    # 记账也不能走 release（见 pool.discard）。
+                    self.gateway.pool.discard(lease)
                 else:
-                    # 记账用的必须是**客户端会回显的那份文本**，也就是摘掉 think 段之后的
-                    # 版本：下一轮 prompt 是这个版本的拼接，前缀判据才有可能成立。用
-                    # q.text()（原始版）记的话，关思考时每轮都会判"对不上"，缓存静默全废
-                    # ——而且答案是对的，看不出来（nothink_check.py 抓的就是这个）。
-                    self.gateway.pool.release(
-                        lease, strip_think(q.text(), enable_thinking), q.was_cleared)
+                    failed = q is None or q.error or q.dead
+                    if failed:
+                        self.gateway.pool.mark_dead(lease.session)
+                        self.gateway.pool.release(lease, "", True)
+                    else:
+                        # 记账用的必须是**客户端会回显的那份文本**，也就是摘掉 think 段
+                        # 之后的版本：下一轮 prompt 是这个版本的拼接，前缀判据才有可能
+                        # 成立。用 q.text()（原始版）记的话，关思考时每轮都会判"对不上"，
+                        # 缓存静默全废——而且答案是对的，看不出来（nothink_check.py 抓的
+                        # 就是这个）。
+                        self.gateway.pool.release(
+                            lease, strip_think(q.text(), enable_thinking), q.was_cleared)
             if q is not None:
                 self.gateway.backend.release_request(q)
 
@@ -1025,10 +1106,20 @@ class Handler(BaseHTTPRequestHandler):
         def on_delta(text):
             emit(text)
 
-        q.on_delta = on_delta
-        # 已经攒在 q.raw 里的那部分（等待期间的 token）也要补发
-        if q.raw:
-            emit(q.text())
+        # 接手：与 reader 线程在 deliver_lock 里交接，保证"等待期间攒下的那一段"
+        # 恰好交一次。两点都不能省：
+        #   · 只补发 raw 里 delivered 之后的字节，不是整段 raw——整段重发正是
+        #     "首段内容重复"的来源（reader 可能正好在 attach 的瞬间投过一段）；
+        #   · 补发也走 q.decoder（增量解码器），因为跨帧切开的 UTF-8 字符要靠它拼回来；
+        #     整段 decode 会在切缝处吐出替换字符，那个字符就**消失**了。
+        with q.deliver_lock:
+            q.on_delta = on_delta
+            backlog = b""
+            if q.delivered < len(q.raw):
+                backlog = q.decoder.decode(bytes(q.raw[q.delivered:]))
+                q.delivered = len(q.raw)
+        if backlog:
+            emit(backlog)
         q.done.wait(REQUEST_TIMEOUT)
         if not q.done.is_set():
             self.gateway.pool.mark_dead(lease.session)
@@ -1038,10 +1129,14 @@ class Handler(BaseHTTPRequestHandler):
         if q.error:
             # HTTP 头已经发出去了，只能用 SSE 里的错误对象收尾：先报错，再按协议
             # 正常结束这个流（clients 普遍是看到 [DONE] 才算读完）。
-            sse({"error": {"message": q.error, "type": "server_error"}})
+            # 被拒（上下文装不下）时类型是客户端错误：流式下虽然已经回不了 400 状态码，
+            # 但 type 字段至少要如实说这是请求的问题，客户端才好决定是重试还是改请求。
+            sse({"error": {"message": q.error,
+                           "type": "invalid_request_error" if q.rejected
+                                   else "server_error"}})
             self._chunk(b"data: [DONE]\n\n")
             self._chunk(b"")
-            raise BackendError(q.error)
+            raise BackendError(q.error, soft=q.rejected)
 
         # 收尾前先把 stripper 里还攒着的字节放出来（正常情况是空；被截断在 <think> 里时
         # 会连标签一起吐出来，见 flush() 的说明），否则客户端会少一段正文。
@@ -1066,7 +1161,7 @@ class Handler(BaseHTTPRequestHandler):
         if not q.done.is_set():
             raise BackendError("timeout waiting for generation")
         if q.error:
-            raise BackendError(q.error)
+            raise BackendError(q.error, soft=q.rejected)
         created = int(time.time())
         self._json(200, {
             "id": "chatcmpl-%d-%d" % (created, q.rid),
@@ -1080,16 +1175,46 @@ class Handler(BaseHTTPRequestHandler):
         }, extra_headers=kv_reuse_headers(q.kv))
 
     def _usage(self, q):
-        return {"prompt_tokens": q.prefill_tokens,
+        """OpenAI 口径的 usage。
+
+        `prompt_tokens` 是**客户端发来的那段 prompt 的长度**，不是后端本轮真正算过
+        的那部分。命中 KV 复用时后端只报增量（板上实测：整段 522 字节的 prompt，
+        本轮只 prefill 了对应 84 字节的那部分；DONE 帧第 4 字段就是这个增量），
+        照搬进 prompt_tokens 会让客户端以为上下文只有 21 tok——按它做上下文预算
+        就**永远不会触发裁剪**，一路涨到后端自动清 KV，然后出现那种"只错一轮、
+        不留痕"的答案。
+
+        所以：prompt_tokens = 本轮结束时的上下文长度 − 本轮生成的 token 数；
+        被复用的那部分放 prompt_tokens_details.cached_tokens（OpenAI 同名字段）。
+        两个数都来自 DONE 帧（第 4 与第 8 字段），网关不需要自己分词。
+        """
+        ctx = q.context_tokens or (q.prefill_tokens + q.decode_tokens)
+        prompt_tokens = max(0, ctx - q.decode_tokens)
+        cached = max(0, prompt_tokens - q.prefill_tokens)
+        return {"prompt_tokens": prompt_tokens,
                 "completion_tokens": q.decode_tokens,
-                "total_tokens": q.prefill_tokens + q.decode_tokens}
+                "total_tokens": prompt_tokens + q.decode_tokens,
+                # 恒存在（没错时是 0）：客户端读它时不必先判有没有这个键。
+                "prompt_tokens_details": {"cached_tokens": cached}}
+
+
+# 帧协议里 max_new_tokens 字段实际按 `int` 用（后端拿 `%llu` 读进来之后要落到
+# `PendingInput::max_new_tokens` 这个 int）。后端 2026-09-16 起会**拒收**超出这个范围的
+# 值（回 ERR），所以这里必须先卡住——否则一个客户端随口写 `"max_tokens": 1e12`
+# 就能让后端回 ERR，而 ERR 的含义是"这个会话的驱动线程没了"，网关据此把会话标死：
+# **四次离谱的 max_tokens 就能把整个服务打死**。这是客户端不该有能力做到的事。
+MAX_NEW_TOKENS_CAP = 0x7fffffff
 
 
 def _pick_max_tokens(req):
     for name in ("max_tokens", "max_completion_tokens", "n_predict", "max_new_tokens"):
         v = req.get(name)
         if isinstance(v, int) and v > 0:
-            return v
+            # **夹住而不是回 400**：`"max_tokens": 100000` 是客户端很常见的写法，意思是
+            # "能吐多少吐多少"，不是"我要十万个 token"。真按 400 拒掉会把正常的 OpenAI
+            # 风格客户端挡在门外。夹到上限之后语义仍然正确——后端本来就会在 EOS 或上下文
+            # 耗尽时停，这个字段只是个上界。
+            return min(v, MAX_NEW_TOKENS_CAP)
     return 0        # 0 = 让后端用它自己的默认值（--n-predict）
 
 
@@ -1207,6 +1332,77 @@ def kv_reuse_headers(kv):
 # 5. 自检：只验帧协议，不起 HTTP
 # ===========================================================================
 
+def selftest_reject(backend, check):
+    """REJECT 的回归：后端拒了一轮（上下文装不下），网关这半边该做什么。
+
+    对应的缺陷：serve 模式下"上下文将满"原本是后端**自动清 KV 再把这一轮跑完**，而
+    网关只发增量（`prompt[len(base):]`）→ 模型拿到的是一段没有开头的对话 → 以一个
+    自信的错答案、finish_reason=stop 返回。不报错、不重试、只错一轮，是最难查的一类。
+
+    改成后端发 CLEAR+REJECT 之后，网关这半边有三条义务：
+      ① 只失败这一条请求，而且是**软错误**（HTTP 400，而不是 503——客户端要做的是改
+         请求，原样重试必然再被拒一次）；
+      ② 会话照常留在池子里（标死等于每撞一次超限就永久少一个会话，四次之后没会话可用）；
+      ③ 粘性记录作废（下一轮 RESET 全量重发），**且不能把这一轮的 prompt 记进 KV 账**
+         ——这一轮一个 token 都没 prefill 进去。
+
+    单独成一个函数是因为它要**另起一个桩后端**（--ctx-limit 是桩专有的开关）。
+    真后端上这段跑不了，调用处会 SKIP。
+    """
+    rb = Backend(list(backend.argv) + ["--ctx-limit", "500"],
+                 backend.log_path + ".reject", frame_fd=backend.frame_fd)
+    rb.start()
+    try:
+        rpool = SessionPool(rb, idle_ttl=0, queue_timeout=5)
+        # 第一轮：ctx 还是 0，不该触发（真后端同理：空的会话没什么"装不下"的）
+        l1 = rpool.acquire("reject-probe", render_messages(
+            [{"role": "user", "content": "记住暗号：青柠味苏打水。"}]))
+        q1 = rb.submit(l1.sent_prompt, 8, session=l1.session, reset=l1.reset)
+        rb.wait(q1)
+        rpool.release(l1, q1.text(), q1.was_cleared)
+        sess = l1.session
+        rb.release_request(q1)
+        check("第一轮正常跑完（还没到上限）", q1.error is None and q1.decode_tokens > 0,
+              "ctx=%d" % q1.context_tokens)
+
+        # 第二轮：桩的 ctx 已经攒够，会回 CLEAR + REJECT
+        l2 = rpool.acquire("reject-probe", render_messages(
+            [{"role": "user", "content": "记住暗号：青柠味苏打水。"},
+             {"role": "assistant", "content": q1.text()},
+             {"role": "user", "content": "再说一遍暗号。"}]))
+        q2 = rb.submit(l2.sent_prompt, 8, session=l2.session, reset=l2.reset)
+        soft = None
+        try:
+            rb.wait(q2)
+        except BackendError as exc:
+            soft = exc
+        check("被拒的那轮抛的是**软**错误（HTTP 层会回 400 而不是 503）",
+              soft is not None and soft.soft and "context limit" in str(soft), "%r" % (soft,))
+        check("这一轮确实没跑（没有 DONE 的计数）",
+              q2.decode_tokens == 0 and q2.finish_reason is None)
+        check("CLEAR 帧到了（粘性记录必须作废）", q2.was_cleared)
+
+        # 模拟 HTTP 线程的 finally 那段处置（这里没有 HTTP 层，selftest 只到协议这一层）
+        if q2.rejected:
+            rpool.discard(l2)
+        else:                                   # pragma: no cover - 上面的断言已覆盖
+            rpool.release(l2, "", True)
+        rb.release_request(q2)
+        check("会话没被标死（还能继续用）", not rpool.dead[sess], "dead=%s" % (rpool.dead[sess],))
+        check("会话已归还（不再占着租约）", not rpool.busy[sess])
+        check("KV 账没被这一轮污染：known 是 None（未知），不是本轮 prompt",
+              rpool.known[sess] is None, "known=%r" % (rpool.known[sess],))
+
+        # 下一轮必须 RESET 全量重发（known=None 的语义），而不是拿增量去拼一段残缺历史
+        l3 = rpool.acquire("reject-probe", render_messages(
+            [{"role": "user", "content": "全新的一轮。"}]))
+        check("被拒之后下一轮走 RESET 全量重发，不复用", l3.reset and l3.base == "",
+              "reset=%s base=%r" % (l3.reset, l3.base[:20]))
+        rpool.release(l3, "", True)
+    finally:
+        rb.stop()
+
+
 def selftest(backend, pool):
     """验证 C++ 侧的帧协议。比"直接上 HTTP"分段定位得清楚：协议不通时不用怀疑 HTTP。"""
     ok = True
@@ -1220,6 +1416,17 @@ def selftest(backend, pool):
     check("sessions", backend.sessions == pool.n, "sessions=%d" % backend.sessions)
     check("default max_new_tokens", backend.default_max_new_tokens > 0,
           "= %d" % backend.default_max_new_tokens)
+
+    print("== max_tokens 夹到后端能接受的范围（否则一个离谱的值能打死一个会话）==")
+    check("不传 => 0（用后端默认值）", _pick_max_tokens({}) == 0,
+          "= %d" % _pick_max_tokens({}))
+    check("正常值原样透传", _pick_max_tokens({"max_tokens": 2000}) == 2000,
+          "= %d" % _pick_max_tokens({"max_tokens": 2000}))
+    check("超大值被夹到上限（不是原样发出去）",
+          _pick_max_tokens({"max_tokens": 10 ** 12}) == MAX_NEW_TOKENS_CAP,
+          "10**12 -> %d" % _pick_max_tokens({"max_tokens": 10 ** 12}))
+    check("上限本身不变", _pick_max_tokens({"max_tokens": MAX_NEW_TOKENS_CAP}) == MAX_NEW_TOKENS_CAP,
+          "= %d" % MAX_NEW_TOKENS_CAP)
 
     print("== 单请求（非流式）==")
     p1 = render_messages([{"role": "user", "content": "用一句话说明你是谁。"}])
@@ -1500,6 +1707,14 @@ def selftest(backend, pool):
     else:
         print("  [SKIP] 只有 %d 个会话，跳过并发项" % backend.sessions)
 
+    print("== REJECT：后端拒了一轮，会话**不能**被标死 ==")
+    if any("fake_backend" in str(a) for a in backend.argv):
+        selftest_reject(backend, check)
+    else:
+        # 真后端没有 --ctx-limit，造不出这个帧序；真板上要把一段对话撑到 4096 token 才
+        # 触发，那不叫自检、那叫压测。真后端那半个只能在板卡上手动验（把上下文跑满）。
+        print("  [SKIP] 这一段要桩后端（--ctx-limit 是桩专有的开关）")
+
     print("\n%s" % ("自检全部通过" if ok else "自检有失败项，见上面的 FAIL"))
     return 0 if ok else 1
 
@@ -1514,7 +1729,9 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--sessions", type=int, default=4,
-                    help="期望的会话数；与后端 READY 报的对不上就退出")
+                    help="期望的会话数。与后端 READY 报的对不上时**只警告、不退出**——"
+                         "池子大小取自后端报的数（它才是真正知道几个会话可用的一方），"
+                         "这个参数只是让你早点看见「参数和实际对不上」，真不一致也照样能服务")
     ap.add_argument("--backend-log", default="gateway_backend.log")
     ap.add_argument("--idle-ttl", type=float, default=DEFAULT_IDLE_TTL,
                     help="一段对话静默超过这么多秒就把它占的会话收回给排队者"

@@ -1,5 +1,9 @@
 # 运行时副产物，不入库（网关一跑就会生成）
 gateway.log
 gateway_backend.log
+# `--selftest` 里那条 REJECT 用例会另起一个后端，日志落在 `gateway_backend.log.reject`
+# （见 rkllm_gateway.py:1353），所以要连后缀一起挡——只写上面那一条的话，跑一次自检
+# 就会在 `git status` 里多出一个未跟踪文件。
+gateway_backend.log*
 board_tests.log
 __pycache__/

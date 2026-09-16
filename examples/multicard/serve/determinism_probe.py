@@ -18,6 +18,11 @@ top_p=0.9，top_k=1 就是取 argmax，温度乘不改变 argmax 的顺序，是
      和 A 组的固有抖动相比是否更大——这是判断「复用有没有引入额外差异」的唯一办法）
 
 用法：python3 determinism_probe.py http://127.0.0.1:8080
+
+**用完全部交还**（2026-09-16 修）：本脚本一共用 6 段对话（A 组 1 + B 组 3 + C 组 2），
+而板卡的会话池只有 4 个。以前一个都不 close，前 4 段就占满了池子，第 5 段开始要等
+`IDLE_TTL`（默认 300s）——探针看着"在跑"，其实卡在排队上，量出来的时间全是等待。
+所以 A 组、B 组各用完立刻交还，C 组跑完再还。
 """
 import json
 import sys
@@ -41,9 +46,21 @@ def chat(messages, conv, max_tokens=NP):
     return d["choices"][0]["message"]["content"], d["usage"]["prompt_tokens"]
 
 
+def close_conv(conv):
+    """告诉网关"这段对话结束了"，把会话立刻还回去（不等 IDLE_TTL）。"""
+    body = json.dumps({"conversation_id": conv}).encode("utf-8")
+    req = urllib.request.Request(BASE + "/v1/conversations/close", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def show(tag, outs, prefills):
     uniq = len(set(outs))
-    print("  %s: prefill=%s, 不同回答数=%d/%d" % (tag, prefills, uniq, len(outs)))
+    # 标签是 prompt_tok 而不是 prefill：usage.prompt_tokens 的口径是**整段 prompt**
+    # （2026-09-16 起网关改成 OpenAI 口径）。这里只拿它做"同条件两次运行是否一致"的
+    # 对照，所以口径变化不影响结论，只影响它叫什么名字。
+    print("  %s: prompt_tok=%s, 不同回答数=%d/%d" % (tag, prefills, uniq, len(outs)))
     for i, o in enumerate(outs):
         print("      [%d] %r" % (i, o[:70].replace("\n", " ")))
     return uniq
@@ -60,6 +77,7 @@ for i in range(3):
     oa.append(o)
     pa.append(p)
 ua = show("同 session 重复", oa, pa)
+close_conv("det-same")
 
 print("== B. 三个不同 conversation_id（三个不同 session），同一 prompt ==")
 ob, pb = [], []
@@ -68,6 +86,8 @@ for i in range(3):
     ob.append(o)
     pb.append(p)
 ub = show("跨 session", ob, pb)
+for i in range(3):
+    close_conv("det-sess-%d" % i)
 
 print("== C. 粘性复用的第二轮 vs 全量 prefill，差异量级 ==")
 FILLER = "请记住这个口令：紫色犀牛731。后面我会问你。" * 6
@@ -82,6 +102,8 @@ print("     粘性答=%r" % o_s[:70].replace("\n", " "))
 print("     全量答=%r" % o_f[:70].replace("\n", " "))
 print("     粘性含口令=%s, 全量含口令=%s"
       % ("紫色犀牛731" in o_s, "紫色犀牛731" in o_f))
+close_conv("det-sticky")
+close_conv("det-full-0")
 
 print()
 print("结论提示：若 A 组就不复现，则任何逐字节判据都不成立，验收只能用语义判据；")

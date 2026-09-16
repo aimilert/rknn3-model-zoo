@@ -164,6 +164,21 @@ static void serve_err(uint64_t rid, int session, const std::string& message)
               message.data(), message.size());
 }
 
+// 后端在 prefill **之前**拒了这一轮：会话是好的，只是这一轮没跑（目前只有「上下文
+// 装不下」一种）。
+//
+// 为什么单开一个帧类型而不是复用 ERR：网关对两者的处置**必须**不同。ERR 的含义是
+// "该会话的驱动线程已经退出"，网关收到就把这个会话标死、不再往上派活——那是对的。
+// 而上下文装不下不是会话的错，标死等于每撞一次超限就永久少一个会话，四次之后整个
+// 服务没会话可用。所以 REJECT 让网关只失败这一条请求（HTTP 400）并把粘性记录作废，
+// 会话本身照常留在池子里。
+static void serve_reject(uint64_t rid, int session, const std::string& message)
+{
+  serve_frame("REJECT ", std::to_string(rid) + " " + std::to_string(session) + " " +
+                           std::to_string(message.size()),
+              message.data(), message.size());
+}
+
 enum class InferencePhase
 {
   PREFILL,
@@ -363,9 +378,14 @@ struct Conversation
   double                    total_prefill_ms = 0.0;
   double                    total_decode_ms = 0.0;
 
-  // 并发模式专用：会话编号、错误标记、墙钟耗时（含等锁与等流水线的时间，
+  // 并发模式专用：错误标记、墙钟耗时（含等锁与等流水线的时间，
   // 与 total_decode_ms 里的纯 NPU 时间不同——后者只统计 session_run 本身）。
-  int                       index = 0;
+  //
+  // 这里原本有个 `int index`（会话编号）：全文件只有并发基准那一条路径给它赋过值
+  // （`conv->index = s`），**没有任何读点**——真正需要编号的地方（打印、派发、
+  // `[s<i>]` 前缀）用的都是 driver 的参数 `index` 或会话在 vector 里的下标。
+  // 有写没读的字段比没有字段更坏：它让人以为"Conversation 自己知道我是几号"，
+  // 而实际值取决于路径（服务/交互路径下永远是 0）。2026-09-16 连同那句赋值一起删。
   bool                      failed = false;
   double                    wall_ms = 0.0;
   // 交互式多会话专用：本会话处理完成的轮数。
@@ -880,9 +900,12 @@ static void print_usage(const char* program)
          "                                Requests on stdin: 'REQ <rid> <session| -1>\n"
          "                                <max_new_tokens> <reset> <prompt_len>' + prompt_len\n"
          "                                raw bytes, one frame per request; 'QUIT' to stop.\n"
-         "                                Replies: DELTA/DONE/CLEAR/ERR frames on the frame\n"
-         "                                fd (--serve-fd, default 3), so stray logs on stdout\n"
-         "                                cannot corrupt the stream.\n"
+         "                                Replies: DELTA/DONE/CLEAR/ERR/REJECT frames on the\n"
+         "                                frame fd (--serve-fd, default 3), so stray logs on\n"
+         "                                stdout cannot corrupt the stream. ERR = that\n"
+         "                                session's driver thread exited (the session is\n"
+         "                                dead); REJECT = this turn was refused before it\n"
+         "                                ran, the session is still usable.\n"
          "                                Also emits 'READY <nsessions> <default_n>' first.\n"
          "  --serve-fd <n>                frame channel fd for --serve (default: 3). The\n"
          "                                gateway passes its pipe write end and names it here\n");
@@ -1518,7 +1541,18 @@ static int tokenizer_callback(void* userdata, const char* text, int32_t text_len
     return -1;
   }
 
-  int n_tokens = tokenizer->Tokenize(text, text_len, tokens, n_tokens_max);
+  // 这里**必须**取 g_tokenizer_mutex，理由是那把锁自己的注释里写的那条：
+  // Tokenizer 没有线程安全承诺，所以 decode 路径（result_callback -> TokenToPiece/
+  // Decode）一直串行化着。但 prefill 路径的 Tokenize 是从**本回调**进的，而它跑在
+  // 另一张卡的那个会话线程上——两边各自持有的是**不同的 run_mutex**，那把锁根本
+  // 排除不了彼此。于是 card 0 上 prefill 的 Tokenize 会和 card 3 上 decode 的 Decode
+  // 同时进同一个 tokenizer 对象。成本可忽略（一次微秒级，相比 80ms/token）。
+  // 注：TSan 看不到这条——tokenizer 在闭源的预编译库里，没被插桩。
+  int n_tokens = 0;
+  {
+    std::lock_guard<std::mutex> tokenizer_lock(g_tokenizer_mutex);
+    n_tokens = tokenizer->Tokenize(text, text_len, tokens, n_tokens_max);
+  }
   VLOG("[tokenizer_callback] text=%s, text_len=%d, n_tokens=%d\n", text, text_len, n_tokens);
   if (n_tokens <= 0) {
     printf("tokenizer failed for input text\n");
@@ -2465,6 +2499,31 @@ struct SessionTiming
   bool    valid = false;
 };
 
+// 清掉一个会话在所有卡上的 KV，并把它的对话状态复位（下次 prefill 会重新带 system 轮）。
+//
+// 逐卡取锁、取一张放一张（§3.4 锁序不变量）：SDK 要求「同一个 rknn3_context 的并发
+// 使用由调用方保证线程安全」，而本会话的 session 和别的会话的 session 同处一张卡的
+// **同一个 context** 上——清 KV 虽然只动本会话自己的 KV 缓冲（P0 探针已证 KV 隔离），
+// 但它仍是对该 context 的一次 SDK 调用，可能与另一路正在跑的 session_run 并发。
+//
+// **这是全文件唯一的清 KV 实现，五处调用点都走它**（上下文将满时自动清 ×2、
+// 网关请求的 RESET、两处收尾清理）。放在这里而不是放在第一个调用点旁边，是因为
+// `Conversation` 得先定义完——helper 抽出来了却只有两处用它、另外三处还各抄一份持锁
+// 循环，等于把"漏掉某一边的锁"的风险原样留着（2026-09-16 改）。
+//
+// 收尾那两处（所有驱动线程 join 之后）其实没有并发、不需要锁；照样走这里是为了
+// **不留第二份实现**——多一份就多一处将来只改一半的地方。它们顺带把会话状态复位，
+// 紧接着会话就被销毁，无影响。
+static void clear_conversation_kv(std::vector<StageContext>& stages, Conversation& conv)
+{
+  for (size_t i = 0; i < stages.size(); ++i) {
+    std::lock_guard<std::mutex> card_lock(stages[i].run_mutex);
+    rknn3_session_clear_kvcache(conv.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
+  }
+  conv.context_tokens = 0;
+  conv.first_turn = true;
+}
+
 // 一个会话的驱动循环。首轮用 first_prompt（与单会话路径同源，便于逐 token 对比），
 // 后续轮用模板拼出的续写 prompt。
 static void run_conversation_worker(Conversation& conv, std::vector<StageContext>& stages,
@@ -2483,13 +2542,7 @@ static void run_conversation_worker(Conversation& conv, std::vector<StageContext
     if (conv.context_tokens > 0 && context_limit > 0 &&
         conv.context_tokens + prefill_reserve >= context_limit) {
       // 与交互模式同一条策略：快满了就清 KV 重开一段对话（只影响本会话）。
-      //
-      // 清 KV 也要取卡级锁（逐卡取、取一张放一张）。理由：SDK 要求「同一个
-      // rknn3_context 的并发使用由调用方保证线程安全」，而本会话的 session 和
-      // 别的会话的 session 同处一张卡的**同一个 context** 上——清 KV 虽然只动
-      // 本会话自己的 KV 缓冲（P0 探针已证 KV 隔离），但它仍是对该 context 的
-      // 一次 SDK 调用，可能与另一路正在跑的 session_run 并发。
-      // 粒度仍是「同时只持一张卡的锁」，不破坏 §3.4 的锁序不变量。
+      // 清 KV 的取锁规矩在 clear_conversation_kv 里（逐卡取、取一张放一张）。
       //
       // 用 VLOG 而不是 printf：--rounds 是已验收路径，默认输出必须逐字节不变。
       // 但这条清 KV 分支原本**没有任何日志**，测试时无法证明它真被走到了（这正是
@@ -2497,12 +2550,7 @@ static void run_conversation_worker(Conversation& conv, std::vector<StageContext
       // --verbose 打开即可计数。
       VLOG("[conv] context %llu/%llu nearly full, clearing KV cache\n",
            (unsigned long long)conv.context_tokens, (unsigned long long)context_limit);
-      for (size_t i = 0; i < stages.size(); ++i) {
-        std::lock_guard<std::mutex> card_lock(stages[i].run_mutex);
-        rknn3_session_clear_kvcache(conv.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
-      }
-      conv.context_tokens = 0;
-      conv.first_turn = true;
+      clear_conversation_kv(stages, conv);
     }
 
     // 首轮直接用 --prompt 原文（与单会话路径同源，token id 才具备可比性）；
@@ -2597,6 +2645,29 @@ struct InteractiveDispatcher
   // 提前退出，而输入线程正卡在「待办队列满了」的反压等待上——没人会再来消费
   // 队列，它就永远等下去。归零时把输入线程一并放行。
   int                     active_workers = 0;
+  // 每个下标上的会话线程是否还活着（下标 = 会话号，启动时全 true）。
+  //
+  // 为什么非要有这一张表：服务模式下「钉给会话 i」的活**只有 i 能接**（见
+  // pending_takeable），所以 i 的线程一退出，钉给它的活就再没有任何人能取——
+  // 它们既不会回 DONE 也不会回 ERR，而是永远躺在队列里占额度；攒满
+  // kInteractivePendingCap 之后输入线程卡死在 cv_space 上（别的会话还活着，
+  // active_workers != 0，那个放行条件永远不成立）→ 网关侧管道写满 → 整条链停摆，
+  // 连进程都退不出来（input_thread.join() 等不到）。
+  //
+  // 注意是"部分失败才卡"：全部会话都退出时 active_workers 归零会把输入线程放行，
+  // 所以只跑成功路径的演示永远测不出这条。
+  std::vector<bool> worker_alive;
+};
+
+// 交一条待办给会话线程的结果。**三个状态而不是一个 bool**：服务模式下「这条活的目标
+// 会话已经死了」和「所有会话都没了」后果完全不同——前者只该给这一条请求回 ERR，
+// 然后继续收后面的活；后者说明这个进程已经没有消费方，输入线程该收工了。合成一个
+// false 会让一次坏会话把整个服务带走。
+enum class PushResult
+{
+  kOk,            // 收下了
+  kDeadTarget,    // 目标会话已死：这条活没人会跑，请求方在等一个永远不来的答案
+  kWorkersGone,   // 所有会话都退了：输入线程收工
 };
 
 // 某个会话线程能不能接这一条待办。交互模式下所有待办的 target_session 都是 -1，
@@ -2613,25 +2684,6 @@ static void print_session_block(int index, const std::string& text)
   std::lock_guard<std::mutex> lock(g_output_mutex);
   printf("[s%d] %s\n", index, text.c_str());
   fflush(stdout);
-}
-
-// 清掉一个会话在所有卡上的 KV，并把它的对话状态复位（下次 prefill 会重新带 system 轮）。
-//
-// 逐卡取锁、取一张放一张（§3.4 锁序不变量）：SDK 要求「同一个 rknn3_context 的并发
-// 使用由调用方保证线程安全」，而本会话的 session 和别的会话的 session 同处一张卡的
-// **同一个 context** 上——清 KV 虽然只动本会话自己的 KV 缓冲（P0 探针已证 KV 隔离），
-// 但它仍是对该 context 的一次 SDK 调用，可能与另一路正在跑的 session_run 并发。
-//
-// 两处调用（上下文将满时自动清、网关请求的 RESET）都走这里，避免这段持锁循环抄两遍
-// 而漏掉某一边的锁。
-static void clear_conversation_kv(std::vector<StageContext>& stages, Conversation& conv)
-{
-  for (size_t i = 0; i < stages.size(); ++i) {
-    std::lock_guard<std::mutex> card_lock(stages[i].run_mutex);
-    rknn3_session_clear_kvcache(conv.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
-  }
-  conv.context_tokens = 0;
-  conv.first_turn = true;
 }
 
 // 一个会话的交互/服务驱动循环：取到一条活 → 跑完整一轮 → 交回落点 → 回去接着等。
@@ -2702,15 +2754,38 @@ static void run_interactive_session_worker(int index, Conversation& conv,
     if (g_serve_mode && job.reset && conv.context_tokens > 0) {
       serve_clear(job.rid, index, conv.context_tokens, context_limit);
       clear_conversation_kv(stages, conv);
+    } else if (context_almost_full && g_serve_mode) {
+      // **服务模式下不能"自动清 KV 再把这一轮跑完"**。上下文将满时清 KV 在交互模式
+      // 里是合理的（整段对话都在本进程里拼，清完重来一轮语义自洽），但服务模式下
+      // 网关只发增量（`prompt[len(base):]`，板上实测 sent=84 / full=522）：KV 一清，
+      // 模型拿到的就是一段**没有开头**的对话，然后以 finish_reason=stop 返回一个
+      // 自信的错答案。CLEAR 帧救的是**下一轮**（网关据此把这段对话的粘性记录作废、
+      // 下轮全量重发），**本轮已经错了，而且自愈之后不留痕迹**——不报错、不重试、
+      // 只错一轮，是最难查的一类。
+      //
+      // 所以改成**拒掉这一轮**，把策略交回网关：
+      //   · 先发 CLEAR：让网关作废粘性记录（known[session] = None），下一轮必定
+      //     RESET 全量重发，不会再用增量拼一段残缺历史；
+      //   · 再发 REJECT：告诉网关「这个会话还活着，只是这一轮没跑」。**不能发 ERR**：
+      //     网关收到 ERR 会把会话标死（mark_dead），而上下文装不下不是会话的错——
+      //     标死等于每撞一次超限就永久少一个会话，四次之后整个服务没有会话可用。
+      serve_clear(job.rid, index, conv.context_tokens, context_limit);
+      serve_reject(job.rid, index,
+                   "context limit reached: " + std::to_string(conv.context_tokens) +
+                       " + " + std::to_string(prefill_reserve) + " >= " +
+                       std::to_string(context_limit) +
+                       " tokens; start a new conversation or trim the history");
+      // 顺手把 KV 清掉：这段对话本身就装不下，留着满 KV 只会让下一轮同样顶穿。
+      // 清完是"确定为空"的状态，网关已知情（上面那帧 CLEAR），下一轮会 RESET 重发。
+      clear_conversation_kv(stages, conv);
+      // continue 而不是 break：会话线程是好的，只是这一轮不跑。break 出去等于把一个
+      // 健康的会话永久摘掉（服务容量少一份），钉给它的活从此没人接（见 worker_alive）。
+      continue;
     } else if (context_almost_full) {
-      if (g_serve_mode) {
-        serve_clear(job.rid, index, conv.context_tokens, context_limit);
-      } else {
-        print_session_block(index,
-            "(context " + std::to_string(conv.context_tokens) + "/" +
-            std::to_string(context_limit) +
-            " tokens nearly full, clearing KV cache to start a fresh conversation)");
-      }
+      print_session_block(index,
+          "(context " + std::to_string(conv.context_tokens) + "/" +
+          std::to_string(context_limit) +
+          " tokens nearly full, clearing KV cache to start a fresh conversation)");
       clear_conversation_kv(stages, conv);
     }
 
@@ -2784,15 +2859,38 @@ static void run_interactive_session_worker(int index, Conversation& conv,
   }
 
   gettimeofday(&timing->end, NULL);
-  timing->valid = true;
+  // 只有**真接到过活**的会话才让这条 timing 进汇总。没接到活的是 start{0,0}（零初始化）
+  // + end=现在，于是 report_interactive_sessions 里那个 !t.valid 的过滤形同虚设，
+  // min(start) 被拉成 0（1970）→ 窗口变成 1.78e9 秒 → 打印 "0.00 tok/s"，而同一行的
+  // 状态还写着 "ok"。触发一点都不奇怪：少于 N 个会话被用到就 QUIT（服务模式下人为
+  // 控制并发数、或交互模式输入行数少于会话数）。一行之差，直接把聚合数字变成垃圾。
+  timing->valid = timing_started;
   conv.wall_ms = elapsed_us(timing->start, timing->end) / 1e3;
 
   // 会话线程退出登记（正常收工与推理失败两条路径都会走到这里，因为两个出口都是
   // break 出循环）。最后一个退出的人负责把输入线程也放行，见 active_workers 注释。
   bool all_gone = false;
   bool input_still_reading = false;
+  std::vector<PendingInput> orphaned;
   {
     std::lock_guard<std::mutex> lock(dispatcher->mutex);
+    // 先记下"本会话已经死了"，再把钉给它的活取出来。两件事必须在**同一把锁**里做：
+    // 中间放开的话，输入线程正好能挤进一条钉给本会话的活，而它检查 worker_alive 时
+    // 看到的还是 true —— 这条活就又成了永远没人接的孤儿。
+    if (index >= 0 && (size_t)index < dispatcher->worker_alive.size()) {
+      dispatcher->worker_alive[index] = false;
+    }
+    // 只有本线程能接的活（target_session == index）现在没人接了，取出来回 ERR。
+    // 留在队列里的后果见 worker_alive 的注释：占额度 → 攒满 → 输入线程卡死 →
+    // 整条服务链停摆。交互模式下 target_session 恒为 -1，这里扫不到东西。
+    for (auto it = dispatcher->pending.begin(); it != dispatcher->pending.end();) {
+      if (it->target_session == index) {
+        orphaned.push_back(*it);
+        it = dispatcher->pending.erase(it);
+      } else {
+        ++it;
+      }
+    }
     if (--dispatcher->active_workers == 0) {
       dispatcher->input_eof = true;
       all_gone = true;
@@ -2806,6 +2904,11 @@ static void run_interactive_session_worker(int index, Conversation& conv,
     dispatcher->cv_space.notify_all();
     dispatcher->cv_work.notify_all();
   }
+  // 帧写出**放在锁外**：serve_frame 走的是另一把锁（g_output_mutex），在这里持着
+  // dispatcher->mutex 再取它，等于凭空多出第二种锁序，没必要给自己埋雷。
+  for (const auto& item : orphaned) {
+    serve_err(item.rid, index, "session failed");
+  }
   if (all_gone && input_still_reading && isatty(STDIN_FILENO)) {
     std::lock_guard<std::mutex> lock(g_output_mutex);
     printf("[interactive] all sessions have exited; "
@@ -2814,23 +2917,47 @@ static void run_interactive_session_worker(int index, Conversation& conv,
   }
 }
 
-// 把一条待办交给会话线程。队列满时在这里等（反压），会话已全部退出时返回 false
-// （再收输入也没人消费了）。两个前端共用。
-static bool dispatcher_push(InteractiveDispatcher* dispatcher, const PendingInput& item)
+// 把一条待办交给会话线程。队列满时在这里等（反压）。两个前端共用。
+static PushResult dispatcher_push(InteractiveDispatcher* dispatcher, const PendingInput& item)
 {
   std::unique_lock<std::mutex> lock(dispatcher->mutex);
+  const bool pinned = item.target_session >= 0 &&
+                      (size_t)item.target_session < dispatcher->worker_alive.size();
+  auto target_dead = [&]() {
+    return pinned && !dispatcher->worker_alive[item.target_session];
+  };
+  // 目标会话死没死要**先看**，等队列空间是后话：目标已经死了的话，等空间纯属白等
+  // （钉给死会话的活没有任何人会消费它），而请求方在等一个永远不来的答案。
+  if (target_dead()) {
+    return PushResult::kDeadTarget;
+  }
   dispatcher->cv_space.wait(lock, [dispatcher]() {
     return dispatcher->pending.size() < kInteractivePendingCap ||
            dispatcher->active_workers == 0;
   });
   if (dispatcher->active_workers == 0) {
-    return false;
+    return PushResult::kWorkersGone;
+  }
+  // **醒来之后必须再判一次**（2026-09-16，主机端 t5 实测踩到）：
+  // 上面那次判断只解决了"别白等"，它不能代表"等到位置时目标还活着"。队列满 + 目标
+  // 会话在这段等待里死掉，是一个真实存在的窗口——而且**恰好只有目标死掉才能解开这个
+  // 等待**（它退出时会把队列里钉给它的活扫掉、腾出位置）。于是醒来的这一刻，正是
+  // "它已经死了"最可能成立的一刻：那条活刚被推进队列，就已经没有任何人会消费它。
+  //
+  // 为什么漏不掉：会话线程置 worker_alive=false 与清扫队列是**同一把锁**里的两件事，
+  // 本函数从头到尾也持着这把锁。两者只能一前一后：
+  //   · 本函数在前 → 上面那次判断看到 true，推进去的那条随后被对方的清扫捞走 → 有回帧；
+  //   · 对方在前 → 这里再判一次看到 false → kDeadTarget → 有回帧。
+  // 少了这次判断，第二种情形就会留下一条**永远没人回答**的活：网关那边表现为白等
+  // REQUEST_TIMEOUT（默认 1800s），而且它占着队列额度、没有任何迹象。
+  if (target_dead()) {
+    return PushResult::kDeadTarget;
   }
   dispatcher->pending.push_back(item);
   // notify_all 而不是 notify_one：服务模式下队首可能正钉给某个特定会话，被唤醒的
   // 若恰好是别人，这一条活就没人取了（它会一直躺在队列里）。
   dispatcher->cv_work.notify_all();
-  return true;
+  return PushResult::kOk;
 }
 
 // 输入线程：把 stdin 的每一行放进待办队列，满了就等。
@@ -2849,7 +2976,8 @@ static void run_interactive_input_worker(InteractiveDispatcher* dispatcher)
     }
     PendingInput item;
     item.text = std::move(line);
-    if (!dispatcher_push(dispatcher, item)) {
+    // 交互模式下 target_session 恒为 -1，所以只可能是 kOk 或 kWorkersGone。
+    if (dispatcher_push(dispatcher, item) != PushResult::kOk) {
       break;
     }
   }
@@ -2864,6 +2992,33 @@ static void run_interactive_input_worker(InteractiveDispatcher* dispatcher)
 // 数字去 reserve 内存（比如 2^60），直接把服务打死——这条流由网关直接驱动，
 // 它一旦算出个错长度，我们不该跟着一起崩。
 static const size_t kServeMaxPromptBytes = 1u << 20;
+
+// 每轮 max_new_tokens 的上限。协议里这个字段实际按 `int` 用（`PendingInput`、
+// `run_chat_turn` 都是 int），而头行是用 `%llu` 读进 `unsigned long long` 的——
+// 中间那次 `(int)` 截断以前**没有任何校验**，于是 `4294967296` 会变成 0（= "用进程
+// 默认值"）、`4294967297` 变成 1、`2^64-1` 变成 -1（也走"用默认值"这条）：
+// 网关把上限写成表达式、或将来加了单位换算，都会得到"看起来被接受了、实际跑的是别的
+// 数字"。这里直接卡在 int 的正数范围内，宁可回一帧 ERR 讲清楚，也不静默换个数。
+static const unsigned long long kServeMaxNewTokens = 0x7fffffffull;
+
+// 把"声明了长度、但这一轮不打算处理"的载荷读掉丢弃，保持帧流对齐。
+// 逐块读、不按 prompt_len 去 reserve：长度上限已经在外层卡过一道，这里的固定块只是
+// 让丢弃动作本身与具体长度无关。
+static void discard_serve_payload(unsigned long long prompt_len)
+{
+  char chunk[4096];
+  unsigned long long left = prompt_len;
+  while (left > 0) {
+    const std::streamsize want =
+        (std::streamsize)(left < sizeof(chunk) ? left : (unsigned long long)sizeof(chunk));
+    std::cin.read(chunk, want);
+    const std::streamsize got = std::cin.gcount();
+    if (got <= 0) {
+      break;  // stdin 提前结束：外层 getline 下一次就会看到 EOF 而收工
+    }
+    left -= (unsigned long long)got;
+  }
+}
 
 // --serve 的输入线程：从 stdin 读请求帧（语法见 g_serve_mode 上方的注释）。
 //
@@ -2893,13 +3048,30 @@ static void run_serve_input_worker(InteractiveDispatcher* dispatcher, int sessio
       serve_err(0, -1, "bad request header: " + header);
       continue;
     }
-    if (session >= session_count || session < -1) {
-      serve_err(rid, session, "session index out of range");
-      continue;
-    }
+    // 长度上限先行：它决定载荷还能不能安全跳过（见下面越界分支）。顺序不能反——
+    // 反过来的话，「会话号越界 + prompt_len 声明成 2^60」会先去跳一个天文数字的载荷。
     if (prompt_len > kServeMaxPromptBytes) {
       serve_err(rid, session, "prompt too long: " + std::to_string(prompt_len) + " bytes");
       break;  // 载荷读不下去、流已经错位，再读只会把后面的头行当载荷
+    }
+    if (session >= session_count || session < -1) {
+      // 头行合法但会话号越界：**必须把载荷读掉**再回 ERR，不能直接 continue。
+      // 这 prompt_len 个字节留在流里的话，下一次循环会把载荷开头的几个字节当成长度
+      // 为零的头行读——从此整条帧流**永久错位**，后面每个请求都被解析成
+      // bad request header（网关那边看到的现象是"每个请求都立刻失败"）。
+      // 网关正常运行时到不了这里（池子大小取自后端 READY 的会话数，派发处都有范围
+      // 守卫），所以这条的价值是"防线被踩时别把可恢复错误升级成永久错位"。
+      discard_serve_payload(prompt_len);
+      serve_err(rid, session, "session index out of range");
+      continue;
+    }
+    if (max_new > kServeMaxNewTokens) {
+      // 同上：载荷要读掉再回 ERR，别让流错位。
+      discard_serve_payload(prompt_len);
+      serve_err(rid, session,
+                "max_new_tokens out of range: " + std::to_string(max_new) + " (must be <= " +
+                    std::to_string(kServeMaxNewTokens) + ")");
+      continue;
     }
 
     std::string prompt;
@@ -2918,7 +3090,16 @@ static void run_serve_input_worker(InteractiveDispatcher* dispatcher, int sessio
     item.target_session = session;
     item.max_new_tokens = (int)max_new;
     item.reset = (reset != 0);
-    if (!dispatcher_push(dispatcher, item)) {
+    const PushResult pushed = dispatcher_push(dispatcher, item);
+    if (pushed == PushResult::kDeadTarget) {
+      // 会话在网关派活之后、入队之前死掉了（推理失败）。回一帧 ERR 让网关立刻把这段
+      // 对话挪到别的会话上——不回的后果是它一直等到 REQUEST_TIMEOUT（默认 1800s），
+      // 期间白占着一个租约，排队的人全被挡在后面。
+      // 这里用 ERR（而不是 REJECT）：会话**确实**死了，网关把它标死是对的。
+      serve_err(rid, session, "session failed");
+      continue;
+    }
+    if (pushed == PushResult::kWorkersGone) {
       break;
     }
   }
@@ -4228,7 +4409,6 @@ int main(int argc, char** argv)
       const int session_count = options.sessions;
       for (int s = 0; s < session_count && ok; ++s) {
         std::unique_ptr<Conversation> conv(new Conversation(g_stage_count));
-        conv->index = s;
         conv->result.tokenizer = tokenizer;
         reset_last_stage_result(*conv);
         for (size_t i = 0; i < stages.size(); ++i) {
@@ -4382,6 +4562,8 @@ int main(int argc, char** argv)
         // 服务模式下还会按 target_session 钉住指定会话）。
         InteractiveDispatcher dispatcher;
         dispatcher.active_workers = session_count;
+        // 启动时就全部标活：会话线程还没起，但"现在钉给谁的活都还有希望被接"是真的。
+        dispatcher.worker_alive.assign((size_t)session_count, true);
 
         if (options.serve) {
           // 帧通道要先开好、READY 要先发，再起会话线程：网关靠 READY 判断
@@ -4440,10 +4622,10 @@ int main(int argc, char** argv)
                                         options.rounds, max_new_tokens);
       }
       print_stage_performance_statistics(stages);
+      // 收尾清理：驱动线程在上一行 join 完了，这里没有并发（helper 里的锁是白取的，
+      // 但走 helper 是为了不留第二份清 KV 的实现）。
       for (auto& conv : multi_conversations) {
-        for (size_t i = 0; i < stages.size(); ++i) {
-          rknn3_session_clear_kvcache(conv->stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
-        }
+        clear_conversation_kv(stages, *conv);
       }
       for (auto& conv : multi_conversations) {
         if (conv->result.token_dump) {
@@ -4510,11 +4692,7 @@ int main(int argc, char** argv)
           conversation.context_tokens + prefill_reserve >= context_limit) {
         printf("\n[warning] context %llu/%llu tokens nearly full, clearing KV cache to start a fresh conversation\n",
                (unsigned long long)conversation.context_tokens, (unsigned long long)context_limit);
-        for (size_t i = 0; i < stages.size(); ++i) {
-          rknn3_session_clear_kvcache(conversation.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
-        }
-        conversation.context_tokens = 0;
-        conversation.first_turn = true;
+        clear_conversation_kv(stages, conversation);
       }
 
       std::string chat_prompt;
@@ -4627,9 +4805,9 @@ int main(int argc, char** argv)
   }
 
   print_stage_performance_statistics(stages);
-  for (size_t i = 0; i < stages.size(); ++i) {
-    rknn3_session_clear_kvcache(conversation.stages[i].session, RKNN3_KVCACHE_CLEAR_ALL);
-  }
+  // 收尾清理（单会话路径）：跑到这里已经没有任何在途轮次，锁是白取的，走 helper
+  // 只为不留第二份实现。
+  clear_conversation_kv(stages, conversation);
 
   release_resources(stages, &conversation, &input_cb_data, &embed_info, emb_st.st_size, tokenizer);
 

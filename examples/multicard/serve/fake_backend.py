@@ -49,6 +49,10 @@ def main():
     # 让回复像真模型那样以 `<think>  </think>  ` 开头（关思考时的真实形态），用来端到端
     # 验网关的 ThinkStripper：它必须把这段摘掉，而且**标签被 7 字节切分切开时也要摘对**。
     ap.add_argument("--think-prefix", action="store_true")
+    # 让桩也能造出"上下文装不下"那条路径（真后端在 prefill **之前**判，发 CLEAR+REJECT，
+    # **不**标死会话）。0 = 不限。有它才能把网关那半边（软错误 / 不标死 / 作废粘性 / 不
+    # 把这轮 prompt 记进 KV 账）在本地测到，否则那四条只有板卡上把上下文撑满才能验。
+    ap.add_argument("--ctx-limit", type=int, default=0)
     args, _unknown = ap.parse_known_args()
 
     if args.serve_fd is not None:
@@ -67,11 +71,27 @@ def main():
 
     def serve(rid, session, max_new, reset, prompt):
         s = session if 0 <= session < args.sessions else 0
+        prefill = max(1, len(prompt.encode("utf-8")) // 5)
         with ctx_lock:
             if reset and ctx[s] > 0:
                 emit(out, "CLEAR ", "%d %d %d %d" % (rid, s, ctx[s], CTX_LIMIT))
                 ctx[s] = 0
-        prefill = max(1, len(prompt.encode("utf-8")) // 5)
+            # 上下文装不下就**先拒掉这一轮**，顺序与真后端一致（见 main.cc 的
+            # context_almost_full 分支）：先 CLEAR（让网关作废这段对话的粘性记录），
+            # 再 REJECT（会话还活着，只是这一轮不跑），最后把 KV 当已清。
+            # 不这么做的话，网关只发增量，KV 一清模型就拿增量去拼一段没有开头的对话，
+            # 然后以一个自信的错答案正常返回。
+            was = ctx[s]
+            reject = (args.ctx_limit > 0 and was > 0 and
+                      was + prefill + 512 >= args.ctx_limit)
+            if reject:
+                emit(out, "CLEAR ", "%d %d %d %d" % (rid, s, was, args.ctx_limit))
+                ctx[s] = 0
+        if reject:
+            msg = ("context limit reached: %d + 512 >= %d tokens; start a new "
+                   "conversation or trim the history" % (was, args.ctx_limit))
+            emit(out, "REJECT ", "%d %d %d" % (rid, s, len(msg)), msg.encode("utf-8"))
+            return
         time.sleep(args.delay)
         # 切得要"不整齐"：把多字节字符也切开，逼网关用增量解码器
         reply = ("<think>  </think>  " + REPLY) if args.think_prefix else REPLY
@@ -83,7 +103,13 @@ def main():
         with ctx_lock:
             ctx[s] += prefill + len(raw)
             after = ctx[s]
-        finish = "length" if len(REPLY) <= max_new else "stop"
+        # 判据按"发出去的字节是不是比整段回复短"来定。原版是
+        # `finish = "length" if len(REPLY) <= max_new else "stop"`，两个错叠在一起：
+        #   · **反了**——回复装得下（没被截断）反而被报成 `length`；
+        #   · **单位混用**——`len(REPLY)` 是字符数，`max_new` 是 token 预算。
+        # 后果不是"桩看起来不对"：本地全套回归里凡是拿 finish_reason 判"这一轮有没有
+        # 被截断"的断言，在桩上都拿到反的答案（真板卡上是 `stop`，桩上是 `length`）。
+        finish = "length" if len(raw) < len(reply.encode("utf-8")) else "stop"
         emit(out, "DONE ", "%d %d %s %d %d %.1f %.1f %d"
              % (rid, s, finish, prefill, min(len(REPLY), max_new),
                 prefill * 50.0, min(len(REPLY), max_new) * 90.0, after))
@@ -116,6 +142,14 @@ def main():
             sys.stderr.flush()
             emit(out, "ERR ", "0 - %d" % len(str(exc)), str(exc).encode("utf-8"))
             return 2
+        # max_new_tokens 超范围：真后端（main.cc）2026-09-16 起会在 prefill 前回 ERR——
+        # 那个字段最终落到一个 `int` 上，不校验的话大数会静默截断成别的值（10**12 变成
+        # 0 = "用默认值"）。桩跟着实现同一条契约，好让"网关有没有把它夹进范围"
+        # （`_pick_max_tokens`）在本地也测得出来。**载荷必须已经读掉**再判——否则流错位。
+        if max_new > 0x7fffffff:
+            msg = b"max_new_tokens out of range: %d" % max_new
+            emit(out, "ERR ", "%d %d %d" % (rid, session, len(msg)), msg)
+            continue
         th = threading.Thread(target=serve,
                              args=(rid, session, max_new, reset,
                                    payload.decode("utf-8", "replace")))

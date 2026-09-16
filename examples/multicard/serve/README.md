@@ -97,6 +97,12 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'X-Conversation-Id: bob' 
   会走一次 RESET + 完整 prefill（多约 2–3 秒），**正确性不受影响**（上下文一直在客户端手上）。
 - 排队超过 `QUEUE_TIMEOUT` → 返回 **503** + `Retry later or reuse a conversation_id...`，
   不让终端用户无限期干等。
+- 这一轮的 prompt 太长、装不进上下文 → 后端在 prefill **之前**就把这一轮拒掉，网关回
+  **400** + `context limit reached: ... tokens; start a new conversation or trim the history`。
+  这是**客户端要改请求**的错误（历史太长），所以是 400 不是 503；而且**会话不受影响**
+  ——它还是好的，下一轮照样能用。客户端的处置就是开一段新对话（换个 `conversation_id`）
+  或者裁掉历史。流式下 200 头已经发出去了，改不了状态码，此时同一个错误以 SSE 的
+  `error` 事件送达，`type` 是 `invalid_request_error`。
 
 **说完了要说一声**：网关**不知道**一段对话什么时候结束（客户端不发结束消息，浏览器关了也没人
 通知），所以默认只能靠 `IDLE_TTL` 超时回收。这对"来问一句就走"的客户端很糟——一个脚本连问
@@ -121,7 +127,12 @@ curl -s http://<板卡>:8080/v1/conversations/close -H 'Content-Type: applicatio
  "waiting": [{"conversation": "id:dave", "waited_s": 12.4}]}
 ```
 
-`state` 是 `busy` / `idle`（有主但现在没在跑）/ `free`（无主）。
+`state` 是 `busy` / `idle`（有主但现在没在跑）/ `free`（无主）/ **`dead`**。
+`dead` = 这个会话的驱动线程已经退出（后端在这个会话上回了 `ERR` 帧），网关不会再把活派给它、
+也不会把它算进"可用会话"：**看着还有 4 个槽位，实际能用的是 4 减去 dead 的个数**。出现
+`dead` 说明后端出过事，去翻网关日志里那个会话的 `ERR` 报文；恢复手段是重启网关（会话只在
+启动时创建，运行时不补）。注意 `dead` 的槽位在 `mark_dead` 里已经把归属解绑了，所以它不会
+同时带着 `conversation`。
 `conversation` 是给人看的标签（长了会截断），`key` 是**原始键**——两者都要有，因为
 **匿名对话只能用 `key` 关**（那种对话的身份是网关按 `system + 首问` 算出来的摘要，客户端自己
 算不出来）：`curl -d '{"key": "h:faa51b39..."}' .../v1/conversations/close`。
@@ -180,6 +191,11 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
   忘了关也能救：`/v1/pool` 里读 `id:web-N`，`POST /v1/conversations/close` 逐个收回来。
 - `tool` 角色的渲染**未测**（`render_messages` 只处理 system/user/assistant）——接 function
   calling 之前要先补这个测试。
+- **客户端中途断开，这一轮仍会跑完**。后端不能中途叫停一次已经开始 prefill+decode 的推理，
+  网关的做法是丢掉往那条连接写的通道、继续把这一轮的 token 读完再释放会话——**代价是这一次
+  的连接断开不能换来算力释放**（4 个会话被断开的请求占一秒，这一秒里不会有人补进来）。
+  这是刻意选的：反过来做（断开就撤会话）会把跑着的会话脚下抽走，KV 与网关记账立刻不一致，
+  下一轮就开始答不对题——那是静默错答，比浪费一点算力糟得多。
 - `finish_reason` 是**反推值**（`decode_tok >= max_new_tokens` → `length`，否则 `stop`）。
 - 开思考（默认）时推理过程**原样透传**，不单独成字段（协议里没有 `reasoning_content`）。
 - 没有 `--no-sticky` 回退开关。

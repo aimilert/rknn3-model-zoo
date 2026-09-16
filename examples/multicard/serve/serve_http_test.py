@@ -25,6 +25,10 @@ import urllib.request
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 MODE = sys.argv[2] if len(sys.argv) > 2 else "full"
+#   full    —— 默认：接口面 + 多轮 KV 复用 + 并发（run_all_board_tests.sh 跑这个）
+#   quick   —— 只跑到流式为止
+#   reject  —— 后端拒了一轮（上下文装不下）时的 HTTP 语义；需 `--ctx-limit` 桩
+#   bigmax  —— 离谱的 max_tokens 不得打死会话；需实现了那条校验的桩（见 fake_backend）
 TIMEOUT = 1800
 
 OK = [True]
@@ -141,13 +145,102 @@ def main():
         print("\n%s" % ("全部通过" if OK[0] else "有失败项"))
         return 0 if OK[0] else 1
 
-    print("== 多轮 KV 复用（HTTP 级证据：看 prompt_tokens）==")
+    if MODE == "reject":
+        # 只跑"后端拒了一轮"这一段。**需要网关后面挂的是带 `--ctx-limit N` 的桩后端**
+        # （真后端没这个开关，真板上要把上下文撑到 4096 token 才触发）：
+        #   python rkllm_gateway.py --port 8098 --sessions 2 --frames-stdout \
+        #       -- python fake_backend.py --sessions 2 --ctx-limit 500
+        #   python serve_http_test.py http://127.0.0.1:8098 reject
+        # 验的是协议层之外**只有 HTTP 层才看得见**的两件事：状态码（400，不是 503——
+        # 503 会诱导客户端原样重试，而原样重试必然再被拒一次）和会话没被标死。
+        print("== 后端拒了一轮（上下文装不下）=> HTTP 400，且会话不被标死 ==")
+        conv = "probe-reject"
+        filler = "记住暗号：青柠味苏打水。"
+        d1 = chat([{"role": "user", "content": filler}], max_tokens=16, conv=conv)
+        a1 = d1["choices"][0]["message"]["content"]
+        check("第一轮正常跑完（还没到上限）", len(a1) > 0)
+        hist = [{"role": "user", "content": filler},
+                {"role": "assistant", "content": a1}]
+        status, body = None, ""
+        try:
+            chat(hist + [{"role": "user", "content": "再说一遍暗号。"}],
+                 max_tokens=16, conv=conv)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            body = exc.read().decode("utf-8", "replace")
+        check("被拒的那轮回 400（客户端该改请求，不是重试）", status == 400,
+              "HTTP %s %s" % (status, body[:120]))
+        check("错误类型是 invalid_request_error（不是 server_error）",
+              "invalid_request_error" in body, body[:200])
+        _, pool = get("/v1/pool")
+        states = [s.get("state") for s in pool.get("slots", [])]
+        check("会话没被标死（池子里没有 dead 状态）", "dead" not in states,
+              "states=%s" % states)
+        # 会话还在池子里不够，还要能真的继续服务：被拒之后同一段对话换成新的一轮，
+        # 应当照常拿到回答（KNOWN=None => RESET 全量重发，这一步顺带验了自愈）。
+        d3 = chat([{"role": "user", "content": "全新的一轮。"}], max_tokens=16,
+                  conv=conv)
+        check("被拒之后这段对话还能继续服务", len(d3["choices"][0]["message"]["content"]) > 0)
+        close_conv(conv)
+        print("\n%s" % ("全部通过" if OK[0] else "有失败项"))
+        return 0 if OK[0] else 1
+
+    if MODE == "bigmax":
+        # 客户端写一个离谱的 max_tokens（`1e12` 是"能吐多少吐多少"很常见的写法）时，
+        # 服务必须照常给答案、**不能因此丢会话**。
+        #
+        # 这条守的是一条真实的可达路径：max_new_tokens 在帧协议的字段最终落到后端的
+        # `int` 上，后端 2026-09-16 起会拒收超出 int32 的值，而 ERR 帧的语义是"这个
+        # 会话的驱动线程没了"——网关收到就把会话标死。所以如果网关不把它夹进范围，
+        # **一个客户端随口写的数字就能永久吃掉一个会话**，四次之后整个服务没有会话可用。
+        # 夹的范围在 `MAX_NEW_TOKENS_CAP`（网关侧）+ 后端/桩的同一条校验，三层对齐。
+        #
+        # 需要桩实现那条校验才测得出来（`fake_backend.py` 已实现），所以这一条要在
+        # 桩后端上跑：装了不带校验的桩，它反而会照常答完、把缺陷盖住。
+        print("== 离谱的 max_tokens 不能打死会话 ==")
+        conv = "probe-bigmax"
+        # 未修复时这里回的是 **503**（会话被标死），所以第一个请求要自己接住 HTTPError
+        # 并且**如实报成 FAIL**：让脚本崩出 traceback 虽然也会被判失败，但看不出是哪一个
+        # 缺陷——而这一段的失败信息必须直接指出"是一个客户端的数字吃掉了会话"。
+        status, err, d = None, "", None
+        try:
+            d = chat([{"role": "user", "content": "只回复两个字：收到。"}],
+                     max_tokens=10 ** 12, conv=conv)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            err = exc.read().decode("utf-8", "replace")
+        check("照常回 200（不是 503）", status is None,
+              "HTTP %s %s" % (status, err[:160]) if status is not None
+              else json.dumps(d["usage"]))
+        check("有内容", d is not None and len(d["choices"][0]["message"]["content"]) > 0)
+        _, pool = get("/v1/pool")
+        states = [s.get("state") for s in pool.get("slots", [])]
+        check("没有会话被标死（池子里没有 dead 状态）", "dead" not in states,
+              "states=%s" % states)
+        ok2 = False
+        try:
+            d2 = chat([{"role": "user", "content": "再来一轮。"}], max_tokens=16, conv=conv)
+            ok2 = len(d2["choices"][0]["message"]["content"]) > 0
+        except urllib.error.HTTPError as exc:
+            print("      （续跑的请求也失败了：HTTP %s）" % exc.code)
+        check("这段对话还能继续服务", ok2)
+        close_conv(conv)
+        print("\n%s" % ("全部通过" if OK[0] else "有失败项"))
+        return 0 if OK[0] else 1
+
+    print("== 多轮 KV 复用（HTTP 级证据：usage.prompt_tokens_details.cached_tokens）==")
 
     def kv_reuse_case(label, conv, extra):
         # 关思考和开思考要各测一遍。关思考时网关会把 think 段从正文里摘掉，于是"记进
         # 会话账本的文本"和"模型实际生成的原始文本"不再逐字节相同——如果记账用了原始
         # 版，客户端下一轮回显的（已摘标签的）历史就对不上前缀，复用每轮都会退化成全量。
-        # 这个坑答案完全正确、只有速度变差，所以必须靠这里的 prompt_tokens 抓。
+        # 这个坑答案完全正确、只有速度变差，所以必须靠 usage 里的复用计数抓。
+        #
+        # 判据在 2026-09-16 换过一次：以前看的是 "prompt_tokens 比全量小"，那是把
+        # prompt_tokens 当"本轮 prefill 的增量"用的**非标准口径**——而 OpenAI 里它是
+        # 整段 prompt 的长度。网关已改成标准口径（prompt_tokens = 整段，复用部分单列
+        # cached_tokens），于是旧判据必然失败：续聊的整段 prompt 本来就比全新对话长。
+        # 现在直接看复用计数：cached_tokens > 0，且本轮真正重算的部分远小于全量。
         filler = "请记住这句话：" + "麒麟九千" * 40
         d1 = chat([{"role": "user", "content": filler}], max_tokens=16, conv=conv, **extra)
         a1 = d1["choices"][0]["message"]["content"]
@@ -159,10 +252,15 @@ def main():
         d3 = chat([{"role": "user", "content": "换一段全新的对话：" + "麒麟九千" * 40}],
                   max_tokens=16, conv=conv + "-fresh", **extra)
         p2 = d2["usage"]["prompt_tokens"]
-        p3 = d3["usage"]["prompt_tokens"]
-        check("第二轮 prefill 远小于全量[%s]" % label, p2 < p3,
-              "续聊 prefill=%d tok, 全量 prefill=%d tok, 比值 %.2f"
-              % (p2, p3, (p2 / p3 if p3 else 0)))
+        cached2 = d2["usage"]["prompt_tokens_details"]["cached_tokens"]
+        recomputed = p2 - cached2            # 本轮真正 prefill 的那部分
+        p3 = d3["usage"]["prompt_tokens"]    # 对照那轮没有可复用的前缀，重算 = 全量
+        check("续聊命中了 KV 复用（cached_tokens > 0）[%s]" % label, cached2 > 0,
+              "续聊 prompt=%d tok，其中复用 %d tok，本轮只算了 %d tok"
+              % (p2, cached2, recomputed))
+        check("真正重算的部分远小于全量[%s]" % label, recomputed < p3,
+              "续聊重算=%d tok, 全量 prefill=%d tok, 比值 %.2f"
+              % (recomputed, p3, (recomputed / p3 if p3 else 0)))
         close_conv(conv)
         close_conv(conv + "-fresh")
 
