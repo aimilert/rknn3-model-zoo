@@ -737,7 +737,7 @@ git tag m5-multiuser    # 指向多用户接入（身份/排队/交还）的代�
 | P3 源码快照 | `rt_work/main.cc.p3_interactive` | `ff85aa377f91eb3b5e543dfa8754e4c6` |
 | R11 源码快照 | `rt_work/main.cc.r11_kvlock` | `c1fcc366958c34941b99c46c8f22cd62` |
 | M5 源码快照（`--serve` 帧协议 / `TokenSink`） | `rt_work/main.cc.m5_serve` | `108706c0c96c231f1632c489fc5963b3` |
-| M5 板端网关（**已入库**）演进 | `examples/multicard/serve/rkllm_gateway.py` | M5 入库 `db3fe3d` = `e09ac2b941de767443c0d1d635bd305b` → 修坑 4 `213a131` = `1eb4347a3aae6ec9e69e0f624bdaf62e` → 加网页演示 `570c406` = `a7dde57a99cdb89d343e3f984000cec6` → 多用户版 `bc7f013` = `f35fd2b84ec9968d83795c70cc3d6e0d` → **修 ERR 帧解析 = `fcb9dcd3b15bf26190d142296055593c`**（本行 md5 **2026-09-16 逐版本重算过，都对**） |
+| M5 板端网关（**已入库**）演进 | `examples/multicard/serve/rkllm_gateway.py` | M5 入库 `db3fe3d` = `e09ac2b941de767443c0d1d635bd305b` → 修坑 4 `213a131` = `1eb4347a3aae6ec9e69e0f624bdaf62e` → 加网页演示 `570c406` = `a7dde57a99cdb89d343e3f984000cec6` → 多用户版 `bc7f013` = `f35fd2b84ec9968d83795c70cc3d6e0d` → **修 ERR 帧解析 `5c167f5` = `fcb9dcd3b15bf26190d142296055593c`（当前 HEAD）**（本行 md5 **2026-09-16 逐版本重算过，都对**） |
 | └ **板卡上正在跑的副本不是以上任何一个** | 板卡上的部署副本 | **2026-09-16 上板实测**：原副本 md5 `009d0e265c2530c4a44573f42611b810`——早前那句"`009d0e26` 一说"是对的，`e09ac2b9` 不是。它与 `570c406` **只差 `_static_demo` 的一处 docstring**（功能无差别，不是功能漂移；**何时分叉的没查**），所以 §9.7 里"入库后两份副本 md5 相同"那句**在 2026-09-16 实测时不成立**。它**没有** §9.8 的身份/排队/`close`/`/v1/pool` 的 `key`。**同日已就地打上 ERR 解析补丁**（见 §9.7 末），原件留 `rkllm_gateway.py.bak_err_parse`，补丁后 = `8fc1b7076c99c2f226a251a554b90137`——**没有拿 HEAD 整体覆盖**，因为那会顺带推上只在桩后端验过的排队/`close`/`pool`。要用 §9.8 那套仍需重新下发 + 重启网关（重载模型约 240s） |
 | 网页演示页（**已入库**） | `examples/multicard/serve/demo_4chat.html` | `570c406` = `88a53e8b1935c7ef27bb04959ec7c211`（旧版，四个匿名对话）→ **`bc7f013` = `1db0882d98850b20232d0f96e325c9a1`**。**板卡上的是旧版**（早前记为 `af72406…`，本轮未核实）——它会以四个匿名对话占住全部 4 个会话（§9.8 咬到 5） |
 | M5 启动/构建/验收脚本（**已入库**） | `examples/multicard/serve/*.sh`、`*.py`、`README.md` | 见 `git ls-tree`；板卡路径全部走环境变量 |
@@ -1450,7 +1450,7 @@ N=1 时它完全无害（只有一个对话，`bound` 里就一条），所以�
   若这段没闭合就被截断，`ThinkStripper` 会原样吐出带 `<think>` 的文本——这是上面那条有界偏差的另一面。
 - `pass_fds` 在 Windows 上不可用（本地只能用桩后端 `fake_backend.py` + `--frames-stdout` 做回归）。
 
-**⚠️ 帧协议的一个硬缺陷：`ERR` 被按 `DELTA` 解析（2026-09-16 板上撞到，已修）**
+**⚠️ 帧协议的一个硬缺陷：`ERR` 被按 `DELTA` 解析（2026-09-16 板上撞到，已修 `5c167f5`）**
 
 写侧两种帧的字段数不同：`DELTA <rid> <n>` 对 `ERR <rid> <session> <n>`（`serve_err` 多发一个
 `session`）。读侧原先共用一套两字段解析（`rest.partition(b" ")`），于是 `ERR` 的长度字段拿到的
