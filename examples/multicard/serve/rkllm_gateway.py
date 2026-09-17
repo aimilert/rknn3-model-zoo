@@ -40,6 +40,14 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# 工具调用的渲染/解析单独一个文件：格式细节多（XML 形态、tojson 的坑、连续 tool 消息
+# 合并成一个 user 轮），而且它自己就能被逐字节对拍（check_template.py），不该混在
+# 已经 1800 行的网关里。
+from toolcalls import (ToolCallExtractor, normalize_tool_calls, render_assistant_turn,
+                       render_tools_system, split_tool_calls, to_openai_tool_calls,
+                       tool_response_block)
+from toolcalls import selftest as toolcalls_selftest
+
 MODEL_ID = "qwen3.5-27b"
 BACKEND_READY_TIMEOUT = 900.0     # 模型加载约 230-240s，留足余量
 REQUEST_TIMEOUT = 1800.0          # 单轮最长等待（长上下文 prefill 很慢）
@@ -709,7 +717,7 @@ def _content_text(content):
     return ""
 
 
-def render_messages(messages, enable_thinking=None):
+def render_messages(messages, enable_thinking=None, tools=None):
     """按 Qwen3.5 模板把 OpenAI 的 messages 渲染成一个 prompt 字符串。
 
     渲染放在网关侧而不是 demo 里：demo 的模板只有「首轮带 system / 后续轮不带」两态，
@@ -729,19 +737,40 @@ def render_messages(messages, enable_thinking=None):
     # 实测过这个退化（nothink_check.py）：关思考时第二轮 reset=1、base=0、sent=full，
     # 缓存全废但答案仍然是错的看不出来——属于"静默变慢"。全贴则每轮渲染同一段历史
     # 都是同样的字节，复用照常。第一条 user 在两种规则下都带标记，所以对首轮无影响。
+    #
+    # **工具返回那个 user 轮不贴**：它是模板合成的、不是用户说的话，贴上去属于往历史里
+    # 塞模板没有的东西（渲染结果仍然逐轮稳定，所以复用不受影响）。
     no_think = (enable_thinking is False)
 
     parts = []
-    for m in msgs:
+    i = 0
+    while i < len(msgs):
+        m = msgs[i]
         role = m.get("role") or "user"
         text = _content_text(m.get("content"))
+
         if role == "tool":
-            # Qwen 系模板把工具返回包在 <tool_response> 里。这一支没有端到端验证过
-            # （见文件末尾"未验证项"），先按通用角色块渲染，不要指望 tool 调用能跑通。
-            text = "<tool_response>\n%s\n</tool_response>" % text
+            # 模板把工具返回包在 <tool_response> 里，而且**连续多条合并进同一个 user
+            # 轮**（一个回合里并行调了三个工具，就是三条 tool 消息）。这跟"每条渲染成
+            # 一个 <|im_start|>tool 轮"完全不同——模板里根本没有 tool 角色轮，旧实现
+            # 渲成 <|im_start|>tool 是错的，模型收到的是它没见过的形状。
+            blocks = []
+            while i < len(msgs) and (msgs[i].get("role") or "") == "tool":
+                blocks.append(tool_response_block(_content_text(msgs[i].get("content"))))
+                i += 1
+            parts.append("%suser\n%s%s" % (IM_START, "\n".join(blocks), IM_END))
+            continue
+
+        if role == "system" and tools:
+            text = render_tools_system(tools, text)
+        elif role == "assistant":
+            calls = normalize_tool_calls(m.get("tool_calls"))
+            if calls:
+                text = render_assistant_turn(text, calls)
         if no_think and role == "user":
             text = text + " /no_think"
         parts.append("%s%s\n%s%s" % (IM_START, role, text, IM_END))
+        i += 1
     parts.append("%sassistant\n" % IM_START)
     return "".join(parts)
 
@@ -991,7 +1020,8 @@ class Handler(BaseHTTPRequestHandler):
         max_new = _pick_max_tokens(req)
         ctk = req.get("chat_template_kw") or {}
         enable_thinking = ctk.get("enable_thinking") if isinstance(ctk, dict) else None
-        prompt = render_messages(messages, enable_thinking=enable_thinking)
+        tools = _pick_tools(req)
+        prompt = render_messages(messages, enable_thinking=enable_thinking, tools=tools)
         # 会话身份，优先级从高到低：
         #   1. 请求体的 conversation_id —— 本项目自己的扩展，语义最明确
         #   2. X-Conversation-Id 请求头 —— 同上，给不方便改 body 的客户端
@@ -1002,8 +1032,9 @@ class Handler(BaseHTTPRequestHandler):
         key = conversation_key(messages, explicit=req.get("conversation_id")
                                or self.headers.get("X-Conversation-Id")
                                or req.get("user"))
-        self.gateway.log("chat: %d messages, %d prompt bytes, stream=%s, max_new=%d",
-                         len(messages), len(prompt.encode("utf-8")), stream, max_new)
+        self.gateway.log("chat: %d messages, %d prompt bytes, stream=%s, max_new=%d, tools=%d",
+                         len(messages), len(prompt.encode("utf-8")), stream, max_new,
+                         len(tools))
 
         lease = None
         q = None
@@ -1047,13 +1078,16 @@ class Handler(BaseHTTPRequestHandler):
                         self.gateway.pool.mark_dead(lease.session)
                         self.gateway.pool.release(lease, "", True)
                     else:
-                        # 记账用的必须是**客户端会回显的那份文本**，也就是摘掉 think 段
-                        # 之后的版本：下一轮 prompt 是这个版本的拼接，前缀判据才有可能
-                        # 成立。用 q.text()（原始版）记的话，关思考时每轮都会判"对不上"，
-                        # 缓存静默全废——而且答案是对的，看不出来（nothink_check.py 抓的
-                        # 就是这个）。
+                        # 记账用的必须是**客户端会回显的那份文本**：下一轮 prompt 是这个
+                        # 版本的拼接，前缀判据才有可能成立。用 q.text()（原始版）记的话，
+                        # 关思考时每轮都会判"对不上"，缓存静默全废——而且答案是对的，
+                        # 看不出来（nothink_check.py 抓的就是这个）。工具调用把这条规则
+                        # 又抬高一档：带着 tool_calls 的助手轮在下一轮 prompt 里是
+                        # 「正文 + <tool_call> XML」，所以记账也必须是渲染后的那一份，
+                        # 而不是模型原始输出（见 assistant_continuation）。
                         self.gateway.pool.release(
-                            lease, strip_think(q.text(), enable_thinking), q.was_cleared)
+                            lease, assistant_continuation(q, enable_thinking),
+                            q.was_cleared)
             if q is not None:
                 self.gateway.backend.release_request(q)
 
@@ -1065,6 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
         include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
         # 关思考时把开头那个（空的）think 段摘掉，两种响应形态共用同一份状态机
         stripper = ThinkStripper() if enable_thinking is False else None
+        extractor = ToolCallExtractor(reasoning=reply_reasoning(enable_thinking))
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1094,14 +1129,44 @@ class Handler(BaseHTTPRequestHandler):
              "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
 
         sent = [0]
+        n_calls = [0]
+
+        def tool_delta(call):
+            """一条工具调用的 SSE 增量。
+
+            `arguments` 一次性发完，不按 token 切片：客户端是按 `index` 把同一路调用的
+            arguments 拼起来的，一次给全和分片给在协议上等价。分片要在网关侧多维护一份
+            "这个 JSON 字符串切到哪了"的状态，换来的只是首字节早一点——不值得为它多一份
+            会出错的逻辑。
+            """
+            idx = n_calls[0]
+            n_calls[0] += 1
+            return {"id": cid, "object": "chat.completion.chunk", "created": created,
+                    "model": MODEL_ID,
+                    "choices": [{"index": 0,
+                                 "delta": {"tool_calls": [{
+                                     "index": idx,
+                                     "id": "call_%d" % idx,
+                                     "type": "function",
+                                     "function": {
+                                         "name": call["name"],
+                                         "arguments": json.dumps(
+                                             call.get("arguments") or {},
+                                             ensure_ascii=False)}}]},
+                                 "finish_reason": None}]}
 
         def emit(text):
-            """统一出口：过一遍 stripper（没开 stripper 就是原样），非空才发。"""
+            """统一出口：过 stripper（没开就是原样）再摘工具调用，各自非空才发。"""
             if stripper is not None:
                 text = stripper.feed(text)
+            if not text:
+                return
+            text, calls = extractor.feed(text)
             if text:
                 sse(delta_obj(text))
                 sent[0] += 1
+            for call in calls:
+                sse(tool_delta(call))
 
         def on_delta(text):
             emit(text)
@@ -1139,22 +1204,31 @@ class Handler(BaseHTTPRequestHandler):
             raise BackendError(q.error, soft=q.rejected)
 
         # 收尾前先把 stripper 里还攒着的字节放出来（正常情况是空；被截断在 <think> 里时
-        # 会连标签一起吐出来，见 flush() 的说明），否则客户端会少一段正文。
+        # 会连标签一起吐出来，见 flush() 的说明），否则客户端会少一段正文。走 emit 而不是
+        # 直接发：这段尾巴里也可能装着一个工具调用。
         if stripper is not None:
             tail = stripper.flush()
             if tail:
-                sse(delta_obj(tail))
-                sent[0] += 1
+                emit(tail)
 
-        sse(delta_obj(None, finish=q.finish_reason or "stop"))
+        # 同理：extractor 里攒着的可能是半个 <tool_call>（被 max_tokens 截断），
+        # flush 会连标签一起交回来当正文，不吞。
+        leftover, _ = extractor.flush()
+        if leftover:
+            sse(delta_obj(leftover))
+            sent[0] += 1
+
+        # 有工具调用时 finish_reason 必须是 tool_calls（理由同非流式路径）
+        sse(delta_obj(None, finish="tool_calls" if n_calls[0]
+                      else (q.finish_reason or "stop")))
         if include_usage:
             sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": MODEL_ID, "choices": [],
                  "usage": self._usage(q)})
         self._chunk(b"data: [DONE]\n\n")
         self._chunk(b"")                # 终止 chunk
-        self.gateway.log("stream done: rid=%d session=%d chunks=%d tokens=%d",
-                         q.rid, q.session, sent[0], q.decode_tokens)
+        self.gateway.log("stream done: rid=%d session=%d chunks=%d tool_calls=%d tokens=%d",
+                         q.rid, q.session, sent[0], n_calls[0], q.decode_tokens)
 
     def _blocking_response(self, req, q, enable_thinking=None):
         q.done.wait(REQUEST_TIMEOUT)
@@ -1163,14 +1237,21 @@ class Handler(BaseHTTPRequestHandler):
         if q.error:
             raise BackendError(q.error, soft=q.rejected)
         created = int(time.time())
+        content, calls = split_reply(q, enable_thinking)
+        message = {"role": "assistant", "content": content}
+        finish = q.finish_reason or "stop"
+        if calls:
+            # 有工具调用时 finish_reason 必须是 tool_calls：客户端（以及各家 Agent 框架）
+            # 就是靠它决定"该执行工具了"还是"这轮结束了"。照搬后端的 stop 会让 Agent
+            # 以为模型已经答完，工具根本不会被调用。
+            message["tool_calls"] = to_openai_tool_calls(calls)
+            finish = "tool_calls"
         self._json(200, {
             "id": "chatcmpl-%d-%d" % (created, q.rid),
             "object": "chat.completion",
             "created": created,
             "model": MODEL_ID,
-            "choices": [{"index": 0, "finish_reason": q.finish_reason or "stop",
-                         "message": {"role": "assistant",
-                                     "content": strip_think(q.text(), enable_thinking)}}],
+            "choices": [{"index": 0, "finish_reason": finish, "message": message}],
             "usage": self._usage(q),
         }, extra_headers=kv_reuse_headers(q.kv))
 
@@ -1216,6 +1297,41 @@ def _pick_max_tokens(req):
             # 耗尽时停，这个字段只是个上界。
             return min(v, MAX_NEW_TOKENS_CAP)
     return 0        # 0 = 让后端用它自己的默认值（--n-predict）
+
+
+def _pick_tools(req):
+    """OpenAI 的 `tools` / `tool_choice` -> 要注入 prompt 的工具列表（空 = 不注入）。
+
+    注入方式是把工具定义写进 **system 消息**（Qwen3.5 模板就是这么定的），所以工具变了
+    system 就变了，粘性复用的前缀判据会判"对不上"、这一轮全量重算。这没法避免——
+    工具集本来就是这个对话的一部分。要注意的是**别让它每轮都变**：Agent 每轮传同一份
+    tools，渲染出的字节就是同一份，复用照常。真正会踩的坑是客户端给 tools 里的
+    dict 换了键顺序——渲染时键是排序的（toolcalls.jinja_tojson），顺序无关，没事。
+
+    `tool_choice`：`"none"` 不注入；指定某个 function 就只注入它；其余（含
+    `"auto"` / `"required"`）全注入。"required" 我们没法强制模型一定调用，就不假装
+    能做到——把它当 auto 处理，比回一个 400 更接近客户端的意图。
+    """
+    raw = req.get("tools")
+    if not isinstance(raw, list):
+        return []
+    tools = [t for t in raw if isinstance(t, dict)]
+    if not tools:
+        return []
+    choice = req.get("tool_choice")
+    if isinstance(choice, str) and choice.strip().lower() == "none":
+        return []
+    if isinstance(choice, dict):
+        fn = choice.get("function")
+        if not isinstance(fn, dict):
+            fn = choice
+        want = fn.get("name")
+        if want:
+            picked = [t for t in tools
+                      if (t.get("function") or {}).get("name") == want]
+            if picked:
+                return picked
+    return tools
 
 
 class ThinkStripper(object):
@@ -1312,6 +1428,34 @@ def strip_think(text, enable_thinking):
         return text
     s = ThinkStripper()
     return s.feed(text) + s.flush()
+
+
+def reply_reasoning(enable_thinking):
+    """扫工具调用时要不要跳过 `<think>` 段。
+
+    开思考（默认，含客户端没明说）时要跳过：模型是"先推理、后调用"，但推理过程里
+    **讨论**到 `<tool_call>` 字样并不等于它打算调用那个工具，抽出来执行就成了替模型
+    做决定。关思考时不必——ThinkStripper 已经把开头那个（空的）think 段摘掉了。
+    """
+    return enable_thinking is not False
+
+
+def split_reply(q, enable_thinking):
+    """模型这一轮的回复 -> (给客户端的正文, 工具调用列表)。"""
+    return split_tool_calls(strip_think(q.text(), enable_thinking),
+                            reasoning=reply_reasoning(enable_thinking))
+
+
+def assistant_continuation(q, enable_thinking):
+    """这一轮的助手回复在**下一轮 prompt 里**长什么样（不含 assistant 头与 `<|im_end|>`）。
+
+    响应路径和 KV 记账路径共用这一个函数，两边的字节因此天然一致——不一致的话前缀
+    判据会失败、每轮全量重算，而那是"只慢不错"的静默退化。
+    没有工具调用时它就是 `strip_think(...)` 本身（render_assistant_turn 的空列表分支
+    原样返回正文），所以不带工具的老行为一个字节都没变。
+    """
+    content, calls = split_reply(q, enable_thinking)
+    return render_assistant_turn(content, calls)
 
 
 def kv_reuse_headers(kv):
@@ -1499,6 +1643,10 @@ def selftest(backend, pool):
     check("开思考时原样透传（不擅自丢推理过程）",
           strip_think("<think>推理</think>答案", True) == "<think>推理</think>答案"
           and strip_think("<think>推理</think>答案", None) == "<think>推理</think>答案")
+
+    # 工具调用的解析也是纯字符串逻辑，同样不必等板卡。放在这里而不是这里重写一遍：
+    # 实现和测试同住 toolcalls.py，check_template.py 也调同一个（两处都不需要后端）。
+    toolcalls_selftest(check)
 
     print("== 会话池：RESET+CLEAR 之后仍要能复用（回归）==")
     # 这条是补的：原实现里 release() 在 was_cleared 时把 known 清成空串，于是每段对话

@@ -29,6 +29,9 @@ MODE = sys.argv[2] if len(sys.argv) > 2 else "full"
 #   quick   —— 只跑到流式为止
 #   reject  —— 后端拒了一轮（上下文装不下）时的 HTTP 语义；需 `--ctx-limit` 桩
 #   bigmax  —— 离谱的 max_tokens 不得打死会话；需实现了那条校验的桩（见 fake_backend）
+#   tools   —— 工具调用：注入工具说明 -> 生成 -> 摘出调用 -> OpenAI 形态，以及工具结果
+#              回灌。桩上跑（fake_backend.py --tool-call）覆盖最全；板上也跑得动，但
+#              "模型这轮会不会真调用"取决于模型意愿，不调用时那几条打 INFO 而不是 FAIL
 TIMEOUT = 1800
 
 OK = [True]
@@ -105,6 +108,134 @@ def chat(messages, max_tokens=64, stream=False, conv=None, **extra):
     return chunks, "".join(text)
 
 
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "查某城市当前天气",
+        "parameters": {"type": "object",
+                       "properties": {"city": {"type": "string", "description": "城市名"},
+                                      "days": {"type": "integer", "description": "查几天"}},
+                       "required": ["city"]},
+    },
+}
+
+
+def tool_section():
+    """工具调用（function calling）在 HTTP 这一层的验收。
+
+    **两段性质不同的检查**，别把第二段当成第一段的替代：
+      · 「模型会不会真调用」取决于模型意愿，桩上（`--tool-call`）必然发生、板上不一定。
+        所以这里只在**真拿到** tool_calls 时断言契约（finish_reason / arguments 是合法
+        JSON / id 和 type），没拿到就打一行显式的 INFO——不把"模型这轮没调"伪装成通过。
+      · 「回灌 tool 结果再问一轮」是**确定的**：助手轮带 tool_calls 的历史由我们手写，
+        不依赖模型意愿。它端到端验的是渲染侧最要命的那条（连续 tool 消息合成一个 user
+        轮 + 助手轮调用块），板上和桩上都会跑到。
+    """
+    print("== 工具调用：注入 -> 生成 -> 摘出 -> OpenAI 形态 ==")
+    ask = [{"role": "user", "content": "北京今天天气怎么样？"}]
+    d = chat(ask, max_tokens=320, conv="probe-tool", tools=[WEATHER_TOOL])
+    msg = d["choices"][0]["message"]
+    fin = d["choices"][0]["finish_reason"]
+    calls = msg.get("tool_calls") or []
+    if calls:
+        check("有 tool_calls 时 finish_reason == tool_calls",
+              fin == "tool_calls", "finish_reason=%r" % fin)
+        check("tool_calls 的形态是 OpenAI 那种（id/type/function.name/arguments 齐全）",
+              all(c.get("id") and c.get("type") == "function"
+                  and c.get("function", {}).get("name")
+                  and isinstance(c["function"].get("arguments"), str) for c in calls),
+              json.dumps(calls, ensure_ascii=False)[:200])
+        # arguments 必须是**能解出来的 JSON 字符串**，不是把原文直接塞进去。客户端要按
+        # JSON 去解它，解不开的工具调用等于没调用。
+        try:
+            args0 = json.loads(calls[0]["function"]["arguments"])
+            ok_json = isinstance(args0, dict)
+        except ValueError:
+            args0, ok_json = None, False
+        check("arguments 是合法 JSON 且能解成对象", ok_json,
+              json.dumps(calls[0]["function"]["arguments"], ensure_ascii=False)[:120])
+        check("正文里不再残留 <tool_call> 标签（调用已经被摘出去了）",
+              "<tool_call>" not in (msg.get("content") or ""),
+              "content=%r" % (msg.get("content") or "")[:80])
+    else:
+        # 板上模型这轮可能选择不调用（比如它觉得自己知道答案）。这**不是**失败，但也
+        # 不是通过——写清楚，免得把一次没覆盖到的跑批当成覆盖到了。
+        print("  [INFO] 这一轮模型没有调用工具（finish_reason=%r, content=%r）"
+              % (fin, (msg.get("content") or "")[:60].replace("\n", " ")))
+        print("         桩上（fake_backend.py --tool-call）必然发生；板上取决于模型意愿。")
+    close_conv("probe-tool")
+
+    print("== 工具结果回灌：助手轮带 tool_calls 的历史（确定路径，不依赖模型意愿）==")
+    # 手写一段"已经调过一次"的历史。它端到端验的是渲染侧：助手轮的调用块要按模板渲成
+    # <tool_call>/<function=...>，tool 角色要渲成 <tool_response> 包在一个 user 轮里
+    # （模板里根本没有 tool 轮，渲成 <|im_start|>tool 是改造前的错法）。
+    hist = [
+        {"role": "user", "content": "北京今天天气怎么样？"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_0", "type": "function",
+             "function": {"name": "get_weather",
+                          "arguments": json.dumps({"city": "北京", "days": 1},
+                                                  ensure_ascii=False)}}]},
+        {"role": "tool", "content": "北京 18 摄氏度，晴。"},
+        {"role": "tool", "content": "湿度 40%。"},          # 连续两条 -> 合成一个 user 轮
+        {"role": "user", "content": "那明天呢？"},
+    ]
+    d2 = chat(hist, max_tokens=320, conv="probe-tool", tools=[WEATHER_TOOL])
+    c2 = d2["choices"][0]["message"].get("content") or ""
+    check("带 tool_calls + 连续两条 tool 结果的历史能正常出一轮",
+          len(c2) > 0, "前 60 字：%s" % c2[:60].replace("\n", " "))
+
+    print("== 工具循环里的 KV 复用：带工具的历史同样要粘得住 ==")
+    # 这一条才是前面所有字节级较真的**目的**。工具轮的历史（助手调用块 + <tool_response>）
+    # 只要渲染出来的字节和上一轮实际发出去的差一点，前缀就断在那儿、之后每轮全量重算——
+    # 不报错、答案也对，只在这里现形。
+    #
+    # **判据必须是和冷会话的对照，不能是 `cached_tokens > 0`**：前缀断在助手轮时，它
+    # 前面的部分照样命中缓存。实测把记账文本多拼一个空格（前缀必断），cached 从 567/584
+    # 掉到 44/443——`> 0` 照样通过。所以比的是"本轮真正重算的部分"：热会话 vs 换个身份
+    # 的冷会话（没有粘性记录）。同 sticky_check.py 的 `(p_s - c_s) * 2 < p_f`。
+    follow = hist + [{"role": "assistant", "content": c2},
+                     {"role": "user", "content": "谢谢，那后天呢？"}]
+
+    def recomputed(d):
+        u = d["usage"]
+        return (u["prompt_tokens"] - (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+                (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
+
+    d3 = chat(follow, max_tokens=64, conv="probe-tool", tools=[WEATHER_TOOL])
+    d4 = chat(follow, max_tokens=64, conv="probe-tool-cold", tools=[WEATHER_TOOL])
+    hot, hot_cached = recomputed(d3)
+    cold, _ = recomputed(d4)
+    check("带工具的多轮历史命中 KV 复用（本轮重算部分远小于冷会话）",
+          hot * 2 < cold and hot_cached > 0,
+          "热会话重算=%d tok（复用 %d）, 冷会话重算=%d tok" % (hot, hot_cached, cold))
+    close_conv("probe-tool-cold")
+
+    print("== 流式 + 工具：增量协议也要能带 tool_calls ==")
+    chunks, text = chat(ask, max_tokens=320, stream=True, conv="probe-tool",
+                        tools=[WEATHER_TOOL])
+    fins = [c["choices"][0].get("finish_reason") for c in chunks if c.get("choices")]
+    tcs = [tc for c in chunks if c.get("choices")
+           for tc in (c["choices"][0].get("delta") or {}).get("tool_calls") or []]
+    check("流式路径有收尾的 finish_reason", any(f is not None for f in fins),
+          "finish=%s" % [f for f in fins if f is not None])
+    if tcs:
+        check("流式 finish_reason == tool_calls", fins[-1] == "tool_calls",
+              "finish=%r" % fins[-1])
+        check("流式 tool_calls 增量带 index（客户端靠它拼同一路调用）",
+              all("index" in tc for tc in tcs),
+              json.dumps(tcs, ensure_ascii=False)[:200])
+        # 流式和非流式给客户端的**正文**必须一致：不一致的话客户端回显流式那份再发
+        # 下一轮，渲染出来的字节就和记账的对不上，粘性复用静默退化成每轮全量重算。
+        # （正文的规范化只在渲染侧做一次，见 toolcalls.render_assistant_turn。）
+        check("流式正文里也没有残留的 <tool_call> 标签", "<tool_call>" not in text,
+              "正文=%r" % text[:80])
+    else:
+        print("  [INFO] 流式这一轮没有工具调用增量（同上一段的说明）。")
+    close_conv("probe-tool")
+
+
 def main():
     print("=== 网关 HTTP 测试：%s ===" % BASE)
 
@@ -140,6 +271,12 @@ def main():
                                   for c in chunks))
     check("拼出的文本非空", len(text) > 0, "%d 字" % len(text))
     close_conv("probe-oneshot")     # 见文件头：不还回去，后面几段就会为会话数打架
+
+    if MODE == "tools":
+        # 早退：这段是自成一体的，没必要把后面的并发/伸缩也跑一遍（几分钟起）。
+        tool_section()
+        print("\n%s" % ("全部通过" if OK[0] else "有失败项"))
+        return 0 if OK[0] else 1
 
     if MODE == "quick":
         print("\n%s" % ("全部通过" if OK[0] else "有失败项"))

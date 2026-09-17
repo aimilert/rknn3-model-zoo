@@ -21,8 +21,10 @@
 | `restart_gateway.sh` | 杀掉重启（含两个测试陷阱的注释，别改成命令行一行流） |
 | `build_serve.sh` | 在构建机上交叉编译出 `rknn_multicard_demo.serve`（Release） |
 | `run_all_board_tests.sh` | 板上跑完全部验收测试，失败项集中列在最后 |
-| `check_template.py` | 网关渲染的 prompt 与 `main.cc` 模板**逐字节**比对（见下） |
-| `serve_http_test.py` | 接口面：health / models / 非流式 / SSE / 多轮 KV 复用 / 并发 |
+| `toolcalls.py` | 工具调用（function calling）：prompt 侧的渲染 + 回复侧的解析，含自带自检 |
+| `tool_golden.json` | 工具渲染的金标准：真 Jinja2 渲模型自己的 `tokenizer.chat_template` 得到的字节 |
+| `check_template.py` | 网关渲染的 prompt 与 `main.cc` 模板 / 模型模板**逐字节**比对（见下） |
+| `serve_http_test.py` | 接口面：health / models / 非流式 / SSE / 多轮 KV 复用 / 并发（`tools` 模式另有工具调用） |
 | `sticky_check.py` | 粘性复用的**语义**正确性（暗号靠 KV 存活 + prefill 计数） |
 | `nothink_check.py` | 关思考（`enable_thinking=false`）下的粘性复用回归 |
 | `http_scaling.py` | HTTP 层并发伸缩（自研门面存在的唯一理由） |
@@ -189,8 +191,18 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
   **关掉标签页**会交还（后者走 `sendBeacon`——`beforeunload` 里 `fetch` 会被浏览器取消）。
   所以先演示网页版再演示多用户接入时，中间要关掉页面，否则后来的人全在排队。
   忘了关也能救：`/v1/pool` 里读 `id:web-N`，`POST /v1/conversations/close` 逐个收回来。
-- `tool` 角色的渲染**未测**（`render_messages` 只处理 system/user/assistant）——接 function
-  calling 之前要先补这个测试。
+- **function calling 已实现，但有下面这几条边界**（格式来自模型自己的 `tokenizer.chat_template`，
+  逐字节对拍见 `check_template.py` + `tool_golden.json`）：
+  - **`tool_choice: "required"` 不强制调用**。`"none"` 会照做（不注入工具说明），指定单个函数时
+    只注入那一个；但**没有任何机制逼模型一定调用**——它仍然可以选择直接回答。要"必须调用"得
+    由 Agent 侧自己判（`finish_reason != "tool_calls"` 时重试）。
+  - **认不出来的工具调用会作为正文返回**（不猜、不吞）。模型写了个不合格式的块时，客户端拿到
+    的是带 `<tool_call>` 标签的正文而不是一个 `tool_calls` 数组——比编一个参数错误的调用安全。
+  - **工具集变了会让 KV 前缀失效**。工具说明注入在 system 消息里，所以同一段对话中途增删工具
+    等于换了 prompt 前缀，那一轮会全量重算。要求 Agent 在一段对话里保持工具集稳定。
+  - **模型回退到 Hermes JSON 形态时，那一轮之后会失去粘性**。渲染侧一律用 XML，所以按 JSON
+    解析出来的调用渲回去必然和模型生成的字节不同（`toolcalls.selftest` 里有一条断言钉着这个
+    已知限制）。只影响模型自己回退的那些轮。
 - **客户端中途断开，这一轮仍会跑完**。后端不能中途叫停一次已经开始 prefill+decode 的推理，
   网关的做法是丢掉往那条连接写的通道、继续把这一轮的 token 读完再释放会话——**代价是这一次
   的连接断开不能换来算力释放**（4 个会话被断开的请求占一秒，这一秒里不会有人补进来）。
@@ -240,6 +252,23 @@ python3 serve_http_test.py http://127.0.0.1:8099        # 全绿（连跑两遍�
 python3 demo_multiuser.py http://127.0.0.1:8099 5 40 --stagger 0.4 --plain --close
 ```
 
+工具调用（function calling）那一路要桩**主动吐一个调用**才测得到，所以桩要多带 `--tool-call`
+（它在 prompt 里还没有 `<tool_response>` 时回一个固定的 XML 调用，拿到工具结果之后就正常回答，
+于是整条回路——注入工具说明 → 生成 → 摘出调用 → OpenAI 形态响应 → 回灌结果 → 再问一轮——在
+没有板卡的情况下就走通了）：
+
+```sh
+python3 rkllm_gateway.py --port 8101 --sessions 2 --frames-stdout \
+    -- python3 fake_backend.py --sessions 2 --tool-call --think-prefix
+python3 serve_http_test.py http://127.0.0.1:8101 tools
+```
+
+**`tools` 模式里有两条性质不同的检查，别把后一条当前一条用**：「模型会不会真调用」取决于模型
+意愿（桩上必然发生、板上不一定，没发生就打 `[INFO]` 而不是 `FAIL`）；「回灌 tool 结果再问一轮」
+是我们手写历史、不依赖模型意愿的**确定路径**，板上也照跑。里面那条 KV 复用判据比的是**和冷会话
+的对照**，不是 `cached_tokens > 0`——前缀断在助手轮时前面的部分照样命中，`> 0` 会漏（实测把记账
+文本多拼一个空格，cached 从 567/584 掉到 44/443，`> 0` 依然通过）。
+
 想单独看"排队 + TTL 回收"这条路，另起一个网关并给一个短的 TTL：
 
 ```sh
@@ -250,3 +279,9 @@ python3 demo_multiuser.py http://127.0.0.1:8098 5 20 --stagger 0.3 --plain   # 5
 
 `check_template.py` 守的是一条**必须守住的不变量**：服务模式下 prompt 由网关渲染、后端逐字节透传，
 所以两边渲染必须**逐字节一致**，否则同一段对话在 `--interactive` 与服务两条前端上的行为会悄悄分叉。
+
+它还管**工具调用**那一半。`main.cc` 里的 `QWEN35_CHAT_TEMPLATE` 没有工具支持，所以权威不是它，
+而是模型自己的 `tokenizer.chat_template`；板卡上没有 jinja2（实测 Python 3.12 无此包）渲不了，
+于是参考字节在本机用真 Jinja2 渲好后冻进 `tool_golden.json`（生成器 `rt_work/gen_golden.py`，
+不进 git）。**这个套件是被"改坏它试试"验过的**：把调用前的分隔、`tojson` 的排序/转义、
+`<tool_response>` 的前导换行、连续 tool 消息之间的连接符等处逐个改坏，它每次都红。

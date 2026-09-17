@@ -15,7 +15,7 @@
   · 头行解析不了一律 rc=2 退出，让失败显式暴露，而不是静默丢帧。
 
 用法（由网关自动拉起，一般不手跑）：
-    python3 fake_backend.py --sessions 2 [--serve-fd N]
+    python3 fake_backend.py --sessions 2 [--serve-fd N] [--think-prefix] [--tool-call]
 """
 import argparse
 import os
@@ -25,6 +25,11 @@ import time
 
 REPLY = ("你好，我是一个跑在 4 片 RK1828 上的 Qwen3.5-27B，"
          "由多会话并发执行器驱动。这句话里混了中文、数字 12345 和 ASCII 混排。")
+# --tool-call 时的固定调用：一个字符串参数 + 一个数字参数。数字那个是刻意的——解析侧会
+# 把它转成 Python 的 int，渲回 prompt 时如果不用原文，`3` 这轮还能对上、`true`/`1.50`
+# 那种就对不上了（见 toolcalls.render_assistant_turn）。
+TOOL_CALL = ("\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n北京\n"
+             "</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>")
 CTX_LIMIT = 4096
 
 
@@ -53,6 +58,11 @@ def main():
     # **不**标死会话）。0 = 不限。有它才能把网关那半边（软错误 / 不标死 / 作废粘性 / 不
     # 把这轮 prompt 记进 KV 账）在本地测到，否则那四条只有板卡上把上下文撑满才能验。
     ap.add_argument("--ctx-limit", type=int, default=0)
+    # 让桩先回一个工具调用、拿到 tool 结果之后再正常回答，好把"请求 -> 注入工具说明 ->
+    # 生成 -> 摘出调用 -> OpenAI 形态响应 -> 回灌 tool 结果 -> 再问一轮"整条回路在没有
+    # 板卡的情况下走通。判据是 prompt 里有没有 <tool_response>（由对话本身决定，不需要
+    # 桩自己记状态），所以也顺带验了网关把 tool 结果正确渲进了下一轮 prompt。
+    ap.add_argument("--tool-call", action="store_true")
     args, _unknown = ap.parse_known_args()
 
     if args.serve_fd is not None:
@@ -95,6 +105,8 @@ def main():
         time.sleep(args.delay)
         # 切得要"不整齐"：把多字节字符也切开，逼网关用增量解码器
         reply = ("<think>  </think>  " + REPLY) if args.think_prefix else REPLY
+        if args.tool_call and "<tool_response>" not in prompt:
+            reply += TOOL_CALL
         raw = reply[:max_new].encode("utf-8")
         step = 7
         for i in range(0, len(raw), step):

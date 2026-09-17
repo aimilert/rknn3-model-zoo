@@ -30,6 +30,10 @@ run python3 serve_http_test.py "$BASE"
 # 它要的是**真后端**，因为这条契约（后端拒收超出 int32 的 max_new_tokens）只有真后端
 # 和桩各自实现了一份，两边都要能过。放在 full 之后：它会占一个会话几秒钟。
 run python3 serve_http_test.py "$BASE" bigmax
+# 工具调用。板上"模型这轮会不会真调用"取决于模型意愿（不调用时那几条打 INFO 而不是
+# FAIL），但**确定路径**照样全跑：回灌 tool 结果再问一轮、以及带工具的历史能不能粘住
+# KV。后者才是重点——工具轮的历史渲染差一个字节，之后每轮就全量重算，不报错、答案也对。
+run python3 serve_http_test.py "$BASE" tools
 run python3 sticky_check.py "$BASE"
 run python3 nothink_check.py "$BASE"
 # 伸缩测量放最后：它会把 4 个会话都写脏
