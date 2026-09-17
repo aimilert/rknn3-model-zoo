@@ -153,6 +153,7 @@ class Backend(object):
         self._next_rid = 1
         self._ready = threading.Event()
         self._dead = False
+        self.stopping = False                 # 我们自己发的 QUIT，用来区分"正常收工"与"后端死了"
         self._rfile = None
         self._reader = None
         self.on_clear = None                  # 回调 (session, ctx, limit)
@@ -194,6 +195,7 @@ class Backend(object):
             return
         try:
             if self.proc.poll() is None:
+                self.stopping = True
                 self.proc.stdin.write(b"QUIT\n")
                 self.proc.stdin.flush()
         except Exception:
@@ -253,6 +255,14 @@ class Backend(object):
         finally:
             self._dead = True
             self._ready.set()
+            # 后端没了 = 这个网关从此刻起只能回 503（池子里再等也不会多出会话来）。
+            # 必须吵一声：现场除了这一行，其余症状全是"客户端卡住/503"，看不出是谁先死的。
+            # 自己发 QUIT 收工的那条路（stopping）不算故障，别误报。
+            if not self.stopping:
+                sys.stderr.write("[gateway] backend exited (frame stream ended); every "
+                                 "request fails with 503 until the gateway is "
+                                 "restarted\n")
+                sys.stderr.flush()
             with self._lock:
                 pending = list(self._reqs.values())
             for q in pending:
@@ -506,6 +516,24 @@ class SessionPool(object):
         queued = False
         with self.cv:
             while True:
+                # 等不出结果的两件事，必须在**进队列之前**判掉。不判的代价不是"慢一点"，
+                # 是请求在队列里空等满 queue_timeout 而屏幕上什么都不打印——现场看起来
+                # 像"网关卡了"，真相在 `GET /v1/pool` 里一眼可见（四个 slot 全是 dead）。
+                #   · 后端子进程没了：一个超大请求就能让它退出（见 main.cc 的
+                #     kServeMaxPromptBytes 分支），池子里再等也不会凭空多出会话来；
+                #   · 四个会话全 dead：dead 没有任何复活路径（见 mark_dead），等下去
+                #     是纯粹的干等。
+                # 2026-09-17 上板实测：一个 3.4 MB 的请求打死后端 → 四个会话全 dead →
+                # 5 段对话（4 个终端 + 1 个 Claude Code）在这里排到 600s 超时才收到 503。
+                if not self.backend.alive():
+                    self.waiting.pop(key, None)
+                    raise BackendError("backend exited; every request fails until the "
+                                       "gateway is restarted")
+                if all(self.dead):
+                    self.waiting.pop(key, None)
+                    raise BackendError("all %d sessions are dead; restart the gateway"
+                                       % self.n)
+
                 # 优先复用已经绑在这一段对话上的会话：只有它才可能已经有这段历史。
                 cand = self.bound.get(key)
                 if cand is not None and not self.dead[cand] and not self.busy[cand]:
@@ -659,8 +687,11 @@ class SessionPool(object):
         不能走 release()：它会把「本轮发出的 prompt」算进"KV 里确定装着的内容"，而这一
         轮一个 token 都没 prefill 进去。照 release 记账的话，下一轮网关会以为历史都在、
         只发差异部分——模型看到的是一段没有开头的对话，答出来通顺但串味，正是这套记账
-        存在的意义反面。known 由 CLEAR 帧的 `_on_clear` 置成 None（后端在拒之前先发了
-        CLEAR），下一轮必定 RESET 全量重发，这才是对的。
+        存在的意义反面。known 这里**一个字节都不动**，两种来源各自已经是对的：
+          · 上下文装不下 —— 后端在拒之前先发了 CLEAR，`_on_clear` 已把它置成 None，
+            下一轮必定 RESET 全量重发；
+          · 载荷超帧上限 —— 后端**不发 CLEAR**（KV 一个字节都没动），known 保持原样
+            正好描述着 KV 里真正装着的东西。
         """
         with self.cv:
             s = lease.session
@@ -943,9 +974,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._static_demo()
         if path in ("/health", "/healthz"):
             pool = self.gateway.pool.snapshot()
-            return self._json(200, {"status": "ok",
+            dead = sum(1 for s in pool["slots"] if s["state"] == "dead")
+            backend_alive = self.gateway.backend.alive()
+            return self._json(200, {"status": ("ok" if backend_alive and dead == 0 else
+                                               "backend_exited" if not backend_alive else
+                                               "degraded"),
                                     "model": MODEL_ID,
                                     "sessions": self.gateway.backend.sessions,
+                                    # 「还能不能干活」必须能从这一行看出来。现场最坑的一种
+                                    # 状态是 status:"ok" + sessions:4 + 四个 slot 全 dead：
+                                    # 后端子进程已经退出、每个请求都 503，而 /health 报的是
+                                    # 满员。看护脚本本来就在轮询这里，别让它去学 /v1/pool。
+                                    "backend_alive": backend_alive,
+                                    "sessions_dead": dead,
                                     # 会话全被占 + 有人在等 = 到上限了。放进 /health 是因为
                                     # 监控/看护脚本本来就在轮询这个端点，不必再教它一个新路径。
                                     "sessions_busy": sum(1 for s in pool["slots"]
@@ -1547,6 +1588,68 @@ def selftest_reject(backend, check):
         rb.stop()
 
 
+class _AliveOnlyBackend(object):
+    """只给 selftest_pool_liveness 用：池子对后端只要求 `sessions` / `on_clear` / `alive` 三样。
+
+    这里敢用桩是因为被测的是**池子那条判据本身**（"等不出结果就别让人排"），它与帧协议、
+    与哪台后端都无关；用真后端反而要额外起一个进程、白等 240s 加载模型。端到端那一半
+    （真后端被打死之后，5 段对话不再一起空等到 600s）在板卡上验，见文档 §9.11。
+    """
+
+    def __init__(self, sessions=4):
+        self.sessions = sessions
+        self.on_clear = None
+        self.is_alive = True
+
+    def alive(self):
+        return self.is_alive
+
+
+def selftest_pool_liveness(check):
+    """后端没了 / 会话全 dead：`acquire` 必须**立刻**报错，而不是让人排在队列里空等。
+
+    对应的现场（2026-09-17 上板实测）：一个 3.4 MB 的请求让后端进程退出（见 main.cc 的
+    kServeMaxPromptBytes 分支），四个会话全 dead；之后 4 个终端 + 1 个 Claude Code 一起
+    进来排队，屏幕上什么都不打印，600s 之后才各收到一个 503。看相是"网关卡了"，真相是
+    队列在等一个已经不存在的东西——所以这条判据必须在**进队列之前**生效。
+
+    判据本身也有"写松了"的两种形态，两条反面对照就钉它们：
+      · 写成恒失败 —— 后端活着、会话有空时必须照常拿到会话；
+      · 两种情况糊成一句话 —— 错误信息要分得清"后端死了"还是"会话没了"，现场靠它
+        决定下一步（前者只能重启网关，后者同样是，但成因完全不同）。
+    """
+    be = _AliveOnlyBackend(4)
+    pool = SessionPool(be, idle_ttl=0, queue_timeout=5)
+
+    def timed_acquire(key):
+        t0 = time.time()
+        try:
+            pool.acquire(key, "hi")
+            return None, time.time() - t0
+        except BackendError as exc:
+            return exc, time.time() - t0
+
+    lease = pool.acquire("live", "hi")
+    pool.release(lease, "hi", False)
+
+    # ① 后端子进程没了
+    be.is_alive = False
+    err, dt = timed_acquire("backend-gone")
+    check("后端没了 => 立刻报错，不在队列里空等到 queue_timeout",
+          err is not None and not err.soft and dt < 1.0, "%.2fs %r" % (dt, err))
+    check("错误分得清是「后端退出了」", err is not None and "backend" in str(err),
+          "%r" % (err,))
+
+    # ② 后端活着，但四个会话全 dead（dead 没有任何复活路径）
+    be.is_alive = True
+    for s in range(pool.n):
+        pool.mark_dead(s)
+    err, dt = timed_acquire("all-dead")
+    check("四个会话全 dead => 立刻报错，不在队列里空等到 queue_timeout",
+          err is not None and not err.soft and dt < 1.0, "%.2fs %r" % (dt, err))
+    check("错误分得清是「会话没了」", err is not None and "dead" in str(err), "%r" % (err,))
+
+
 def selftest(backend, pool):
     """验证 C++ 侧的帧协议。比"直接上 HTTP"分段定位得清楚：协议不通时不用怀疑 HTTP。"""
     ok = True
@@ -1862,6 +1965,9 @@ def selftest(backend, pool):
         # 真后端没有 --ctx-limit，造不出这个帧序；真板上要把一段对话撑到 4096 token 才
         # 触发，那不叫自检、那叫压测。真后端那半个只能在板卡上手动验（把上下文跑满）。
         print("  [SKIP] 这一段要桩后端（--ctx-limit 是桩专有的开关）")
+
+    print("== 后端死了 / 会话全 dead：不能让人排在队列里空等 ==")
+    selftest_pool_liveness(check)
 
     print("\n%s" % ("自检全部通过" if ok else "自检有失败项，见上面的 FAIL"))
     return 0 if ok else 1

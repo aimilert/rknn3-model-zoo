@@ -183,8 +183,9 @@ static void serve_err(uint64_t rid, int session, const std::string& message)
               message.data(), message.size());
 }
 
-// 后端在 prefill **之前**拒了这一轮：会话是好的，只是这一轮没跑（目前只有「上下文
-// 装不下」一种）。
+// 后端在 prefill **之前**拒了这一轮：会话是好的，只是这一轮没跑。目前两种来源：
+// 「上下文装不下」（带着一帧 CLEAR，那段历史确实被丢了）和「载荷超过帧上限」
+// （不带 CLEAR——KV 一个字节都没动，网关那边 known[] 保持原样才是对的）。
 //
 // 为什么单开一个帧类型而不是复用 ERR：网关对两者的处置**必须**不同。ERR 的含义是
 // "该会话的驱动线程已经退出"，网关收到就把这个会话标死、不再往上派活——那是对的。
@@ -3057,9 +3058,14 @@ static void run_interactive_input_worker(InteractiveDispatcher* dispatcher)
   dispatcher->cv_work.notify_all();
 }
 
-// prompt 载荷的长度上限。没有上限的话，头行里一个手滑的数字就能让本进程按那个
-// 数字去 reserve 内存（比如 2^60），直接把服务打死——这条流由网关直接驱动，
-// 它一旦算出个错长度，我们不该跟着一起崩。
+// prompt 载荷的长度上限。它**只管一件事**：别相信头行里那个数字。没有上限的话，
+// 一个手滑的 2^60 会让本进程按它去 reserve 内存，直接把服务打死——这条流由网关
+// 直接驱动，它一旦算出个错长度，我们不该跟着一起崩。
+//
+// **它不是"这一轮太长"的判据**，那条判据是 tokenizer 的（装不下就 REJECT，见会话
+// 驱动循环里数 incoming_tokens 那一段）。1 MiB 远在任何 8192 位置上装得下的 prompt
+// 之上——那个量级是几十 KB——所以在这里拦下来的请求，tokenizer 那条也一定会拦。
+// 两者真正的区别在**拦下来之后干什么**，而这里曾经写的是 `break`。
 static const size_t kServeMaxPromptBytes = 1u << 20;
 
 // 每轮 max_new_tokens 的上限。协议里这个字段实际按 `int` 用（`PendingInput`、
@@ -3120,8 +3126,26 @@ static void run_serve_input_worker(InteractiveDispatcher* dispatcher, int sessio
     // 长度上限先行：它决定载荷还能不能安全跳过（见下面越界分支）。顺序不能反——
     // 反过来的话，「会话号越界 + prompt_len 声明成 2^60」会先去跳一个天文数字的载荷。
     if (prompt_len > kServeMaxPromptBytes) {
-      serve_err(rid, session, "prompt too long: " + std::to_string(prompt_len) + " bytes");
-      break;  // 载荷读不下去、流已经错位，再读只会把后面的头行当载荷
+      // **把载荷丢掉接着跑，不能 break**。"载荷读不下去"只对**撒谎的头行**成立
+      // （声明了长度、字节却没发出来），而写这条流的只有我们自己那个网关，它永远
+      // 按 `len(payload)` 写满——所以这个分支实际收到的载荷是**真的**，和下面两个
+      // 越界分支一样读得掉、丢得起。
+      //
+      // break 的代价是"一条请求发错了"升级成"整个服务没了"：输入线程一退，四个
+      // 会话全死，网关之后每个请求都 503 直到重启，池子里排队的人等满 queue_timeout
+      // 也等不到人，而 /health 还在报 sessions: 4。2026-09-17 上板实测，就是这么被
+      // Claude Code 的一个 3.4 MB 请求打死的。
+      //
+      // 回 REJECT 而不是 ERR：会话是好的、这一轮也确实一个 token 都没跑（KV 一个
+      // 字节都没动，所以**不发 CLEAR**）。网关收到 REJECT 只失败这一条请求（400）
+      // 并把会话留着；ERR 会被 mark_dead，撞四次又回到"四个会话全死"。
+      discard_serve_payload(prompt_len);
+      serve_reject(rid, session,
+                   "prompt too long: " + std::to_string(prompt_len) +
+                       " bytes exceeds the frame limit of " +
+                       std::to_string(kServeMaxPromptBytes) +
+                       " bytes; shorten this request");
+      continue;
     }
     if (session >= session_count || session < -1) {
       // 头行合法但会话号越界：**必须把载荷读掉**再回 ERR，不能直接 continue。
