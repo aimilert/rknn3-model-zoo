@@ -1,7 +1,7 @@
 # 多 Session 并发推理方案（Qwen3.5-27B / 4×RK1828）
 
 > 项目：`rknn3-model-zoo/examples/multicard`
-> 核心代码：`cpp/main.cc`（4823 行）、`python/qwen3_5/`（模型转换）
+> 核心代码：`cpp/main.cc`（4871 行）、`python/qwen3_5/`（模型转换）
 > 目标模型：**Qwen3.5-27B**，4 段流水线 / 4 张 RK1828 卡
 > 部署现场：`CM3588-Plus:<板卡上模型目录>`（板卡在独立内网）
 > 安装目录：`../install-Qwen/rk3588_linux_aarch64`
@@ -749,7 +749,7 @@ git tag m5-multiuser    # 指向多用户接入（身份/排队/交还）的代�
 | └ **板卡上的部署副本（会漂移，以这一行为准）** | 板卡上的部署副本 | **2026-09-16 上板实测**：原副本 md5 `009d0e265c2530c4a44573f42611b810`——早前那句"`009d0e26` 一说"是对的，`e09ac2b9` 不是。它与 `570c406` **只差 `_static_demo` 的一处 docstring**（功能无差别，不是功能漂移；**何时分叉的没查**），所以 §9.7 里"入库后两份副本 md5 相同"那句**在 2026-09-16 实测时不成立**。它**没有** §9.8 的身份/排队/`close`/`/v1/pool` 的 `key`。**同日已就地打上 ERR 解析补丁**（见 §9.7 末），原件留 `rkllm_gateway.py.bak_err_parse`，补丁后 = `8fc1b7076c99c2f226a251a554b90137`——**没有拿 HEAD 整体覆盖**，因为那会顺带推上只在桩后端验过的排队/`close`/`pool`。要用 §9.8 那套仍需重新下发 + 重启网关（重载模型约 240s）。**同日稍后（全套件验收时）已整体换新**：后端 `3355dc4f` + 网关 `7a06e5ca` + 演示页 `1db0882d` + 测试脚本，旧件全存 `bak_20260916/`（回滚 = 换回 `rknn_multicard_demo.bak_e223ea8f` 与 `bak_20260916/` 里的文件，再重启）。也就是说"**没有拿 HEAD 整体覆盖**"只在**当天前半段**成立，别按这行去推断板卡此刻的状态。**2026-09-17 整体重换一次**（工具调用版网关 + 8192 上下文模型）：`serve/` 下 10 个文件与工作区**逐字节相同**（md5 逐一核对，表见 §9.9），旧件在 `serve/bak_20260917_tools/`——**所以"板卡上不是仓库 HEAD 的副本"这句话，从 2026-09-17 起不成立**；它是 09-16 之前的历史，别再当现状引用 |
 | 网页演示页（**已入库**） | `examples/multicard/serve/demo_4chat.html` | `570c406` = `88a53e8b1935c7ef27bb04959ec7c211`（旧版，四个匿名对话）→ **`bc7f013` = `1db0882d98850b20232d0f96e325c9a1`**。**板卡上的是旧版** `af7240627777f576a24d5f95bd522b38`（2026-09-16 核实，与早前记的 `af72406…` 吻合）——它会以四个匿名对话占住全部 4 个会话（§9.8 咬到 5）；**2026-09-16 已换成 `1db0882d…`**（不换的话，新网关的排队会让旧页面的四个对话互相堵住，演示当场卡死） |
 | M5 启动/构建/验收脚本（**已入库**） | `examples/multicard/serve/*.sh`、`*.py`、`README.md` | 见 `git ls-tree`；板卡路径全部走环境变量 |
-| M5 板端二进制（Release） | 板卡 `<板卡安装目录>/rknn_multicard_demo.serve` | `e223ea8f3f5d38e82a37cd560c29fb96`（1091328 B，M5）→ **`3355dc4f44a5f47332c8e0d7528be84d`（1076496 B，`b13bbdb`，2026-09-16 起在板上运行）** |
+| M5 板端二进制（Release） | 板卡 `<板卡安装目录>/rknn_multicard_demo.serve` | `e223ea8f3f5d38e82a37cd560c29fb96`（1091328 B，M5）→ `3355dc4f44a5f47332c8e0d7528be84d`（1076496 B，`b13bbdb`，GCC 11.4 交叉编译，2026-09-16 起在板上运行）→ **`b6a67b2d1ede1d8e0cb2a63db6830e3e`（1107096 B，源码 `57daa06d`，**板上原生编译** g++ 13.3.0，2026-09-17 起在板上运行，见 §9.10.6）** |
 | 板卡二进制 | 见 §5 各阶段完成记录的表 | P0 `a6739a6e…` / P0+插桩 `205232b8…` / P1 `6f5aa9d7…` / P2 `8f6e900d…` / P3 `d30ce8af…` / **R11 补锁后 `1b01b960904c7412f64a173b222240a1`** |
 | TSan 二进制（首轮，**不含 R11 锁**） | 板卡 `<板卡临时目录>/rknn_multicard_demo.tsan` | `acb78c120353c73f74725ed1c7a30ed2` |
 | TSan 二进制（补轮，**含 R11 锁**） | 板卡 `<板卡临时目录>/rknn_multicard_demo.tsanr11` | **`7f19e6d505ac443829604765bcb2b142`** |
@@ -2005,6 +2005,223 @@ follow = hist + [{"role": "assistant", "content": c2}, ...]   # ← 丢了 tool_
 
 ---
 
+### 9.10 REJECT 判据的缺口：一条超限请求本来会**吃掉一个会话** —— 2026-09-17 修复并上板验收
+
+§9.7 引入 REJECT 帧时写下的意图是「上下文装不下就拒掉这一轮，别把会话标死」。**那条
+判据有一个洞，而且洞的形状正好是它最该拦住的那两类请求**。
+
+#### 9.10.1 洞在哪
+
+原判据（`main.cc` 会话驱动循环）：
+
+```cpp
+const bool context_almost_full =
+    conv.context_tokens > 0 && context_limit > 0 &&
+    conv.context_tokens + prefill_reserve >= context_limit;
+```
+
+两个问题叠在一起：
+
+1. **门槛条件 `conv.context_tokens > 0`**，看的是**已经攒在 KV 里的** token；
+2. **完全没有数本轮 prompt 自己有多长。**
+
+服务模式下网关只发**增量**（`prompt[len(base):]`，板上实测 `sent=84 / full=522`），
+增量多长完全由客户端决定，跟 `conv.context_tokens` 没有关系。于是两类请求直接漏过去：
+
+- **新会话的第一条就超**——累计值还是 0，门槛条件当场为假；
+- **聊到一半突然贴一份长文档 / diff**——累计值看着很小。
+
+漏过去之后它一路走到 prefill，在 SDK 里以 `input_tokens > max_position_embeddings`
+失败。**回来的是 ERR 而不是 REJECT**，网关于是 `mark_dead(lease.session)`——它就
+永久少一个会话。4 条这样的请求就把整套服务打死，而 `/health` 仍然报 `sessions: 4`。
+
+**这个后果 `main.cc` 自己的注释一字不差地预言过**（"标死等于每撞一次超限就永久少一个
+会话，四次之后整个服务没有会话可用"）——判据写在那里，只是没盖住这两类输入。
+
+> 顺带收回一条**我上一轮给错的建议**：当时我提议"网关不该对 `q.error` 无条件
+> `mark_dead`"。读了 `main.cc` 的失败路径才发现那一轮末尾是 `break;`——工作线程
+> **整个退出**循环、`worker_alive[index] = false`。会话是真死了，网关标死是对的。
+> **修复只能在服务侧**，不能在网关侧和稀泥。
+
+#### 9.10.2 怎么修
+
+服务模式下每一轮派发前，用**会话自己的 tokenizer** 数一遍本轮 prompt，把"已经在那儿的"
+和"这一段要放进去的"加起来看：
+
+```cpp
+uint64_t incoming_tokens = 0;
+if (g_serve_mode) {
+  const int n = count_prompt_tokens(conv.result.tokenizer, job.text);
+  ...
+}
+const uint64_t projected_tokens = conv.context_tokens + incoming_tokens;
+const bool context_almost_full =
+    projected_tokens > 0 && context_limit > 0 &&
+    projected_tokens + prefill_reserve >= context_limit;
+```
+
+**交互模式不数**：那边 prompt 由模板拼、长短就是本次输入，而交互模式的策略本来就是
+"自动清 KV 接着跑"（`run_conversation_worker` 的 `--rounds` 路径、单会话 REPL 路径
+都是这条策略）。**那两处判据故意没动**——它们没有网关的 `known[]` 会被带偏，清 KV
+接着跑语义自洽。服务侧只有这一条驱动路径。
+
+修的时候顺手把三件事一并处理了：
+
+- **`count_prompt_tokens` 里必须取 `g_tokenizer_mutex`**。它就是从原来的
+  `probe_count_tokens` 改来的（那个函数**没有取锁**，因为过去只在单线程探针路径上
+  用）。改成服务模式调用点之后，这是 **4 条会话线程的并发入口**，而 `Tokenizer`
+  没有线程安全承诺——不取锁就是一个真实的并发隐患，而且它在"探针路径一切正常"的
+  假象下潜伏着。锁取在函数内部：探针路径多取一次锁不要钱。
+- **数不出来不能当成 0**。这条判据是"装不下"的**唯一拦截点**，静默失效比报错难查
+  得多（表现是偶发 503 + 会话一个个变少）。`tokenizer` 为空或 `Tokenize` 返回非正数
+  时打一条 `WARNING`，至少可查。
+- **REJECT 的报文拆成两支**，因为客户端该采取的动作完全不同：
+  - `this single turn is too long: <n> tokens of prompt alone (limit <L>); shorten this request`
+    —— 清 KV 没用（KV 本来就是空的），只能改请求；
+  - `context limit reached: <h> tokens of history + <n> of this turn (limit <L>); start a new conversation or trim the history`
+    —— 清 KV + 开新对话能救。
+
+#### 9.10.3 两处**极容易写错**的地方（都写进注释钉住了）
+
+1. **CLEAR 报的必须是 `conv.context_tokens`（真被丢掉的那些），绝不能报
+   `projected_tokens`。** 本轮 prompt 一个 token 都还没进 KV；报了的话网关的
+   `known[]` 会比实际 KV **长**，前缀判据从此对不上，缓存**静默全废**——不报错、
+   答案也对，只是每轮全量重算。
+2. **RESET 分支和 REJECT 分支不再是互斥的。** 原来是 `if (reset...)  {...} else if
+   (almost_full) {...}`；现在 RESET 之后会**继续往下走**到 REJECT 判据——因为一个
+   RESET 轮次本身也可能太长。所以 REJECT 里的 CLEAR 加了 `if (conv.context_tokens > 0)`
+   守护，避免对同一轮发两遍 CLEAR。这条守护成立的前提是
+   **`clear_conversation_kv` 会把 `conv.context_tokens` 归零**（已核对定义，确实归零）
+   ——依赖这个前提的地方在注释里点明了。
+
+#### 9.10.4 主机侧测试台：t11 + 变异体 m5
+
+`rt_work/hosttest/` 加了 `t11_oversized_first_turn_rejects()`，并配一个变异体：
+
+| 用例 / 变异体 | 覆盖的是哪半个判据 | 期望 |
+|---|---|---|
+| `t7` | **历史攒太长**（老判据本来就管得住） | 绿 |
+| `t11` | **本轮自己就装不下**（新加的那半个） | 绿 |
+| 变异 `m5 no_incoming_count`（`projected = conv.context_tokens`，即不数本轮） | — | **只有 t11 变红，t7 仍绿** |
+
+m5 只让 t11 变红、t7 不动，正说明**t11 测的是新增的那半个判据，不是把 t7 重测了一遍**
+（t7 也在 m5 下单独跑过：12 PASS / 0 FAIL）。
+
+**两个踩过的坑，都是"测试自己骗自己"：**
+
+- **桩的 `Tokenizer::Tokenize` 原来返回 0**——新判据会静默降级，而 **t11 会照样绿**。
+  桩改成真正计数（1 token/字节，取单调可手算的数；保真度不是这套测试的目标）。
+- **夹具从来没设过 `conv.result.tokenizer`**（在文件里 grep 零匹配）。
+  `result.tokenizer` 为 NULL 时数不出来，判据降级成只看历史累计——**测的是降级后的
+  行为，而不是产品行为**。夹具挂了一个 `Tokenizer host_tokenizer{...}` 上去。
+
+**t11 第一次跑是失败的，但失败原因不是产品**：桩的底层管线每一轮都会失败
+（`[stage0] run failed ret=-1` / `prefill failed`），所以 **DONE / ERR 这类帧标签根本
+区分不了"跑过"和"没跑"**（t8 的 `ERR(411)` 也是同一个原因，而 t8 只断言"有一个帧"）。
+断言改成看帧本身（rid 700 恰好一个 `REJECT` 帧）加报文文本匹配之后才可靠。
+
+#### 9.10.5 上板验收：四条超限请求打不死服务
+
+板卡侧新增 `rt_work/verify_reject_fix.py`。**修复前的现场**（2026-09-17 记录）是同一个
+请求返回 503、`/v1/pool` 少一个可用会话。修复后：
+
+| 步骤 | 期望 | 实测 |
+|---|---|---|
+| 单条 15719 token 的请求 | 4xx + "单轮太长" | **HTTP 400** `this single turn is too long: 15719 tokens of prompt alone (limit 8192)` |
+| 连打 4 条、4 个不同对话（= 修复前把服务打死的场景） | 全部 4xx | **400 / 400 / 400** |
+| 事后 `/v1/pool` | 无 `dead`，可用额度仍 4 | `{'idle': 4}`，usable=4 |
+| 紧接着一个普通小请求 | 200 | **HTTP 200**（prompt=33） |
+| 逐个 `close` 那 5 个探针会话 | 全 200 | **200 × 5**，池回到 `{'free': 4}` |
+
+**"不变量不是 4 个 free"**——这条值得写下来，因为验收脚本的第一版就是断言"4 free"、
+当场红了两条：会话被一段对话借走、暂时没人说话时状态是 `idle`，那是**正常的、`IDLE_TTL`
+到点会收回、仍然可用**。真正的不变量是三条：(1) 没有任何会话进 `dead`；(2)
+`free + idle + busy` 恒等于 4，即可用额度不缩水；(3) 挨过超限请求之后普通请求能跑通、
+探针占的会话能被正常交还。**状态字段是网关自己写的，只有真发一轮请求、真关一次会话，
+才算证明那些会话是活的而不是"看着在、其实废了"。**
+
+**另一条口径教训**：验收脚本第一版自己拼了一遍 OpenAI 形状的转换，同一份抓包量到
+**24665** token，而 `cc_token_measure.py` 量到 **15719**——差出来的正是
+`json.dumps` 带进去的字段名。改成 `from cc_token_measure import to_openai` 复用同一套
+转换之后两个数才对上。**同一个请求必须是同一个数**，否则"修复前 vs 修复后"的对照没有意义。
+
+#### 9.10.6 顺带：板卡原生编译（中间那台编译机没了）
+
+原来那台租用的交叉编译服务器**没续租**。查了一下发现根本不需要它：**板卡自己就有
+g++ 13.3.0 + make + cmake**，`install-*/lib/` 里三个 SDK `.so` 也都在（那是跑这个
+二进制的运行时依赖，本来就必须在）。**只缺头文件**，而头文件全在仓库里：`rknn3_api.h` /
+`float16.h` / `Tokenizer.h` / `nlohmann/json`（header-only），加上链接期的
+`libtokenizer.a`（**静态库**，板上不用放）。
+
+⚠️ **这不是"复刻"现有二进制**：那份是 GCC 11.4（Ubuntu 22.04）交叉编出来的，板上是
+13.3，**字节不可能一样，谁也证明不了"等价"**。所以判据只有一条：整套板卡验收。编出来的
+是一个**新基线**，不是旧二进制的副本。回滚件留在板上。
+
+#### 9.10.7 部署这道工序里三件会**静默出错**的事
+
+这一轮真正花时间的不是改代码，是这三条——它们共同的特征是**出错时一切看起来都成功**：
+
+1. **网关加载的是 `rknn_multicard_demo.serve`，不是 `rknn_multicard_demo`。**
+   `start_gateway.sh` 第 45 行 `B=${B:-./rknn_multicard_demo.serve}`（由 `build_serve.sh`
+   产出）。**覆盖错名字的话旧后端会继续在跑**，而整套流程从 md5 到日志全部"成功"。
+   核实办法：`readlink /proc/<pid>/exe` 加 `readlink /proc/<pid>/cwd`，别靠猜。
+2. **`MODEL_DIR` 必须显式传，漏了会静默停摆。** plink 起的是**干净 shell**，不继承交互
+   环境里的 export；而 `restart_gateway.sh` 是 `setsid nohup ./start_gateway.sh &` 起的
+   后台进程，它自己的失败**只写进日志**——脚本这边照样返回 0、打印
+   `gateway restarting (model load ~240s)`，之后 240s 里什么都看不出来。
+   实际发生的是 `start_gateway.sh` 第一件事 `[ -d "$MODEL_DIR" ]` 不成立，报
+   `no such model dir: /home/Qwen3.5-27B (set MODEL_DIR)` 然后退出——**网关就此停摆**。
+   `board_install.sh` 现在把 `MODEL_DIR` 和 `CTX` 都改成硬要求（`: "${MODEL_DIR:?...}"`）。
+3. **`CTX` 默认是 4096，而板上模型是 8192 那份导出。** 漏传**不报错**，只会把上下文
+   **悄悄砍成一半**——所有跟历史实测数字的对比就此作废。所以也一起改成硬要求。
+
+（板卡上没有 `curl`，探活要用 `python3` 或从别的机器打 HTTP。）
+
+#### 9.10.8 板卡整套验收：全绿，且性能与交叉编译老基线重合
+
+`run_all_board_tests.sh` 八段全部 `rc=0`，汇总判据 **FAIL 0 / 非零 rc 0 / traceback 0
+→ 全绿**。
+
+> **一个读日志时的坑**：想复核 FAIL 行数**不能**在跑完之后 `grep -c '\[FAIL\]' board_tests.log`
+> ——汇总块自己写下的那行 `（无 [FAIL] 行）` 里就有 `[FAIL]` 这个字面量。脚本内部的计数
+> 是在**追加汇总之前**做的，所以它报 0 是对的，而事后 grep 会得到 1。别把这 1 当成失败。
+
+**伸缩（96 token，三方对照）：**
+
+| N | 墙钟(s) | 聚合 tok/s | 伸缩比 | 对照官方 server | GCC 11.4 老基线 |
+|---|---|---|---|---|---|
+| 1 | 8.8 | **10.93** | 1.00x | 10.63 | 10.97 |
+| 2 | 9.6 | **20.09** | 1.84x | 10.98 | 20.22 (1.84x) |
+| 4 | 10.3 | **37.22** | **3.40x** | 10.98 | 37.13~37.40 (3.38~3.41x) |
+
+**GCC 13.3 原生编译 vs GCC 11.4 交叉编译，性能没有可辨差异**——这是"原生构建可以替代
+原二进制"这条结论唯一的支撑，也是它必须跑整套件而不能只跑冒烟的原因。
+
+#### 本节的版本对照
+
+| 件 | md5 |
+|---|---|
+| `examples/multicard/cpp/main.cc`（源码，本地 == 板上 `native_build/main.cc`） | `57daa06d5b1ac14f94b4f777582358b7` |
+| 后端二进制（板上 `rknn_multicard_demo.serve`，**板上原生编译**） | `b6a67b2d1ede1d8e0cb2a63db6830e3e` |
+| 后端二进制（上一版，GCC 11.4 交叉编译 `b13bbdb`）—— 留在板上做回滚 | `3355dc4f44a5f47332c8e0d7528be84d` |
+
+启动参数与上一版**逐字一致**（`--ctx-size 8192 --core-mask 0xff --stage-count 4
+--bucket-size 128 --sessions 4 --serve -n 512`），所以上面的吞吐数字与历史同口径。
+
+#### 未验证 / 已知限制
+
+- **"历史攒太长"那一支只在本机测试台上验过（t7），没在板上复现。** 要在板上真的走到那一支，
+  得先让 KV 真的攒到接近 8192——按板上 ~11 tok/s 的 prefill 速度，光是把 7000 token
+  灌进 KV 就要十几分钟。所以板上证据覆盖的是**修复前会打死服务的那一支**（单轮超限），
+  不是两支都覆盖了。
+- **板卡原生构建是个新基线**（GCC 13.3 vs 11.4），字节不可能相同；"等价"这个说法
+  只有整套件全绿 + 上表的伸缩重合作为支撑，没有更强的东西。
+- 本轮**没有**重新导出模型。32k / 64k 的取舍见 §9.9.4 与 KV 容量的约束：按实测
+  8.05 MB/node/session @4096 线性外推，**4 个会话最多到约 16015 上下文**，
+  16384×4 就已超预算——**重新导出与 4 路并发是直接冲突的**。
+
+---
+
 ## 10. 一页纸总结
 
 | 项 | 结论 |
@@ -2059,6 +2276,8 @@ KV 复用（HTTP）   续聊 prefill 12 vs 全量 154 tok（开思考 0.08）/ 1
 ```
 
 ---
+
+*文档版本：v1.14（2026-09-17）—— **修掉 REJECT 判据的缺口：一条超限请求本来会吃掉一个会话**（§9.10）。原判据 `conv.context_tokens > 0 && conv.context_tokens + reserve >= limit` 只盯**已经攒在 KV 里的** token、从不数本轮 prompt，于是「新会话第一条就超」和「聊到一半贴一份长文档」直接漏过：走到 prefill 后 SDK 以 `input_tokens > max_position_embeddings` 失败，回来的是 **ERR 不是 REJECT**，网关 `mark_dead` —— **4 条这样的请求打死整套服务，而 `/health` 仍报 `sessions: 4`**。服务模式下改为 `projected = 历史 + 本轮（用会话自己的 tokenizer 数）`；`count_prompt_tokens` 内部补上 `g_tokenizer_mutex`（**它现在有 4 条并发调用路径**，而原 `probe_count_tokens` 没取锁）；REJECT 报文按"单轮太长 / 历史太长"拆成两支。**顺手收回我上一轮给错的建议**：网关的 `mark_dead` 是对的，失败轮末尾是 `break;`，修复只能在服务侧。主机侧新增 `t11` + 变异 `m5`（**m5 只让 t11 变红、t7 不动**，证明 t11 测的是新增的那半个判据）；桩的 `Tokenize` 原来返回 0、夹具从没设过 `conv.result.tokenizer`——**两处都会让新判据静默降级而 t11 照样绿**，都已修。板卡侧 `verify_reject_fix.py`：**连打 4 条超限请求全部 400、零 dead、可用额度恒为 4、普通请求仍 200、5 个探针会话 close 全 200**。同时**板卡改为原生编译**（租用的交叉编译机没续租）：板上自带 g++ 13.3.0 + make + cmake，只缺头文件（全在仓库里），产物 `b6a67b2d`；⚠️ 这是**新基线不是复刻**（GCC 13.3 vs 11.4），判据只有整套件——**八段全绿，伸缩 10.93 / 20.09(1.84×) / 37.22(3.40×) 与老基线重合**。另记三件**会静默出错**的部署工序：网关加载的是 **`.serve`** 那个名字（覆盖错则旧后端继续跑而一切"成功"）、漏 `MODEL_DIR` 会让网关**静默停摆**、`CTX` 默认 4096 会**悄悄把上下文砍半***
 
 *文档版本：v1.13（2026-09-17）—— **Phase 1 工具调用 + 8192 上下文，真机验收**（§9.9）：工具调用的格式**不查文档、取自模型自己的 `tokenizer.chat_template`**（**XML，不是 Hermes JSON**），工具目录在**网关侧**拼，**后端二进制一行没动**（板上仍是 `b13bbdb` 的 `3355dc4f`）。新增板卡侧 `toolcall_check.py`——它问的全是**桩后端永远答不了**的问题；`check_template.py` 拿真 Jinja2 与网关拼出来的工具前言**逐字节对拍**。**桩上全绿、板上第一遍就抓到一条真 FAIL**（回显助手轮丢了 `tool_calls` → 前缀断 → 整段重算 469/469），修后用 A/B/C 变异测试证明检查不是空转。模型换成 **8192 导出**（判据 `rope_cos_cache [1,4,1,8192,16]`），5013 / 6853 token 的 prompt 都能从**中段**取回暗号。`serve/` 下 10 个文件与工作区**逐字节相同**——"板上跑的不是仓库 HEAD 副本"那段历史到此结束。顺带修掉 `restart_gateway.sh` 的 `pkill` 自匹配自杀*
 *文档版本：v1.12（2026-09-16）—— **交叉编译 + 上板全套件验收**：把 v1.10 那个"未做 aarch64 交叉编译、未上板"的边界补掉。后端 `3355dc4f`（源码 `e0c49989`）+ 网关 `7a06e5ca` 一起下发，`run_all_board_tests.sh` **连跑两轮全绿**（FAIL 0 / 非零 rc 0 / traceback 0），伸缩 3.41× 与 3.38×（对照官方 server 1.03×）；§9.8 的身份/排队/`close`/`/v1/pool` **第一次在真后端上跑到**；`usage` 新口径在板上拿到非零 `cached_tokens`。**R14 在板上复现并验证修好**（`--bucket-size 64` + 跨分块的 prompt：改动前 `embed buffer too small` + `prefill failed`，改动后正常作答）——这是本批唯一一条板上"改动前 vs 改动后"对照，因为默认 128 下那条 bug 根本不触发。同时修掉一处**记录过期**：§8.1 网关那行的"当前 HEAD"在 `1dde346` 之后就错了*

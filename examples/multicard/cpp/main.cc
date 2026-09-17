@@ -68,6 +68,25 @@ static bool g_suppress_generation_output = false;
 // 里的 TokenToPiece/Decode 由 N 个会话线程同时调用，这里串行化，代价可忽略
 // （一次调用是微秒级，相比 80ms/token 的推理可以不计）。
 static std::mutex g_tokenizer_mutex;
+
+// 用模型自己的 tokenizer 数一段文本的 token 数，失败返回 -1。
+// 两个调用点：满上下文探针要报出**真实** token 数（靠「字符数 / 3.5」估算无从判断
+// 到底有没有把上下文填满，测试强度就不可知）；服务模式下每一轮派发前也要数一遍
+// **本轮 prompt**，那是"装不下就发 REJECT"这条判据的输入（见会话驱动循环）。
+// 锁必须在函数里取：服务模式下这是 4 条会话线程的并发调用点，而 Tokenizer
+// 没有线程安全承诺（理由就是上面那把锁的注释）；探针路径是单线程的，取锁不要钱。
+static int count_prompt_tokens(Tokenizer* tokenizer, const std::string& text)
+{
+  if (!tokenizer || text.empty()) {
+    return -1;
+  }
+  std::vector<int32_t> buf(text.size() + 16);
+  std::lock_guard<std::mutex> tokenizer_lock(g_tokenizer_mutex);
+  int n = tokenizer->Tokenize(text.c_str(), (int32_t)text.size(), buf.data(),
+                              (int32_t)buf.size());
+  return n > 0 ? n : -1;
+}
+
 // 交互式多会话把整段回复一次性打到 stdout。这把锁把 printf 与紧跟的 fflush 绑成
 // 一个整体，保证「一块回复」在一次持锁内完整落地，块与块之间的先后是可预期的。
 // （严格说，glibc 的 printf 本身对同一个 FILE 也持锁，单次调用不会被另一条线程从
@@ -2756,13 +2775,39 @@ static void run_interactive_session_worker(int index, Conversation& conv,
     // 服务模式下清 KV 不是"提示"而是**语义事件**——本会话的 KV 一丢，粘在它上面的
     // 那段对话历史就没了。网关必须知道，否则它会以为上下文还在、下一轮只补差异部分，
     // 模型看到的是一段残缺的对话。所以这里发 CLEAR 帧，带上被丢弃的 token 数。
-    const bool context_almost_full =
-        conv.context_tokens > 0 && context_limit > 0 &&
-        conv.context_tokens + prefill_reserve >= context_limit;
     if (g_serve_mode && job.reset && conv.context_tokens > 0) {
       serve_clear(job.rid, index, conv.context_tokens, context_limit);
       clear_conversation_kv(stages, conv);
-    } else if (context_almost_full && g_serve_mode) {
+    }
+
+    // 本轮要往 KV 里放的 token 总量 = 已经在那儿的 + 这一段 prompt。
+    // **服务模式下这一段必须自己数**：网关只发增量（`prompt[len(base):]`，板上实测
+    // sent=84 / full=522），增量多长完全由客户端决定，跟 conv.context_tokens 无关。
+    // 只盯累计值的话两类请求都漏——「新会话的第一条就超」（累计值还是 0）和「聊到
+    // 一半突然贴一份长文档/diff」（累计值看着很小）。它们会一路走到 prefill，在 SDK
+    // 里以 input_tokens > max_position_embeddings 失败，回来的是 ERR 而不是 REJECT，
+    // 网关于是 mark_dead——正是下面那段注释要防的后果，2026-09-17 上板实测撞到。
+    // 交互模式不数：那边 prompt 由模板拼、长短就是本次输入，而交互模式的策略本来
+    // 就是"自动清 KV 接着跑"（见最后的 else 分支），没有会死的会话。
+    uint64_t incoming_tokens = 0;
+    if (g_serve_mode) {
+      const int n = count_prompt_tokens(conv.result.tokenizer, job.text);
+      if (n > 0) {
+        incoming_tokens = (uint64_t)n;
+      } else {
+        // 数不出来**不能当成 0**：这条判据是"装不下"的唯一拦截点，静默失效比报错
+        // 难查得多（表现是偶发 503 + 会话一个个变少）。留一条日志，至少可查。
+        printf("[session %d] WARNING: cannot count the incoming prompt; "
+               "the context-limit guard is degraded for this turn\n",
+               index);
+        fflush(stdout);
+      }
+    }
+    const uint64_t projected_tokens = conv.context_tokens + incoming_tokens;
+    const bool context_almost_full =
+        projected_tokens > 0 && context_limit > 0 &&
+        projected_tokens + prefill_reserve >= context_limit;
+    if (context_almost_full && g_serve_mode) {
       // **服务模式下不能"自动清 KV 再把这一轮跑完"**。上下文将满时清 KV 在交互模式
       // 里是合理的（整段对话都在本进程里拼，清完重来一轮语义自洽），但服务模式下
       // 网关只发增量（`prompt[len(base):]`，板上实测 sent=84 / full=522）：KV 一清，
@@ -2777,15 +2822,31 @@ static void run_interactive_session_worker(int index, Conversation& conv,
       //   · 再发 REJECT：告诉网关「这个会话还活着，只是这一轮没跑」。**不能发 ERR**：
       //     网关收到 ERR 会把会话标死（mark_dead），而上下文装不下不是会话的错——
       //     标死等于每撞一次超限就永久少一个会话，四次之后整个服务没有会话可用。
-      serve_clear(job.rid, index, conv.context_tokens, context_limit);
-      serve_reject(job.rid, index,
-                   "context limit reached: " + std::to_string(conv.context_tokens) +
-                       " + " + std::to_string(prefill_reserve) + " >= " +
-                       std::to_string(context_limit) +
-                       " tokens; start a new conversation or trim the history");
-      // 顺手把 KV 清掉：这段对话本身就装不下，留着满 KV 只会让下一轮同样顶穿。
-      // 清完是"确定为空"的状态，网关已知情（上面那帧 CLEAR），下一轮会 RESET 重发。
-      clear_conversation_kv(stages, conv);
+      // 拒的理由分两种，客户端该采取的动作也完全不同，所以消息要分开写：
+      //   · 这一轮 prompt 自己就装不下 —— 清 KV 没用（KV 本来就是空的），只能改请求；
+      //   · 历史攒太长 —— 清 KV + 开新对话能救，下一轮 RESET 全量重发会短一些。
+      const bool this_turn_alone = incoming_tokens + prefill_reserve >= context_limit;
+      const std::string reason =
+          this_turn_alone
+              ? "this single turn is too long: " + std::to_string(incoming_tokens) +
+                    " tokens of prompt alone (limit " + std::to_string(context_limit) +
+                    "); shorten this request"
+              : "context limit reached: " + std::to_string(conv.context_tokens) +
+                    " tokens of history + " + std::to_string(incoming_tokens) +
+                    " of this turn (limit " + std::to_string(context_limit) +
+                    "); start a new conversation or trim the history";
+      // CLEAR 报的必须是**真被丢掉的那些** token，也就是 conv.context_tokens——
+      // 不能报 projected_tokens，本轮 prompt 一个 token 都还没进 KV（报了的话网关
+      // 的 known[] 会比实际 KV 长，前缀判据从此对不上，缓存静默全废）。
+      // 上面的 RESET 分支可能已经把 KV 清空了，那就没什么可报、也不用再清一遍
+      // （清两遍不是错，只是白干一场）。
+      if (conv.context_tokens > 0) {
+        serve_clear(job.rid, index, conv.context_tokens, context_limit);
+        // 顺手把 KV 清掉：这段对话本身就装不下，留着满 KV 只会让下一轮同样顶穿。
+        // 清完是"确定为空"的状态，网关已知情（上面那帧 CLEAR），下一轮会 RESET 重发。
+        clear_conversation_kv(stages, conv);
+      }
+      serve_reject(job.rid, index, reason);
       // continue 而不是 break：会话线程是好的，只是这一轮不跑。break 出去等于把一个
       // 健康的会话永久摘掉（服务容量少一份），钉给它的活从此没人接（见 worker_alive）。
       continue;
@@ -3538,19 +3599,6 @@ static double probe_card_tightest_free_mb(const std::vector<StageContext>& stage
   return tightest;
 }
 
-// 用模型自己的 tokenizer 数一遍，返回 token 数（失败返回 -1）。
-// 满上下文测试必须报出**真实** token 数：靠「字符数 / 3.5」估算无从判断
-// 到底有没有把上下文填满，测试强度就不可知。
-static int probe_count_tokens(Tokenizer* tokenizer, const std::string& text)
-{
-  if (!tokenizer || text.empty()) {
-    return -1;
-  }
-  std::vector<int32_t> buf(text.size() + 16);
-  int n = tokenizer->Tokenize(text.c_str(), (int32_t)text.size(), buf.data(), (int32_t)buf.size());
-  return n > 0 ? n : -1;
-}
-
 // 模型实际生效的上下文上限。以模型内固化的 max_ctx_len 为准——命令行 --ctx-size
 // 只在不超过它时才有意义（RK1828 上超了会被静默降到这个值）。
 static int probe_model_ctx_len(const StageContext& stage)
@@ -3934,7 +3982,7 @@ static int probe_sessions(std::vector<StageContext>& stages, Conversation& conv,
         filler += para;
       }
       long_prompt = prefix + filler + postfix;
-      int n = probe_count_tokens(tokenizer, long_prompt);
+      int n = count_prompt_tokens(tokenizer, long_prompt);
       if (n < 0) {
         printf("[probe]   tokenizer 不可用，无法确认测试强度（跳过满上下文测试）\n");
         longctx_tested = false;
