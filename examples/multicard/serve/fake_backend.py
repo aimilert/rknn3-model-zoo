@@ -63,6 +63,15 @@ def main():
     # 板卡的情况下走通。判据是 prompt 里有没有 <tool_response>（由对话本身决定，不需要
     # 桩自己记状态），所以也顺带验了网关把 tool 结果正确渲进了下一轮 prompt。
     ap.add_argument("--tool-call", action="store_true")
+    # 让桩**每一轮都调用**，而不是"调一次、拿到 tool 结果就好好回答"。真模型就是这样：
+    # 2026-09-17 板上实测，它回灌了工具结果之后又吐了一次工具调用。
+    #
+    # 为什么非要有这个模式：serve_http_test.py tools 里那条 KV 判据下一轮的助手消息，
+    # 原来只回显了**正文**、把 tool_calls 丢了。桩只在第一轮调用，那一轮的正文恰好非空，
+    # 于是"丢调用"这个错法在桩上完全看不出来；真模型一调，助手轮少一个字段，前缀全断、
+    # `cached_tokens` 归零，板上直接红。桩默认行为不变（调一次），要复现这个场景就用它。
+    ap.add_argument("--tool-call-repeats", action="store_true",
+                    help="每一轮都回工具调用（模仿真模型），而不是拿到 tool 结果就收手")
     args, _unknown = ap.parse_known_args()
 
     if args.serve_fd is not None:
@@ -105,7 +114,7 @@ def main():
         time.sleep(args.delay)
         # 切得要"不整齐"：把多字节字符也切开，逼网关用增量解码器
         reply = ("<think>  </think>  " + REPLY) if args.think_prefix else REPLY
-        if args.tool_call and "<tool_response>" not in prompt:
+        if args.tool_call and (args.tool_call_repeats or "<tool_response>" not in prompt):
             reply += TOOL_CALL
         raw = reply[:max_new].encode("utf-8")
         step = 7

@@ -182,21 +182,37 @@ def tool_section():
         {"role": "user", "content": "那明天呢？"},
     ]
     d2 = chat(hist, max_tokens=320, conv="probe-tool", tools=[WEATHER_TOOL])
-    c2 = d2["choices"][0]["message"].get("content") or ""
+    m2 = d2["choices"][0]["message"]
+    c2 = m2.get("content") or ""
+    c2_calls = m2.get("tool_calls") or []
+    # 这一轮真模型大概率**又调一次工具**（2026-09-17 板上实测如此），所以判据
+    # 不能是"正文非空"：那种回复的正文只有一对空的 <think></think>，甚至可能是空的。
     check("带 tool_calls + 连续两条 tool 结果的历史能正常出一轮",
-          len(c2) > 0, "前 60 字：%s" % c2[:60].replace("\n", " "))
+          bool(c2.strip()) or bool(c2_calls),
+          "正文=%r 调用=%d 个" % (c2[:40].replace("\n", " "), len(c2_calls)))
 
     print("== 工具循环里的 KV 复用：带工具的历史同样要粘得住 ==")
     # 这一条才是前面所有字节级较真的**目的**。工具轮的历史（助手调用块 + <tool_response>）
     # 只要渲染出来的字节和上一轮实际发出去的差一点，前缀就断在那儿、之后每轮全量重算——
     # 不报错、答案也对，只在这里现形。
     #
-    # **判据必须是和冷会话的对照，不能是 `cached_tokens > 0`**：前缀断在助手轮时，它
-    # 前面的部分照样命中缓存。实测把记账文本多拼一个空格（前缀必断），cached 从 567/584
-    # 掉到 44/443——`> 0` 照样通过。所以比的是"本轮真正重算的部分"：热会话 vs 换个身份
-    # 的冷会话（没有粘性记录）。同 sticky_check.py 的 `(p_s - c_s) * 2 < p_f`。
-    follow = hist + [{"role": "assistant", "content": c2},
-                     {"role": "user", "content": "谢谢，那后天呢？"}]
+    # **下一轮的助手消息必须原样带上这一轮的 tool_calls**。这不只是"像 Agent 那样"：
+    # 网关的判据是 `prompt.startswith(known[session])`（全匹配，不做最长公共前缀的部分
+    # 复用，见 rkllm_gateway.py 的 _make_lease），所以助手轮少一个字段，代价是**整段
+    # prefill 重算**、`cached_tokens` 直接归零——2026-09-17 真机上就是这么红的：桩在
+    # 这一轮不吐调用，于是 `content=c2` 恰好够用；真模型吐了调用，只回显正文就把调用丢了。
+    # 拿"模型这一轮没调用"当前提的测试，桩上过、板上挂。
+    tail = [{"role": "assistant", "content": c2}]
+    if c2_calls:
+        tail[0]["tool_calls"] = c2_calls
+        tail.append({"role": "tool", "content": "明天 20 摄氏度，多云。"})
+    tail.append({"role": "user", "content": "谢谢，那后天呢？"})
+    follow = hist + tail
+
+    # **判据必须是和冷会话的对照，不能是 `cached_tokens > 0`**：这条判据在改造期间真的
+    # 空转过——桩上把记账文本多拼一个空格（前缀必断），cached 从 567/584 掉到 44/443，
+    # `> 0` 照样通过。所以比的是"本轮真正重算的部分"：热会话 vs 换个身份的冷会话
+    # （没有粘性记录）。同 sticky_check.py 的 `(p_s - c_s) * 2 < p_f`。
 
     def recomputed(d):
         u = d["usage"]

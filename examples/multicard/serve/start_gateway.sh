@@ -21,6 +21,11 @@
 #   QUEUE_TIMEOUT 取不到会话时最多排队等这么多秒，超了返回 503；默认 600（要 > IDLE_TTL）
 #   PORT         监听端口；默认 8080
 #   NP           每轮 max_new_tokens 的进程默认值；默认 512
+#   CTX          上下文长度；默认 4096。**必须和模型导出时的最大位置对得上**：
+#                导出的 rope cache 形状是 [1, head_dim/…, 1, N, 16]，N 就是上限。
+#                8192 那份模型的 N=8192（用 safetensors 头就能看到），起 4096 只是
+#                少用一半、不出错；反过来拿 4096 的导出起 8192 会读越界。落在哪份模型
+#                上用 `python3 -c` 或 serve/README 里的办法核一下再改，别猜。
 #   HOST         监听地址；默认 0.0.0.0 = 局域网可达
 #   LOG          后端日志路径；默认 $GATEWAY_DIR/gateway_backend.log
 #
@@ -43,6 +48,7 @@ IDLE_TTL=${IDLE_TTL:-300}
 QUEUE_TIMEOUT=${QUEUE_TIMEOUT:-600}
 PORT=${PORT:-8080}
 NP=${NP:-512}
+CTX=${CTX:-4096}
 HOST=${HOST:-0.0.0.0}
 LOG=${LOG:-$GATEWAY_DIR/gateway_backend.log}
 
@@ -60,6 +66,6 @@ exec taskset f0 python3 "$GATEWAY_DIR/rkllm_gateway.py" \
      --weight "$MODEL_DIR/Qwen3.5-27B-llm_seg0.weight" \
      --vocab "$MODEL_DIR/Qwen3.5-27B-llm.tokenizer.gguf" \
      --embed "$MODEL_DIR/Qwen3.5-27B-llm.embed.bin" \
-     --ctx-size 4096 --core-mask 0xff --stage-count 4 --bucket-size 128 \
+     --ctx-size "$CTX" --core-mask 0xff --stage-count 4 --bucket-size 128 \
      --rope-tensor "$MODEL_DIR/Qwen3.5-27B-llm_seg0.safetensors" \
      --sessions "$NSESSION" --serve -n "$NP"

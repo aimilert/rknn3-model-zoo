@@ -25,6 +25,7 @@
 | `tool_golden.json` | 工具渲染的金标准：真 Jinja2 渲模型自己的 `tokenizer.chat_template` 得到的字节 |
 | `check_template.py` | 网关渲染的 prompt 与 `main.cc` 模板 / 模型模板**逐字节**比对（见下） |
 | `serve_http_test.py` | 接口面：health / models / 非流式 / SSE / 多轮 KV 复用 / 并发（`tools` 模式另有工具调用） |
+| `toolcall_check.py` | **真模型**的工具调用：会不会调、调用的形状认不认得、回显后 KV 还粘不粘得住 |
 | `sticky_check.py` | 粘性复用的**语义**正确性（暗号靠 KV 存活 + prefill 计数） |
 | `nothink_check.py` | 关思考（`enable_thinking=false`）下的粘性复用回归 |
 | `http_scaling.py` | HTTP 层并发伸缩（自研门面存在的唯一理由） |
@@ -52,7 +53,12 @@ MODEL_DIR=<模型目录> \
 `MODEL_DIR`、`GATEWAY_DIR`、`B`（后端二进制名）、`NSESSION`（默认 4）、`PORT`（默认 8080）、
 `NP`（每轮 max_new_tokens 默认值）、`HOST`（默认 `0.0.0.0`）、`LOG`、
 `IDLE_TTL`（默认 300，一段对话静默这么久就把它占的会话收回给排队者；0=不回收）、
-`QUEUE_TIMEOUT`（默认 600，取不到会话时最多排队等这么久，超了返回 503；要大于 `IDLE_TTL`）。
+`QUEUE_TIMEOUT`（默认 600，取不到会话时最多排队等这么久，超了返回 503；要大于 `IDLE_TTL`）、
+`CTX`（上下文长度，默认 4096）。
+
+**`CTX` 必须和模型导出时的最大位置对得上**，改之前先核一下：导出的
+`safetensors` 头里 `rope_cos_cache` 的形状决定了上限（8192 那份是 `[1, 4, 1, 8192, 16]`）。
+起小了只是少用一半、不出错；拿 4096 的导出起 8192 会越界读。
 
 `NSESSION` 的硬上限是 **5**（第 6 个会话在 stage0 就起不来），而且会话**只在启动时**创建，
 运行时不新建。所以"同时能服务多少人"= `NSESSION`，多出来的人在队列里等。
@@ -259,15 +265,33 @@ python3 demo_multiuser.py http://127.0.0.1:8099 5 40 --stagger 0.4 --plain --clo
 
 ```sh
 python3 rkllm_gateway.py --port 8101 --sessions 2 --frames-stdout \
-    -- python3 fake_backend.py --sessions 2 --tool-call --think-prefix
+    -- python3 fake_backend.py --sessions 2 --tool-call --tool-call-repeats --think-prefix
 python3 serve_http_test.py http://127.0.0.1:8101 tools
+python3 toolcall_check.py http://127.0.0.1:8101        # 桩上只有 NOT、"挑对工具"的观察项
 ```
+
+`toolcall_check.py` 问的是**另一件事**，桩替代不了：`serve_http_test.py tools` 验的是**我们的
+实现**（注入/摘出/回灌/KV），这个脚本验的是**模型**——收到我们渲染的工具目录后会不会调用、
+调用的形状我们认不认得、以及模型自己那次调用被客户端**原样回显**回来后前缀还粘不粘得住。
+三条判据分开：正文里残留调用标记（`<tool_call>` 等）是 **FAIL**——那是"模型说了、我们没听懂"；
+正文是普通文字是模型这轮没调用，单次打 INFO、三次都不调则 FAIL；"选中了该用的那个工具"属于
+模型质量，单列 `[NOTE]`，不算失败（桩固定回一个 `get_weather`，拿它当判据会永远红）。
+最后那条回显往返只有真模型能回答：模型刚吐出来时记账用参数**原文**，客户端回显走 OpenAI 形态、
+原文没了只能按类型重渲，两者逐字节相等当且仅当原文恰好是规范形（`"北京"`、`1.50`、`true`
+都不是）。**2026-09-17 实测这一代模型吐的是规范形**，所以回显往返粘得住（热 32 tok / 冷 630）。
 
 **`tools` 模式里有两条性质不同的检查，别把后一条当前一条用**：「模型会不会真调用」取决于模型
 意愿（桩上必然发生、板上不一定，没发生就打 `[INFO]` 而不是 `FAIL`）；「回灌 tool 结果再问一轮」
 是我们手写历史、不依赖模型意愿的**确定路径**，板上也照跑。里面那条 KV 复用判据比的是**和冷会话
-的对照**，不是 `cached_tokens > 0`——前缀断在助手轮时前面的部分照样命中，`> 0` 会漏（实测把记账
-文本多拼一个空格，cached 从 567/584 掉到 44/443，`> 0` 依然通过）。
+的对照**，不是 `cached_tokens > 0`：后者实测空转过——桩上把记账文本多拼一个空格（前缀必断），
+cached 从 567/584 掉到 44/443，`> 0` 依然通过。
+
+**桩要多带 `--tool-call-repeats` 才覆盖得住真模型的行为**。默认的 `--tool-call` 是"调一次、
+拿到 tool 结果就正常回答"，而真模型**拿到结果还会再调**（2026-09-17 板上实测：回灌工具结果后它又吐了一次工具调用，那一轮的正文只有一段空的 `<think>`）。这个差别不是细节：`serve_http_test.py` 里那条 KV 判据
+下一轮的助手消息，原先只回显**正文**、把 `tool_calls` 丢了；桩不重复调用时那一轮正文恰好非空，
+错法完全看不出来，换成真模型立刻红（板卡 **热会话重算 469 tok / 复用 0**，与冷会话一模一样）。
+网关的前缀判据是 `prompt.startswith(known[session])`（`rkllm_gateway.py` 的 `_make_lease`），
+**全匹配、不做最长公共前缀的部分复用**，所以助手轮少一个字段的代价是整段 prefill 重算。
 
 想单独看"排队 + TTL 回收"这条路，另起一个网关并给一个短的 TTL：
 

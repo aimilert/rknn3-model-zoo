@@ -34,6 +34,10 @@ run python3 serve_http_test.py "$BASE" bigmax
 # FAIL），但**确定路径**照样全跑：回灌 tool 结果再问一轮、以及带工具的历史能不能粘住
 # KV。后者才是重点——工具轮的历史渲染差一个字节，之后每轮就全量重算，不报错、答案也对。
 run python3 serve_http_test.py "$BASE" tools
+# 上一条验的是**我们的实现**（桩上也能跑），这一条验的是**模型**：真模型收到我们渲染的
+# 工具目录后会不会调用、调用的形状我们认不认得、以及模型自己那次调用被客户端原样回显
+# 回来后前缀还粘不粘得住。桩替代不了——桩吐什么由我们写死，模型吐什么只有板上知道。
+run python3 toolcall_check.py "$BASE"
 run python3 sticky_check.py "$BASE"
 run python3 nothink_check.py "$BASE"
 # 伸缩测量放最后：它会把 4 个会话都写脏
