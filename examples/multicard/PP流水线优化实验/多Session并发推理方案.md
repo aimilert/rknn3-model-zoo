@@ -33,6 +33,8 @@
     > **没验的**：流式路径下的工具调用、`tool_choice`（未实现）、并行多工具调用、以及**参数非规范形式**（`"北京"` 带引号、`1.50`）时的回显——最后一条是**换模型/换导出后要重验的第一件事**。
 12. **超长请求现在只失败它自己（2026-09-17，§9.11）**：一条渲染后 **3.4 MB** 的请求曾经把整套服务打死。它越过的是 `main.cc` 的**载荷帧上限**（1 MiB——那是"别相信头行里那个数字"的内存护栏，**不是**"这一轮太长"的判据），而那条分支当时在 `serve_err` 之后 **`break`**：输入线程一退，**四个会话全死**、之后每个请求都 503，而 `/health` 还在报 `sessions: 4`；`dead[]` 没有复活路径、`acquire()` 也从不问后端死活，于是后来的 5 段对话排满 **600s** 才收到 503。现在改成**丢载荷 + REJECT + `continue`**（不发 CLEAR：KV 一个字节都没动），网关侧补三条 containment（进队列前判后端死活与全 dead、`/health` 报 `backend_alive`/`sessions_dead`、帧读线程在流结束时大声打印一行）。板上 A/B（同一探针、同一网关，只换后端二进制）：改动前 **503 `Broken pipe` + 会话 dead**，改动后 **400「exceeds the frame limit」0.1s + 会话一个不少**；并发 10.84 / 20.15(1.86×) / 36.40(3.36×)。
 
+13. **关思考不再只靠软提示（2026-09-18，§9.13）**：` /no_think` 是**软**提示，挡不住"要组织语言"的题——用户看到的"网页某一格**固定**吐一屏英文推理"取决于**问的是什么**，与面板序号无关。模型自己的 `tokenizer.chat_template` 在关思考时要补 `<think>\n\n</think>\n\n`（模型从 `</think>` **后面**开始生成，结构上开不了 think 段），这截尾巴原来被我们在 `toolcalls.py` 主动去掉了，现在补回来。**必须连历史里的助手轮一起包**：不补的话 KV 复用判据（`新 prompt.startswith(上一轮 prompt + 回复)`）从第二轮起永远不成立，**每轮全量重算、只慢不错、屏幕上一点异常都看不见**。⚠️ **关思考的 prompt 长度与 `completion_tokens` 都变了**——那 4 个 token 以前是模型生成出来又被 `ThinkStripper` 摘掉的，现在是预填，**2026-09-18 之前量到的吞吐与 token 计数不能与之后的逐字节互比**。板上四路并发流式复现 **0/4 带 `<think>`**（改前 3/4），`run_all_board_tests.sh` **8 段 rc=0 / FAIL 0 / 非零 rc 0 / traceback 0**。
+
 ---
 
 ## 1. 收益模型：为什么多会话能提速
@@ -720,6 +722,7 @@ git checkout -b feature/multisession-concurrency
 #   dfb8a99  multicard/serve: put the board's native build script in the repo
 #   8bba09e  multicard/serve: draw the demo page's stat line as HTML, not as text
 #   9804a41  multicard/serve: let the demo page set its own output length  (v1.16)
+#   （本次提交） multicard/serve: prefill the model template's think tail when thinking is off  (v1.17；§9.13)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
@@ -2486,6 +2489,66 @@ mut_oversized_kills t3: 如预期地失败（2 条）
 
 ---
 
+### 9.13 关思考：软提示挡不住「要组织语言」的题，改为按模型模板预填 think 尾巴（2026-09-18 修复并上板验收）
+
+**症状（用户报的）**：演示页四个对话框里**有一格**不回答问题，而是吐一整屏
+`<think>Thinking Process: …` 的英文推理；另外三格正常。同一块板、同一份模型、同一个网关。
+
+**定位：不在页面，在题。** 页面里与面板序号有关的只有 `DEFAULT_Q[i]` 和 `"web-" + (i+1)`，
+四个面板走同一段代码，没有按格分支；会话分配顺序、`DEFAULT_Q` 的历史、浏览器缓存也都排除了。
+真凶是**问的是什么**：关思考下"要组织语言"的题仍会开 think 段。板上单轮、流式、`max_tokens=256`
+（= 页面默认值）实测：
+
+| 题 | finish | tok | 带 `<think>` |
+|---|---|---|---|
+| `用一句话介绍杭州。` | length | 256 | ★ 开头、**没闭合** |
+| `介绍一下杭州。` | length | 256 | ★ 开头、**没闭合** |
+| `写一首关于秋天的诗。` | length | 256 | ★ 开头、**没闭合** |
+| `Count down from 50 to 1 …`（对照：机械列举） | stop | 193 | 否 |
+
+推理正文里甚至有一句 `* Constraint: /no_think (This means I should no…` —— **它看见了软提示、
+权衡了一下、照开不误**；`</think>` 来不及吐就被 `max_tokens` 截断，而 `ThinkStripper` 只摘
+"开头且闭合"的段，于是按"宁可露标签也不静默吞内容"把整段推理原样发给客户端 —— 屏幕上就是一堵
+英文推理墙。
+
+**根因**：关思考一直只有**软**的一层（给每条 user 消息尾巴贴 ` /no_think`）。模型自己的
+`tokenizer.chat_template` 里还有**硬**的一层：`enable_thinking=false` 时 `add_generation_prompt`
+补 `<think>\n\n</think>\n\n`，模型从 `</think>` **后面**开始生成，结构上开不了 think 段。这截
+尾巴是我们在 `toolcalls.py` 主动去掉的（当时的理由是"改它会让之前所有吞吐数字失去可比性"，
+见该文件顶部的偏差 2，现已作废），于是只剩软提示可用。
+
+**修法**（`rkllm_gateway.THINK_OFF`）：关思考时①生成位置按模板补上那对空标记；②**历史里的
+助手轮也包同一层**。②不是美化——KV 复用判据是 `新 prompt.startswith(上一轮 prompt + 回复)`，
+历史助手轮不补的话第二轮起前缀永远不成立、`reset` 恒为 1、每轮全量重算，**只慢不错、屏幕上
+一点异常都看不见**。补完之后关思考的渲染与模板**逐字节一致**，`toolcalls.py` 顶部的"刻意偏差"
+只剩一处（思考**开着**时助手轮的推理包装），`known` 的 KV 记账由"近似"变成精确。
+
+**⚠️ 口径变了**：那 4 个 token 以前是模型**生成**出来又被 `ThinkStripper` 摘掉的（进
+`completion_tokens`、不进 prompt），现在是**预填**。**2026-09-18 之前量到的吞吐与 token 计数
+不能与之后的逐字节互比。** 思考**开着** / 不传 `enable_thinking` 两条路径的 prompt 尾 40 字
+与改前**逐字节相同**（实测）。
+
+**验证**：
+
+| 项 | 结果 |
+|---|---|
+| `check_template.py`（板上 Python 3.12.3） | 全绿；关思考那两支改成与金标准**逐字节直比**（原先靠替换比对，而替换比对正是为偏差留的口子） |
+| `nothink_check.py` 第 4 节（新增回归） | `介绍一下杭州。`/256 token → 正文「杭州，简称"杭"，是…」，无 think 段 |
+| 四路并发流式复现（关思考、256 token = 网页形态） | **0/4 带 `<think>`**（改前 3/4） |
+| 关思考下的 KV 复用 | 第二轮 `base=258 / sent=132 / full=390`、`reset=0`（补尾巴没把复用弄坏） |
+| `run_all_board_tests.sh` | 8 段 rc=0、FAIL 0、非零 rc 0、traceback 0；伸缩 **10.95 / 20.08(1.83×) / 37.65(3.44×)** tok/s |
+| `page_check.js` 对真板卡 + 真模型（`web-1..4` 四路） | 全绿，聚合 35.94 tok/s，四路落四个会话、关页面与点清空都把会话还干净 |
+
+`nothink_check.py` 第 4 节的**上限必须是 256（网页的默认值）而不是 96**：think 段在 96 下必然
+非空，那样量到的只是"被截断了"，不是"还开不开 think 段"。
+
+**工序**：这次上板前逐文件 md5 比对，抓出**两个板卡副本落后于 HEAD**（`page_check.js` 缺 §9.12
+那次的改造、`serve_http_test.py` 只差一行注释），一并补齐，`serve/` 又与 HEAD 逐字节相同。
+⚠️ 改的是**网关进程**，必须重启（模型重载 ~240s，页面上已有的会话会断）；旧件留
+`serve/bak_20260918_thinkoff/`。变更台账见 `serve/CHANGELOG.md`。
+
+---
+
 ## 10. 一页纸总结
 
 | 项 | 结论 |
@@ -2504,6 +2567,7 @@ mut_oversized_kills t3: 如预期地失败（2 条）
 | **多用户接入（边缘服务器）** | ✅ **已实现**：身份显式化（`conversation_id`/`X-Conversation-Id`/`user`）+ **只排队不抢占** + `POST /v1/conversations/close`（客户端主动交还）+ 空闲回收 `IDLE_TTL` + `GET /v1/pool` 可观测；`NSESSION` 以内谁问谁拿，超过排队、超 `QUEUE_TIMEOUT` 返 503（§9.8）。**2026-09-16 起板上真后端已随整套件跑到**：身份 / 排队 / `close` / `/v1/pool`（§9.10.8） |
 | **超长请求（>1 MiB 载荷）** | ✅ **只失败这一条**：回一帧 REJECT → HTTP 400，会话一个不少（1.2 MB 载荷 **0.1s** 拒掉，不进 tokenizer）。改动前这条路径**打死整套服务**（503 + 四个会话全 dead + 后来者排满 600s，而 `/health` 仍报满员）——§9.11。**注意这是 §9.10 之外的另一条分支**：§9.10 修的是 tokenizer 那条判据，它盖不住这里 |
 | **工具调用（Phase 1）** | ✅ **已实现并真机验收**（`c1fd763`）：格式**取自模型自己的 `tokenizer.chat_template`**（**XML，不是 Hermes JSON**），工具目录在**网关侧**拼——**后端二进制一行没动**。板上 3/3 探针解出可解析调用、参数名 ⊆ 声明的 properties、`required` 一个不缺；用模型自己那次调用的历史回显 **热=32 vs 冷=630**；`check_template.py` 与真 Jinja2 **逐字节对拍**（板卡 Python 3.12.3 无 jinja2 也跑）。**桩上全绿、板上第一遍就抓到一条真 FAIL**（回显助手轮丢 `tool_calls` → 前缀断 → 整段重算），修后经变异测试证明检查非空转（§9.9） |
+| **关思考（`enable_thinking=false`）** | ✅ **不再只靠软提示**：prompt 末尾按模型自己的模板预填 `<think>\n\n</think>\n\n`，模型从 `</think>` 后面开始生成、结构上开不了 think 段。` /no_think` 那条软提示挡不住"要组织语言"的题——板上实测会写满一整段推理，256 token 截断后原样透传成"推理墙"（用户报的"网页某一格固定出现思考模式"就是它）。四路并发流式复现 **0/4 带 `<think>`**（改前 3/4）。⚠️ 关思考的 prompt 与 `completion_tokens` 都变了，**2026-09-18 之前的吞吐与 token 计数不能与之后的逐字节互比**（§9.13） |
 | **工作量** | P0/P1/P2/P3(交互式)/R11/M5/**Phase 1 工具调用**已完成；**M5 的交付件已全部入库**（`cpp/main.cc` 的帧协议 + `examples/multicard/serve/`） |
 | **剩余风险** | `unaligned tcache chunk` 堆损坏（30 分钟稳定性 0 命中 + **ASan 四阶段 0 报告且阳性对照成立** → 概率**下调**，但未关闭：ASan 会改变堆布局、且没做满 30 分钟 soak）；5 上限的成因未知（非阻塞）；**SDK 内部 TSan 报告未定性**（卡级锁管不到 SDK 自己的传输线程；其中 4 条的写侧是我方 `input_callback`，写的是 SDK 给的缓冲，§9.5 / R6）；**网关无鉴权（R12）**——**这条在多人场景下从"不设防"升级为"排队策略可被单个客户端作废"（§9.8）**、**账本失配会静默退化（R13，只慢不错）** |
 | **版本管理** | 代码 commit `d59a239`/`6347f57`/`446cbdf`/P3/`9d2d167`(R11)/`6d0666a`(M5，tag `m5-serve`) + 各自 tag；回归对照物是独立保存的源码/二进制快照 + 黄金 token 文件；下发靠 **md5 + BuildID 双校验**（§8.4）；**M5 的交付件已全部入库**：帧协议在 `cpp/main.cc`，网关与脚本在 `examples/multicard/serve/`（§9.7） |
@@ -2543,6 +2607,8 @@ KV 复用（HTTP）   续聊 prefill 12 vs 全量 154 tok（开思考 0.08）/ 1
 ```
 
 ---
+
+*文档版本：v1.17（2026-09-18）—— **关思考不再只靠软提示：按模型自己的模板预填 think 尾巴**（§9.13）。用户报的是"网页端第三个会话固定出现思考模式，另外三个能直接输出"，查下来**不在页面、在题**：` /no_think` 是**软**提示，而"要组织语言"的题（`介绍一下杭州。`、`写一首关于秋天的诗。`）在关思考下照开 think 段——板上实测以**未闭合**的 `<think>` 开头、`finish=length`、正好烧完 256 token，推理正文里甚至有一句 `* Constraint: /no_think (This means I should no…`（**它看见了、权衡了、照开不误**），`</think>` 来不及吐就被截断，而 `ThinkStripper` 只摘"开头且闭合"的段，于是整段推理原样透传给客户端。模型自己的 `tokenizer.chat_template` 里本来有**硬**的一层：`enable_thinking=false` 时 `add_generation_prompt` 补 `<think>\n\n</think>\n\n`，模型从 `</think>` 后面开始生成——这截尾巴是我们在 `toolcalls.py` **主动去掉**的（理由见该文件顶部偏差 2，现已作废），现在补回来（`rkllm_gateway.THINK_OFF`）。**历史里的助手轮也必须包同一层**，否则 KV 复用判据 `新 prompt.startswith(上一轮 prompt + 回复)` 从第二轮起永远不成立、每轮全量重算，**只慢不错、屏幕上一点异常都看不见**。补完后关思考的渲染与模板**逐字节一致**，`toolcalls.py` 顶部的"刻意偏差"只剩一处（思考**开着**时的推理包装），KV 记账由"近似"变精确。⚠️ **口径变了**：那 4 个 token 以前是模型生成出来又被摘掉的（进 `completion_tokens`），现在是预填，**2026-09-18 之前量到的吞吐与 token 计数不能与之后的逐字节互比**；思考开着 / 不传 `enable_thinking` 两条路径尾 40 字与改前逐字节相同（实测）。验证：`check_template.py` 板上全绿（关思考那两支改为与金标准逐字节直比）、`nothink_check.py` 新增第 4 节回归（**上限必须 256，96 下 think 段必然非空**）、四路并发流式复现 **0/4 带 `<think>`**（改前 3/4）、关思考 KV 复用照常（base=258 / sent=132 / full=390）、`run_all_board_tests.sh` **8 段 rc=0 / FAIL 0 / 非零 rc 0 / traceback 0**（10.95 / 20.08(1.83×) / 37.65(3.44×) tok/s）、`page_check.js` 对真板卡 + 真模型全绿（35.94 tok/s）。另记一条工序：上板前逐文件 md5 比对抓出**两个板卡副本落后于 HEAD**（`page_check.js` 缺 §9.12 那次的改造、`serve_http_test.py` 只差一行注释），一并补齐。同时新立 `serve/CHANGELOG.md`：按日期列"加了什么功能、修了哪些坑"，只留"症状 → 根因"，细节指向本文*
 
 *文档版本：v1.16（2026-09-18）—— **网页演示页的输出长度不再写死**（§9.12）。页面里原来是 `const MAXTOK = 256;`，于是同一个板子、同一个问题，网页永远比终端短一截（终端版从命令行取，`demo_4session.py` 的 `NP`）。**这不是模型或网关的限制**：网关 `_pick_max_tokens` 只把离谱值夹到 2³¹-1、不设小上限，后端 `main.cc` 也会在 `decode_tokens >= max_new_tokens` 时如实回 `finish_reason=length` —— 纯粹是这一页少个开关。现在给了「输出上限」输入框：**按请求**生效（改大了不会补上已经截断的那一轮）、记住上次的值、空/非法回落默认而**不漏成 0**（网关把 0 当"用后端自己的默认值"，漏出去这一页显示的设定就成了假话）。统计行**只在字面收到 `finish_reason=length` 时才标「触顶截断」**，不拿"tok 数 ≈ 设定值"去猜：真正卡住输出的常常是**上下文**不是这个数，猜出来的标记会把"上下文不够"伪装成"上限设小了"——而那正是这一行最该避免的误导。**顺手修掉同一处的真 bug**：`setStat` 写的是 `textContent`，而所有调用方都传 HTML（速率要加粗），于是页面上直接印出字面的 `<b>11.63 tok/s</b>`——看着只是"没那么粗"、不像坏了，因此藏了好几轮演示才被发现；改走 `innerHTML` 并把网关回的错误文本转义。验证：`page_check.js` 不再去改页面源码里的常量，而是**像用户一样**经 localStorage 把值交进去，并断言每个请求体真带着它（常量变输入框之后，"框接了、线没接"从结果上完全看不出来）；本地桩后端与**真板卡**各跑一次**全绿**（板上 `max_tokens [256,256,256,256]`、四路落在四个会话、关页面与点清空都把会话还干净、聚合 36.09 tok/s）。板卡演示页已换 `f7283eef…`（`9804a41`），**不需要重启网关**，旧件留 `serve/bak_20260918/`。另**补回 §8.1 清单里漏掉的 `5c167f5`**（它一直在 `bc7f013` 与 `1dde346` 之间，只是没进那张表）*
 

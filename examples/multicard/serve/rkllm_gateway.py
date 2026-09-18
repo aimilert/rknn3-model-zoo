@@ -74,6 +74,26 @@ IM_END = "<|im_end|>\n"
 #   user_postfix  = "<|im_end|>\n<|im_start|>assistant\n"
 QWEN35_DEFAULT_SYSTEM = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 
+ASSISTANT_HEAD = IM_START + "assistant\n"
+
+# 关思考时，模型自己的 chat_template 在 `add_generation_prompt` 里要补的那一截
+# （`enable_thinking=false` 分支渲出来就是这对**空**标记）。
+#
+# 为什么非得补：` /no_think` 只是**软**提示。2026-09-18 板上实测，"要组织语言"的题
+# （`介绍一下杭州` / `写一首关于秋天的诗`）在关思考下会先写一整段
+# `<think>Thinking Process:…`，正文里甚至有一句 `* Constraint: /no_think (This means
+# I should no…`——它看见了提示、权衡了一下，然后照开不误。256 token 一截，`</think>`
+# 没机会吐出来，ThinkStripper 只能按"宁可露标签也不静默吞内容"把整段推理原样发给
+# 客户端，屏幕上就是一堵英文推理墙（用户报的"网页端某一格固定出现思考模式"）。
+#
+# 补上它 = 模型从 `</think>` **后面**开始生成，结构上开不了 think 段。代价别当成顺手
+# 加的一行：这段文本今天是被模型**生成**出来、再被网关摘掉的，改成预填后同样的回答
+# 少生成 ~4 个 token（略快），但 prompt 长度与 `completion_tokens` 都变了——
+# 2026-09-18 之前量到的吞吐数字**不能与之后的逐字节互比**。收益见 toolcalls.py 顶部：
+# 那两处"刻意偏差"（助手轮的推理包装、生成尾巴）在关思考下就此消掉，`known`
+# 这笔 KV 记账也从"近似"变成"精确"。
+THINK_OFF = "<think>\n\n</think>\n\n"
+
 
 # ===========================================================================
 # 1. 后端进程与帧协议
@@ -800,9 +820,16 @@ def render_messages(messages, enable_thinking=None, tools=None):
                 text = render_assistant_turn(text, calls)
         if no_think and role == "user":
             text = text + " /no_think"
-        parts.append("%s%s\n%s%s" % (IM_START, role, text, IM_END))
+        if no_think and role == "assistant":
+            # 助手轮按模板的"推理包装"渲。关思考时这个包装就是那对空标记，**不含推理
+            # 正文**，所以我们渲得起（思考开着时包装里要放模型当时的推理，那是渲染侧
+            # 拿不到的东西，见 toolcalls.py 顶部的偏差 1）。
+            parts.append("%s%s%s" % (ASSISTANT_HEAD + THINK_OFF, text, IM_END))
+        else:
+            parts.append("%s%s\n%s%s" % (IM_START, role, text, IM_END))
         i += 1
-    parts.append("%sassistant\n" % IM_START)
+    # 生成位置同样补上：模型从这里接着写，写出来的就是正文本身。
+    parts.append(ASSISTANT_HEAD + (THINK_OFF if no_think else ""))
     return "".join(parts)
 
 

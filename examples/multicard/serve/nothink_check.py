@@ -2,9 +2,15 @@
 # -*- coding: utf-8 -*-
 """关思考（chat_template_kw.enable_thinking=false）下，粘性复用还成不成立？
 
-为什么单独测这一条：关思考是靠给 user 消息尾巴贴 `/no_think` 实现的软开关（这条 GGUF
-不吃官方 server 的 chat_template_kw，实测输出照样带 <think>）。而「贴哪条 user 消息」
-会决定整段 prompt 的前缀稳不稳定：
+关思考有两层，两层都要盯：
+  · **硬**的一层是 prompt 末尾的 `<think>\n\n</think>\n\n`（模型自己模板里
+    `add_generation_prompt` 关思考分支的那一截，2026-09-18 补回）。补了它，模型是从
+    `</think>` 后面开始生成的，开不了 think 段。
+  · **软**的一层是给 user 消息尾巴贴的 ` /no_think`（这条 GGUF 不吃官方 server 的
+    chat_template_kw，实测输出照样带 <think>）。它单独用挡不住"要组织语言"的题，
+    所以下面第 4 节专门拿那种题当回归。
+
+软开关这一层里，「贴哪条 user 消息」会决定整段 prompt 的前缀稳不稳定：
 
   · 只贴**最后一条** user => 第一轮 u1 是"最后一条"（带标记），第二轮 u1 变成了历史
     消息（不带标记）=> 两轮渲染出来的 u1 不是同一个字符串 => 前缀判据不成立 =>
@@ -29,8 +35,9 @@ FAILS = []
 def _think_body(text):
     """取出第一个 <think>…</think> 的内容；没有这个段就返回空串。
 
-    关思考下这条 GGUF 仍会吐一对**空**标记（`<think>  </think>`），所以判据不能是
-    "有没有标签"，只能是"段里有没有内容"。
+    判据一直是"**段里有没有内容**"而不是"有没有标签"：关思考下模型有时仍会吐一对
+    **空**标记（`<think>  </think>`，桩后端的 --think-prefix 就是照它做的），拿标签
+    当判据会把"正常的空标记"和"关思考没生效"混成一个结果。
     """
     start = text.find("<think>")
     if start < 0:
@@ -104,13 +111,31 @@ check("第二轮仍然复用（base 非空且 sent < full）",
       "kv=[%s]" % kv2)
 check("暗号还在（复用没把历史弄丢）", NEEDLE in a2)
 
+print("== 4. 回归：关思考下「要组织语言」的题不许再开 think 段 ==")
+# 2026-09-18 用户报的「网页端某一格固定出现思考模式」就是这一条。` /no_think` 是软提示，
+# 这类题实测会写满一整段 `<think>Thinking Process:…`（正文里甚至有一句
+# `* Constraint: /no_think (This means I should no…`——它看见了、权衡了、照开不误），
+# max_tokens 一截、`</think>` 来不及吐，网关又按"宁可露标签也不静默吞内容"原样透传，
+# 屏幕上就是一堵英文推理墙。修法是 prompt 末尾按模板补那对空标记（rkllm_gateway.THINK_OFF）。
+#
+# **上限必须给 256（网页的默认值）而不是 96**：think 段在 96 下必然非空，那样测到的
+# 只是"被截断了"，不是"还开不开 think 段"。
+a3, p3, kv3 = chat([{"role": "user", "content": "介绍一下杭州。"}], "nothink-2", 256, False)
+print("     prompt=%d tok，答=%r" % (p3, a3[:80].replace("\n", " ")))
+check("关思考生效：没有非空 <think> 段", _think_body(a3).strip() == "",
+      "think 段内容=%r" % _think_body(a3)[:60])
+# 光"没有 think 段"还不够：把整段回答丢成空答案也能过上面那条，而那不算修好。
+check("关思考生效：正文非空（不是把回答整段丢了）", a3.strip() != "")
+print("     对照：同一条软开关在**思考开着**时照常吐推理段（有题可问才叫修好了）")
+
 # 用完把会话交还：板卡上只有 4 个，而 run_all_board_tests.sh 是一串脚本连着跑，
 # 留着不还的话后面的脚本（http_scaling 的 N 路并发）会没有可用会话。
-body = json.dumps({"conversation_id": "nothink-1"}).encode("utf-8")
-_req = urllib.request.Request(BASE + "/v1/conversations/close", data=body,
-                              headers={"Content-Type": "application/json"})
-with urllib.request.urlopen(_req, timeout=30) as _r:
-    _r.read()
+for conv in ("nothink-1", "nothink-2"):
+    body = json.dumps({"conversation_id": conv}).encode("utf-8")
+    _req = urllib.request.Request(BASE + "/v1/conversations/close", data=body,
+                                  headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(_req, timeout=30) as _r:
+        _r.read()
 
 print("\n%s" % ("全部通过" if not FAILS else "失败项：%s" % ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 1)

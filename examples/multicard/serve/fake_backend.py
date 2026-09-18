@@ -51,8 +51,13 @@ def main():
     ap.add_argument("--serve-fd", type=int, default=None)
     ap.add_argument("--default-n", type=int, default=512)
     ap.add_argument("--delay", type=float, default=0.30)
-    # 让回复像真模型那样以 `<think>  </think>  ` 开头（关思考时的真实形态），用来端到端
-    # 验网关的 ThinkStripper：它必须把这段摘掉，而且**标签被 7 字节切分切开时也要摘对**。
+    # 让回复以 `<think>  </think>  ` 开头，用来端到端验网关的 ThinkStripper：它必须把
+    # 这段摘掉，而且**标签被 7 字节切分切开时也要摘对**。
+    #
+    # 注意它现在只是**兜底**形态、不再是"关思考时的真实形态"了：2026-09-18 起网关在
+    # 关思考时按模板把 `<think>\n\n</think>\n\n` 预填进 prompt（rkllm_gateway.THINK_OFF），
+    # 真模型那条路根本不吐这个段。留着它是为了钉住另一件事——**客户端只要送来
+    # enable_thinking=false，不管后端起手吐什么，那一段都不许漏到屏幕上**。
     ap.add_argument("--think-prefix", action="store_true")
     # 让桩也能造出"上下文装不下"那条路径（真后端在 prefill **之前**判，发 CLEAR+REJECT，
     # **不**标死会话）。0 = 不限。有它才能把网关那半边（软错误 / 不标死 / 作废粘性 / 不

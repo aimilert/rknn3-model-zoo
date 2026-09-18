@@ -31,6 +31,11 @@ SYS = ("<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. "
 UPRE = "<|im_start|>user\n"
 UPOST = "<|im_end|>\n<|im_start|>assistant\n"
 
+# 这里**故意**写死、不从 rkllm_gateway import：本文件的全部价值就是当一份独立的记录，
+# 常量都从被测代码拿的话，"两边同时改错"就永远抓不到了。
+ASSISTANT_HEAD = "<|im_start|>assistant\n"
+THINK_OFF = "<think>\n\n</think>\n\n"
+
 fails = []
 
 
@@ -93,6 +98,15 @@ check("关思考：第二轮以第一轮为前缀", h2.startswith(h1),
       "suffix=%d 字 / full=%d 字" % (len(h2) - len(h1), len(h2)))
 check("关思考：差异部分非空", len(h2) > len(h1))
 
+# 上面那条**不是**网关真正用的判据。网关记的 `known` 是「本轮发出去的 prompt + 模型回复」，
+# 判的是 `新 prompt.startswith(known)`。补上 think 尾巴之后这条必须重新验一遍：
+# 尾巴只加在生成位置，而 `h1 + 回复` 里那个位置**也**带着同一个尾巴，两边字节要对得上，
+# 否则第二轮起 reset 永远为 1、每轮全量重算——只慢不错，屏幕上一点异常都看不见。
+check("关思考：第二轮以「第一轮 + 回复」为前缀（= 网关真正用的 KV 复用判据）",
+      h2.startswith(h1 + "收到"), "suffix=%d 字" % (len(h2) - len(h1) - len("收到")))
+check("关思考：生成位置补了模板那对空标记", h1.endswith(ASSISTANT_HEAD + THINK_OFF),
+      "尾 24 字 = %r" % h1[-24:])
+
 print("== 工具调用渲染：与模型自己的 chat_template 逐字节比对（金标准）==")
 # 逐字节比对抓得到而人眼抓不到的：工具定义走 Jinja 的 tojson（**键排序**、中文转成
 # \uXXXX、`<` `>` `&` `'` 全转义），助手轮第一条调用前的分隔是 \n\n 还是 \n，连续的
@@ -104,32 +118,58 @@ with io.open(GOLDEN, encoding="utf-8") as fp:
 
 WRAP = golden["wrap"]           # 模板给助手轮加的推理包装
 WRAP_OFF = golden["wrap_off"]
-ASSISTANT_HEAD = "<|im_start|>assistant\n"
 for case in golden["cases"]:
-    # 两处**刻意**的偏差（理由见 toolcalls.py 顶部，都是为了 KV 前缀对得上）：
-    #   · add_generation_prompt：模板会补 `<think>\n`（关思考时是
-    #     `<think>\n\n</think>\n\n`），我们只补 assistant 头，靠 /no_think 软开关 +
-    #     回复侧摘除实现关思考。这里把那截尾巴**显式换掉**，偏差留在比对代码里。
-    #   · 助手轮的推理包装我们不做——逐字替换掉，但**先数一遍**：替换 0 个还报 PASS
-    #     就成了空转，那条用例根本没在测东西。
     want = case["want"]
     if not want.endswith(case["gen_tail"]):
         check(case["name"], False, "金标准不以 gen_tail 结尾（模板变了，重跑 gen_golden.py）")
         continue
-    want = want[:-len(case["gen_tail"])] + ASSISTANT_HEAD
-    n_wrap = want.count(WRAP)
-    want = want.replace(WRAP, WRAP_OFF)
+
+    if case["enable_thinking"] is False:
+        # 关思考：与模板**逐字节直比**，不做任何替换。两处"刻意偏差"在 2026-09-18
+        # 一起消掉了——` /no_think` 那个软开关挡不住"要组织语言"的题（板上实测
+        # `介绍一下杭州` 会写满一整段 `<think>Thinking Process:…`，256 token 一截
+        # 就是屏幕上那堵推理墙），补回模板的生成尾巴之后，模型从 `</think>` 后面开始
+        # 生成，结构上开不了 think 段。
+        #
+        # 只有一处金标准要动，而且这处偏差是**我们比模板更贴近真实 token 流**：
+        # 模板的关思考分支把历史里的助手轮渲成光秃秃的 `<|im_start|>assistant\n`
+        # （它的假设是"关思考 ⇒ 助手轮里没有 think 段"），而生成位置补上尾巴之后，
+        # KV 里每轮**确实**都留着那对空标记；历史不补的话，第二轮 prompt 的前缀就对不上
+        # KV 里真正装着的东西，粘性复用会静默全废（`nothink_check.py` 盯的就是这个）。
+        body, tail = want[:-len(case["gen_tail"])], want[-len(case["gen_tail"]):]
+        n_hist = sum(1 for m in case["messages"] if (m.get("role") or "") == "assistant")
+        # 先数一遍再替换：替换 0 个还报 PASS 就是空转，那条用例根本没在测东西。
+        if body.count(ASSISTANT_HEAD) != n_hist or n_hist == 0:
+            check(case["name"], False,
+                  "金标准的助手轮数 %d != 消息里的 %d（模板变了，重跑 gen_golden.py）"
+                  % (body.count(ASSISTANT_HEAD), n_hist))
+            continue
+        want = body.replace(ASSISTANT_HEAD, ASSISTANT_HEAD + THINK_OFF) + tail
+    else:
+        # 思考开着：两处偏差照旧（理由见 toolcalls.py 顶部）——助手轮的推理包装里要放
+        # 模型当时的推理，而它在渲染侧拿不到；生成尾巴归模型自己吐。这里把那截尾巴
+        # **显式换掉**，偏差留在比对代码里。
+        want = want[:-len(case["gen_tail"])] + ASSISTANT_HEAD
+        n_wrap = want.count(WRAP)
+        want = want.replace(WRAP, WRAP_OFF)
+        # 替换 0 个还报 PASS 就是空转（那条用例根本没在测推理包装）。关思考那支的
+        # 对应守卫在上面（数助手轮数），两支都不能少——这个套件最容易退化成"全绿但
+        # 什么都没测"，而它盯的恰恰是"差一个字节不报错、只让模型收到的格式悄悄变味"。
+        if n_wrap != case["wrappers"]:
+            check(case["name"], False,
+                  "推理包装数 %d != 记录 %d（模板变了，重跑 gen_golden.py）"
+                  % (n_wrap, case["wrappers"]))
+            continue
+
     got = render_messages(case["messages"], enable_thinking=case["enable_thinking"],
                           tools=case["tools"] or None)
     # /no_think 由 render_messages 自己贴，金标准里的 messages 是**没贴过**的原文，
     # 所以这里不预处理；no_think_marks 只用来核对"参考渲时确实贴了"。
     marks_ok = (" /no_think" in want) if case["no_think_marks"] else ("/no_think" not in want)
-    ok = (got == want) and (n_wrap == case["wrappers"]) and marks_ok
+    ok = (got == want) and marks_ok
     detail = ""
     if not ok:
-        if n_wrap != case["wrappers"]:
-            detail = "推理包装数 %d != 记录 %d" % (n_wrap, case["wrappers"])
-        elif not marks_ok:
+        if not marks_ok:
             detail = "/no_think 标记与记录不符"
         else:
             i = next((k for k, (a, b) in enumerate(zip(want, got)) if a != b), None)
