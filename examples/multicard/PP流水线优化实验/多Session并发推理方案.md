@@ -707,8 +707,19 @@ git checkout -b feature/multisession-concurrency
 #   462cec8  multicard/serve: add a demo runbook and the concurrent-streaming demo it drives
 #   570c406  multicard/serve: serve the 4-panel chat demo from the gateway itself
 #   bc7f013  multicard/serve: multiuser edge-server mode (identity, queue, release)
+#   5c167f5  multicard/serve: parse ERR frames with their own grammar  (原先这张清单里漏了它)
 #   1dde346  multicard: reject an over-long turn instead of silently clearing KV  (服务侧收尾加固 + 一次由执行发现的竞态)
 #   b13bbdb  multicard: derive the prefill chunk from the output tensor, not --bucket-size  (R14；原先只在构建服务器磁盘上)
+#   1d0172a  docs: record the board run, and the R14 reproduction it produced  (v1.12)
+#   c1fd763  multicard: implement function calling, with the format read from the model's own template  (Phase 1；§9.9)
+#   2345cf7  multicard/serve: keep restart_gateway.sh from killing its own shell
+#   7b8f8a5  multicard/serve: fix the tool round trip the board broke on the first run
+#   c2c6f59  docs: record the Phase 1 board run, tool calls and the 8192 export  (v1.13)
+#   d000d59  multicard: count the incoming turn, so an oversized prompt is rejected and not fatal  (v1.14；§9.10)
+#   a54b259  multicard: reject a payload over the frame limit instead of exiting the backend  (v1.15；§9.11)
+#   dfb8a99  multicard/serve: put the board's native build script in the repo
+#   8bba09e  multicard/serve: draw the demo page's stat line as HTML, not as text
+#   9804a41  multicard/serve: let the demo page set its own output length  (v1.16)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
@@ -748,7 +759,7 @@ git tag m5-multiuser    # 指向多用户接入（身份/排队/交还）的代�
 | M5 源码快照（`--serve` 帧协议 / `TokenSink`） | `rt_work/main.cc.m5_serve` | `108706c0c96c231f1632c489fc5963b3` |
 | M5 板端网关（**已入库**）演进 | `examples/multicard/serve/rkllm_gateway.py` | M5 入库 `db3fe3d` = `e09ac2b941de767443c0d1d635bd305b` → 修坑 4 `213a131` = `1eb4347a3aae6ec9e69e0f624bdaf62e` → 加网页演示 `570c406` = `a7dde57a99cdb89d343e3f984000cec6` → 多用户版 `bc7f013` = `f35fd2b84ec9968d83795c70cc3d6e0d` → 修 ERR 帧解析 `5c167f5` = `fcb9dcd3b15bf26190d142296055593c` → 加 REJECT 帧解析 `1dde346` = `7a06e5ca2b9efb230d119582bbc56961` → **加工具调用/工具目录/助手轮回显 `c1fd763` = `166d1543000f764b505d04eb40b72fba`（2026-09-17 上板验收所用的版本）**（本行 md5 **2026-09-16 逐版本重算过，都对**；另注：`5c167f5` 那格上的"当前 HEAD"**写的时候是对的，`1dde346` 之后就过期了**——一本流水账里最容易悄悄变错的就是"当前"这个词，2026-09-16 上板时才发现） |
 | └ **板卡上的部署副本（会漂移，以这一行为准）** | 板卡上的部署副本 | **2026-09-16 上板实测**：原副本 md5 `009d0e265c2530c4a44573f42611b810`——早前那句"`009d0e26` 一说"是对的，`e09ac2b9` 不是。它与 `570c406` **只差 `_static_demo` 的一处 docstring**（功能无差别，不是功能漂移；**何时分叉的没查**），所以 §9.7 里"入库后两份副本 md5 相同"那句**在 2026-09-16 实测时不成立**。它**没有** §9.8 的身份/排队/`close`/`/v1/pool` 的 `key`。**同日已就地打上 ERR 解析补丁**（见 §9.7 末），原件留 `rkllm_gateway.py.bak_err_parse`，补丁后 = `8fc1b7076c99c2f226a251a554b90137`——**没有拿 HEAD 整体覆盖**，因为那会顺带推上只在桩后端验过的排队/`close`/`pool`。要用 §9.8 那套仍需重新下发 + 重启网关（重载模型约 240s）。**同日稍后（全套件验收时）已整体换新**：后端 `3355dc4f` + 网关 `7a06e5ca` + 演示页 `1db0882d` + 测试脚本，旧件全存 `bak_20260916/`（回滚 = 换回 `rknn_multicard_demo.bak_e223ea8f` 与 `bak_20260916/` 里的文件，再重启）。也就是说"**没有拿 HEAD 整体覆盖**"只在**当天前半段**成立，别按这行去推断板卡此刻的状态。**2026-09-17 整体重换一次**（工具调用版网关 + 8192 上下文模型）：`serve/` 下 10 个文件与工作区**逐字节相同**（md5 逐一核对，表见 §9.9），旧件在 `serve/bak_20260917_tools/`——**所以"板卡上不是仓库 HEAD 的副本"这句话，从 2026-09-17 起不成立**；它是 09-16 之前的历史，别再当现状引用 |
-| 网页演示页（**已入库**） | `examples/multicard/serve/demo_4chat.html` | `570c406` = `88a53e8b1935c7ef27bb04959ec7c211`（旧版，四个匿名对话）→ **`bc7f013` = `1db0882d98850b20232d0f96e325c9a1`**。**板卡上的是旧版** `af7240627777f576a24d5f95bd522b38`（2026-09-16 核实，与早前记的 `af72406…` 吻合）——它会以四个匿名对话占住全部 4 个会话（§9.8 咬到 5）；**2026-09-16 已换成 `1db0882d…`**（不换的话，新网关的排队会让旧页面的四个对话互相堵住，演示当场卡死） |
+| 网页演示页（**已入库**） | `examples/multicard/serve/demo_4chat.html` | `570c406` = `88a53e8b1935c7ef27bb04959ec7c211`（旧版，四个匿名对话）→ **`bc7f013` = `1db0882d98850b20232d0f96e325c9a1`**。**板卡上的是旧版** `af7240627777f576a24d5f95bd522b38`（2026-09-16 核实，与早前记的 `af72406…` 吻合）——它会以四个匿名对话占住全部 4 个会话（§9.8 咬到 5）；**2026-09-16 已换成 `1db0882d…`**（不换的话，新网关的排队会让旧页面的四个对话互相堵住，演示当场卡死）→ **`9804a41` = `f7283eef5c263b4396d8f1022c85dd4f`**（加「输出上限」输入框；统计行从 `textContent` 改走 `innerHTML`，原先页面上直接印出字面的 `<b>…tok/s</b>`）。**2026-09-18 已上板**：板卡副本 md5 与之一致（`serve/bak_20260918/demo_4chat.html.1db0882d` 是回滚件），**无需重启网关**（`_static_demo` 每次请求现读磁盘），板上 `page_check.js` 全绿 |
 | M5 启动/构建/验收脚本（**已入库**） | `examples/multicard/serve/*.sh`、`*.py`、`README.md` | 见 `git ls-tree`；板卡路径全部走环境变量 |
 | M5 板端二进制（Release） | 板卡 `<板卡安装目录>/rknn_multicard_demo.serve` | `e223ea8f3f5d38e82a37cd560c29fb96`（1091328 B，M5）→ `3355dc4f44a5f47332c8e0d7528be84d`（1076496 B，`b13bbdb`，GCC 11.4 交叉编译，2026-09-16 起在板上运行）→ **`b6a67b2d1ede1d8e0cb2a63db6830e3e`（1107096 B，源码 `57daa06d`，**板上原生编译** g++ 13.3.0，2026-09-17 起在板上运行，见 §9.10.6）** |
 | 板卡二进制 | 见 §5 各阶段完成记录的表 | P0 `a6739a6e…` / P0+插桩 `205232b8…` / P1 `6f5aa9d7…` / P2 `8f6e900d…` / P3 `d30ce8af…` / **R11 补锁后 `1b01b960904c7412f64a173b222240a1`** |
@@ -2385,6 +2396,96 @@ mut_oversized_kills t3: 如预期地失败（2 条）
 
 ---
 
+### 9.12 网页演示页的输出长度：写死的 256（2026-09-18）
+
+**症状是用户报上来的**：网页演示页每轮输出到 256 token 就停，而终端版能输出 2000 以上。
+同一块板、同一份模型、同一个网关，只有一个变量不同——**长度写死在页面里**。
+
+#### 9.12.1 根因：上游一直给得了长的，是这一页没开口
+
+`demo_4chat.html` 里是 `const MAXTOK = 256;`，而终端版 `demo_4session.py` 的长度从命令行取
+（`NP`）。两个上游都没有 `256` 这个数：
+
+- **网关** `_pick_max_tokens`（`rkllm_gateway.py`）把 `max_tokens` / `max_completion_tokens` /
+  `n_predict` / `max_new_tokens` 挨个试一遍，只把离谱值夹到 `MAX_NEW_TOKENS_CAP = 0x7fffffff`，
+  **不设小上限**；一个都没给才 `return 0`，而那个 0 的语义是「用后端自己的默认值」。
+- **后端** `main.cc` 在 `turn_max_new_tokens > 0 && turn.decode_tokens >= turn_max_new_tokens`
+  时如实回 `finish_reason = "length"`，否则 `"stop"`。
+
+所以这既不是模型能力、也不是网关策略——**纯粹是这一页少一个开关**。
+
+#### 9.12.2 改法：一个输入框，和三条「看不出来就会错」的约束
+
+页头加「输出上限 ⟨数⟩ tok」。三条约束都属于"不报错、只静默给错结果"的那一类，所以逐条钉住：
+
+1. **按请求生效**：每轮带自己的 `max_tokens` 发出去。改大了**不会**补上已经截断的那一轮，得重问
+   —— 演示时这一步最容易误解成"设了没用"。
+2. **记住上次的值**（`localStorage`）。演示要对好几个数，刷新一次重填一遍很烦。
+3. **绝不漏成 0**：`maxtok()` 对空 / 非数字 / ≤0 一律回落默认值。漏成 0 会被网关读成
+   "用后端自己的默认值"，于是**这一页显示的设定就成了假话**——屏幕说 64、实际吐 2000，
+   而且没有任何地方报错。同理 `change` 时把生效值回写进输入框：粘进来一个 `"2,000"`
+   而 `parseInt` 只认前面那个 `2`，不回写就会出现"我明明设了 2000"的罗生门。
+
+#### 9.12.3 一个刻意的偏差：只在**字面**收到 `length` 时才标「触顶截断」
+
+统计行加了一个截断标记，但判据是**后端报的 `finish_reason === "length"` 本身**，
+不是"tok 数 ≈ 设定值"。理由：真正卡住输出的常常是**上下文**而不是这个上限，两者在屏幕上
+长得一模一样（都是"话没说完就停了"）。拿 tok 数去猜，会把"上下文不够"标成"上限设小了"，
+**正好把这一行最该防的那种误导写进了屏幕**。宁可不说，不可说错。
+
+#### 9.12.4 顺手抓到并修掉的真 bug：统计行一直把 HTML 当纯文本渲染
+
+用户那条报障消息里其实**带着这个 bug 的指纹**——粘贴过来的统计行原文是
+`<b>11.63 tok/s</b> · 256 tok · 22.0s · …`，标签跟着数字一起出来了。
+`setStat()` 写的是 `p.stat.textContent`，而**每个调用方都传 HTML**（要让速率加粗）。
+在屏幕上看，它只是"没那么粗"、不像坏了，所以藏了好几轮演示才被人念出来。
+
+改成 `innerHTML` 的同时补了 `esc()`：统计行的失败分支拼的是**网关回的错误文本**，
+十处拼 HTML、一处忘了转义正是这类问题最常见的形态，一开始就堵上更省事。
+
+⚠️ 这条与上面的长度开关**落在同一个函数上**，但成因无关，所以拆成两个 commit
+（`8bba09e` 渲染修复 → `9804a41` 长度开关），各自都是自洽可跑的状态——第一个 commit
+单独 checkout 出来，对桩后端跑 `page_check.js` 是全绿的。
+
+#### 9.12.5 怎么验的：把"改源码常量"换成"像用户一样把值交进去"
+
+`page_check.js` 原先用 `script.replace(/const MAXTOK = \d+;/, …)` 直接改页面源码。
+常量变成输入框之后这条路没了，而**新的失败模式从结果上完全看不出来**：
+框接了、线没接的话，页面照跑、答案照出、四路照样并发，只是长度还停在老的默认值上
+——"模型自己停的"和"上限压根没送出去"长得一模一样。
+
+所以改成两条：桩给一个**真的** `localStorage`（不是一对空函数），把值放进去让页面自己在
+`initMaxtok` 里读出来填进输入框；再记下每个请求体，断言四路带出去的 `max_tokens` 与
+输入框一致。走的是和真浏览器同一条路径，也就不存在"改源码改出来的行为跟用户点出来的不一样"。
+
+顺带**修掉本检查文件头部一句错的注释**：它写着"需要 node 与一台正在跑网关的板卡"，
+而对着本地桩后端就能整跑（起法见 `README.md` 测试一节）——改完页面先在本地过一遍，
+省一次板卡往返。
+
+#### 9.12.6 上板
+
+**不需要重启网关**：`_static_demo`（`rkllm_gateway.py`）每次请求都现读磁盘上的
+`demo_4chat.html`，所以换完文件下一次刷新就是新版（模型那 240s 的重载省掉了）。
+上板时先传成 `.new`、两边核对 md5 再 `mv` 就位——这一页正被现读现发，
+传一半被读到就是白屏。
+
+- 板卡副本 `f7283eef5c263b4396d8f1022c85dd4f`（22732 B，= `9804a41`），旧件留
+  `serve/bak_20260918/demo_4chat.html.1db0882d`（回滚 = 拷回来，同样不用重启）。
+- **板上 `page_check.js` 整跑全绿**：四路请求体 `max_tokens [256,256,256,256]`、
+  四路落在四个不同会话、关页面与点「清空」都把会话还干净、聚合 36.09 tok/s。
+- 统计行在板上渲染成真的 `<b>10.07 tok/s</b>`——§9.12.4 那个 bug 在真机上也确认修掉了。
+
+#### 未验证 / 已知限制
+
+- **"上下文用满"长什么样，这一轮没在板上量过**。我们保证的是"不拿 tok 数去猜"，
+  **没有**保证"上下文用满时一定不会报 `length`"。要钉死这条，得在板上造一个正好用满
+  `CTX=4096` 的会话再看统计行。
+- `page_check.js` 验不到真后端的**长度与内容**行为（截断、吐不吐 `<think>`）：它对桩后端
+  也能全绿，所以"本地绿"不等于"板上对"，长度这一类仍得上板看。
+- 板卡自带 shell **没有 `curl`**（`command not found`）；上面那几条 HTTP 核实是从外部主机打的。
+
+---
+
 ## 10. 一页纸总结
 
 | 项 | 结论 |
@@ -2442,6 +2543,8 @@ KV 复用（HTTP）   续聊 prefill 12 vs 全量 154 tok（开思考 0.08）/ 1
 ```
 
 ---
+
+*文档版本：v1.16（2026-09-18）—— **网页演示页的输出长度不再写死**（§9.12）。页面里原来是 `const MAXTOK = 256;`，于是同一个板子、同一个问题，网页永远比终端短一截（终端版从命令行取，`demo_4session.py` 的 `NP`）。**这不是模型或网关的限制**：网关 `_pick_max_tokens` 只把离谱值夹到 2³¹-1、不设小上限，后端 `main.cc` 也会在 `decode_tokens >= max_new_tokens` 时如实回 `finish_reason=length` —— 纯粹是这一页少个开关。现在给了「输出上限」输入框：**按请求**生效（改大了不会补上已经截断的那一轮）、记住上次的值、空/非法回落默认而**不漏成 0**（网关把 0 当"用后端自己的默认值"，漏出去这一页显示的设定就成了假话）。统计行**只在字面收到 `finish_reason=length` 时才标「触顶截断」**，不拿"tok 数 ≈ 设定值"去猜：真正卡住输出的常常是**上下文**不是这个数，猜出来的标记会把"上下文不够"伪装成"上限设小了"——而那正是这一行最该避免的误导。**顺手修掉同一处的真 bug**：`setStat` 写的是 `textContent`，而所有调用方都传 HTML（速率要加粗），于是页面上直接印出字面的 `<b>11.63 tok/s</b>`——看着只是"没那么粗"、不像坏了，因此藏了好几轮演示才被发现；改走 `innerHTML` 并把网关回的错误文本转义。验证：`page_check.js` 不再去改页面源码里的常量，而是**像用户一样**经 localStorage 把值交进去，并断言每个请求体真带着它（常量变输入框之后，"框接了、线没接"从结果上完全看不出来）；本地桩后端与**真板卡**各跑一次**全绿**（板上 `max_tokens [256,256,256,256]`、四路落在四个会话、关页面与点清空都把会话还干净、聚合 36.09 tok/s）。板卡演示页已换 `f7283eef…`（`9804a41`），**不需要重启网关**，旧件留 `serve/bak_20260918/`。另**补回 §8.1 清单里漏掉的 `5c167f5`**（它一直在 `bc7f013` 与 `1dde346` 之间，只是没进那张表）*
 
 *文档版本：v1.15（2026-09-17）—— **帧上限那条分支的 `break`：一个 3.4 MB 的请求把整套服务打死**（§9.11）。§9.10 修的是 tokenizer 那条判据，它**盖不住**这条：`kServeMaxPromptBytes`（1 MiB）是"别相信头行里那个数字"的**内存护栏**，不是"这一轮太长"的判据，而拦下之后写的是 `serve_err` + **`break`** —— 输入线程一退，四个会话全死、之后每个请求都 503 直到重启网关，而 `/health` 还在报 `sessions: 4`；`dead[]` 没有复活路径、`acquire()` 也从不问后端死活，于是 5 段对话（4 个终端 + 1 个 Claude Code）排满 600s 才收到 503。服务侧改为**丢载荷 + REJECT + `continue`**（不发 CLEAR：KV 一个字节都没动），网关侧补三条 containment（进队列前判后端死活与全 dead、`/health` 新增 `backend_alive`/`sessions_dead`、帧读线程在流结束时大声打印）。板上 A/B（同一探针、同一网关，只换后端二进制）：**改动前 503 `Broken pipe` + 会话 dead，改动后 400「exceeds the frame limit」0.1s + 会话一个不少**；`http_scaling.py` 10.84 / 20.15(1.86×) / 36.40(3.36×)，会话 `[0,1,3,2]`。测试台 `t3` 换了判据（它原来把这条错的行为钉成了对的）+ 新变异 `m6`；工作区 72 PASS / 0 FAIL、网关自检 79 PASS / 0 FAIL。另记一条工序坑：覆盖正在运行的二进制会 `Text file busy`，必须**先停再拷**。⚠️ 顺手修正 §0 第 10 条与 §10 里两处过期记录（"板上真后端还没跑过多人"、"模型上下文 4096"），本轮**又一次**漏传 `CTX` 默认值把上下文砍成 4096*
 
