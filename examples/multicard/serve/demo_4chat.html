@@ -18,6 +18,11 @@
   button.ghost { background:#222836; color:var(--fg); font-weight:500; }
   button:disabled { opacity:.4; cursor:not-allowed; }
   label.tog { color:var(--dim); font-size:13px; display:flex; align-items:center; gap:5px; }
+  label.tog input[type=number] { width:72px; background:#0d1017; border:1px solid var(--line);
+                                 color:var(--fg); border-radius:5px; padding:4px 6px;
+                                 font:inherit; font-size:13px; text-align:right;
+                                 font-variant-numeric:tabular-nums; }
+  label.tog input[type=number]:focus { outline:0; border-color:var(--accent); }
   #gstats { color:var(--dim); font-size:13px; font-variant-numeric:tabular-nums; }
   #gstats b { color:var(--ok); font-size:15px; }
   main { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:12px; }
@@ -53,6 +58,7 @@
   <span id="gstats">待机</span>
   <span class="spacer"></span>
   <label class="tog"><input type="checkbox" id="think"> 开思考（默认关，屏幕更干净）</label>
+  <label class="tog">输出上限 <input type="number" id="maxtok" min="1" step="64"> tok</label>
   <button id="baseline" class="ghost">① 先量单路基线</button>
   <button id="all">② 4 路同时提问</button>
   <button id="clear" class="ghost">清空</button>
@@ -64,7 +70,38 @@
 "use strict";
 const API = "";                       // 空 = 同源（页面由网关自己发出，见 GET /demo）
 const MODEL = "qwen3.5-27b";
-const MAXTOK = 256;
+// 输出上限。**原先是写死的**（`const MAXTOK = 256`），于是同一个板上、同样的问题，
+// 网页永远比终端短一截——终端版是从命令行取的（demo_4session.py 的 NP）。这不是模型或
+// 网关的限制：网关 `_pick_max_tokens` 只把离谱值夹到 2^31-1、不设小上限；后端 main.cc 也会
+// 在 `decode_tokens >= max_new_tokens` 时如实回 `finish_reason=length`。纯粹是这一页少了
+// 个开关。现在给了，并且记住上次的值（演示要对好几个数，刷新一次重填很烦）。
+//
+// 它是**按请求**生效的：每轮带自己的 max_tokens 发出去，改大了不会补上已经截断的那一轮，
+// 得重问。而且真正卡住输出的常常不是它、是上下文——位置用满时后端也会停，
+// 那时 finish_reason 未必是 length。所以统计行只在字面收到 length 时才敢标"触顶截断"。
+const DEFAULT_MAXTOK = 256;
+const MAXTOK_KEY = "demo4chat.maxtok";
+
+function maxtok() {
+  const raw = parseInt(document.getElementById("maxtok").value, 10);
+  // 空/非法/<=0 一律退回默认。**不能让它漏成 0 发出去**：网关把 0 当"用后端自己的默认值"
+  // （`_pick_max_tokens` 的 `return 0`），那一轮实际吐多少就跟这一页显示的设定对不上了。
+  return (raw > 0) ? raw : DEFAULT_MAXTOK;
+}
+
+(function initMaxtok() {
+  const el = document.getElementById("maxtok");
+  let saved = NaN;
+  try { saved = parseInt(localStorage.getItem(MAXTOK_KEY), 10); }
+  catch (e) { /* 隐私模式 / 禁用 storage：用默认值就好，别让整页脚本挂在这儿 */ }
+  el.value = (saved > 0) ? saved : DEFAULT_MAXTOK;
+  // 回写一次生效值：输入框里显示的数必须就是真发出去的数，否则"我明明设了 2000"会变成
+  // 一场查不出原因的罗生门（比如粘进来个 "2,000"，parseInt 只认前面那个 2）
+  el.addEventListener("change", function () {
+    el.value = maxtok();
+    try { localStorage.setItem(MAXTOK_KEY, String(el.value)); } catch (e) {}
+  });
+})();
 
 // 这四问是**四个面板各自的第一问**。它们相同也没关系——四路是四段对话这件事
 // 由显式身份（`web-1`..`web-4`，见 streamChat）保证，不再靠"问题不一样"来区分。
@@ -191,7 +228,7 @@ async function streamChat(messages, onDelta, convId) {
     body: JSON.stringify({
       model: MODEL,
       messages: messages,
-      max_tokens: MAXTOK,
+      max_tokens: maxtok(),
       stream: true,
       stream_options: { include_usage: true },
       chat_template_kw: { enable_thinking: document.getElementById("think").checked },
@@ -206,6 +243,7 @@ async function streamChat(messages, onDelta, convId) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "";
+  let finish = null;
   for (;;) {
     const r = await reader.read();
     if (r.done) { break; }
@@ -225,6 +263,10 @@ async function streamChat(messages, onDelta, convId) {
         ntok = d.usage.completion_tokens;
       }
       const ch = d.choices && d.choices[0];
+      // finish_reason 必须在取 content **之前**读：带它的那一块 delta 是空的（只有
+      // `finish_reason` 有值），下面 `if (!piece) continue` 顺手就把它跳过去了——
+      // 放在后面写就是永远读不到，而且不报错、统计行一直不显示"触顶"。
+      if (ch && ch.finish_reason) { finish = ch.finish_reason; }
       const piece = ch && ch.delta && ch.delta.content;
       if (!piece) { continue; }
       nchunk++;
@@ -234,7 +276,8 @@ async function streamChat(messages, onDelta, convId) {
   }
   const el = (performance.now() - t0) / 1000;
   const tok = ntok || nchunk;          // usage 没到就退化成数出来的块数
-  return { tok: tok, el: el, rate: tok / el, text: answer, kv: kv, exact: !!ntok };
+  return { tok: tok, el: el, rate: tok / el, text: answer, kv: kv, exact: !!ntok,
+           finish: finish };
 }
 
 // 问完了就主动把会话还回去（POST /v1/conversations/close）。
@@ -303,7 +346,12 @@ async function send(p) {
                        + (Number(kv.base) > 0
                           ? "（复用 " + kv.base + "，省 "
                             + Math.round(100 * (1 - kv.sent / kv.full)) + "%）"
-                          : "（全量）") : ""));
+                          : "（全量）") : "")
+            // 只在**字面**收到 length 时才标。别拿"tok 数 ≈ 设定值"去猜：后端在上下文
+            // 用满时也会停，而那种情况 finish_reason 未必是 length——猜出来的标记会把
+            // "上下文不够了"伪装成"上限设小了"，正是这一页最该避免的误导。
+            + (r.finish === "length"
+               ? " · <span style='color:var(--warn)'>触顶截断</span>" : ""));
     return r;
   } catch (err) {
     bubble.textContent = "出错：" + err.message;

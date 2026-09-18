@@ -22,7 +22,10 @@
 //   node page_check.js http://<板卡IP>:8080
 //   MAXTOK=64 node page_check.js http://<板卡IP>:8080    # 只改本次演示的每轮长度，不动页面默认值
 //
-// 需要 node 与一台正在跑网关的板卡；不进 run_all_board_tests.sh（那套是纯 python3 的）。
+// 需要 node。后端**不一定是板卡**：对着本地桩后端（`fake_backend.py`，起法见 README.md 测试
+// 一节）就能整跑，2026-09-18 实测全绿——改完这一页先在本地过一遍，省一次板卡往返。桩验不
+// 到的是真后端的**长度与内容**行为（截断、吐不吐 <think>），那些还得上板。
+// 不进 run_all_board_tests.sh（那套是纯 python3 的）。
 const fs = require("fs");
 const vm = require("vm");
 
@@ -102,14 +105,26 @@ const document = {
 };
 
 let script = /<script>([\s\S]*?)<\/script>/.exec(html)[1];
+
+// MAXTOK=64 node page_check.js … —— 只改**本次演示**的每轮长度，不动页面默认值。
+//
+// 页面把输出上限做成输入框之后（原来写死成源码里的 `const MAXTOK = 256;`），这里不再去
+// 改页面源码里的常量，而是**像用户一样把值交进去**：页面启动时先读 localStorage 里记住的
+// 上次设定（demo_4chat.html 的 initMaxtok），桩只要往那个 store 里放一个值，页面就会自己
+// 把它填进输入框、并带着它发请求——和真浏览器走的是同一条路径，也就不存在"改源码改出来的
+// 行为跟用户点出来的不一样"这种事。
+const LS_KEY = "demo4chat.maxtok";
+const lsStore = {};
 if (process.env.MAXTOK) {
-  const before = script;
-  script = script.replace(/const MAXTOK = \d+;/, "const MAXTOK = " + process.env.MAXTOK + ";");
-  if (script === before) { console.log("FAIL: 没能替换 MAXTOK"); process.exit(1); }
+  lsStore[LS_KEY] = process.env.MAXTOK;
   console.log("（本次 MAXTOK=" + process.env.MAXTOK + "）");
 }
 // 记下每次请求带的身份头：验证"四路确实是以四段不同对话的身份发出去的"，不能只看结果。
 const sentIds = [];
+// 也把请求体记下来。"输出上限"从源码常量变成输入框之后，"输入框里的值有没有真的被
+// 带出去"就成了一件**看不出来**的事：页面照跑、答案照出，只是长度还是老的默认值。
+// 光看结果分不出"模型自己停的"和"上限没送出去"，所以直接查请求体。
+const sentBodies = [];
 const abs = (url) => (url.startsWith("http") ? url : BASE + url);
 const winListeners = {};
 const ctx = {
@@ -120,7 +135,15 @@ const ctx = {
   fetch: (url, opts) => {
     const h = (opts && opts.headers) || {};
     sentIds.push(h["X-Conversation-Id"] || null);
+    try { sentBodies.push(JSON.parse(opts.body)); } catch (e) { sentBodies.push(null); }
     return fetch(abs(url), opts);
+  },
+  // 页面用 localStorage 记住上次的输出上限。桩给一个**真的小 store**，而不是一对空函数：
+  // 空函数会让"设了值 → 刷新还在"这条路径在桩里悄悄走不通，绿了也说明不了页面没问题。
+  localStorage: {
+    getItem(k) { return Object.prototype.hasOwnProperty.call(lsStore, k) ? lsStore[k] : null; },
+    setItem(k, v) { lsStore[k] = String(v); },
+    removeItem(k) { delete lsStore[k]; },
   },
   // 页面用到的浏览器全局。桩的职责是**把环境补齐**，页面代码不该为了能在桩里跑而变形。
   window: {
@@ -213,6 +236,22 @@ if (new Set(qs).size !== 4) {
     console.log("      清理：读 /v1/pool 的 slots[].key（形如 h:...），"
                 + "逐个 POST /v1/conversations/close {\"key\": ...}；"
                 + "或者用 IDLE_TTL 不为 0 的网关重跑");
+    bad++;
+  }
+
+  // 输出上限**必须真的跟着请求走**。这一条守的是"输入框接了、但没接线"：页面照跑、
+  // 答案照出、四路照样并发，只是长度还停在老的默认值上——从结果上完全看不出来
+  //（"模型自己停的"和"上限压根没送出去"长得一模一样）。
+  const wantMax = Number(byId["maxtok"].value);
+  console.log("\n四路带出去的 max_tokens:",
+              JSON.stringify(sentBodies.map(b => (b ? b.max_tokens : null))),
+              "（输入框里是 " + wantMax + "）");
+  if (!(wantMax > 0)) {
+    console.log("FAIL: 输入框里的输出上限不是正数：" + JSON.stringify(byId["maxtok"].value));
+    bad++;
+  } else if (sentBodies.some(b => !b || b.max_tokens !== wantMax)) {
+    console.log("FAIL: 有请求带出去的 max_tokens 与输入框不符（该是 " + wantMax
+                + "）——输入框没接线？");
     bad++;
   }
 
