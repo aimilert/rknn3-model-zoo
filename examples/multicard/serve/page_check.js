@@ -144,6 +144,13 @@ vm.runInContext(script + "\n;globalThis.__t = { panels: panels, send: send, "
                + "streamChat: streamChat, updateGlobal: updateGlobal };", ctx);
 
 const { panels, send } = ctx.__t;
+
+// 统计行是**HTML**（速率要加粗，见页面里的 setStat），桩又把 _text 与 _html 分开存
+// （和浏览器一样），所以读 `stat.textContent` 会拿到空串。2026-09-18 修：页面把 setStat
+// 从 textContent 改成 innerHTML 时，这里读的字段没跟着改，`/tok\/s/` 那条断言就会
+// 在页面完全正常的情况下报 FAIL——**空跑也像失败**，比不检查更费时间。
+// 这个取值器两边都认，改哪一边都不会再假装报错。
+const statOf = (el) => el.textContent || el.innerHTML;
 console.log("buildPanels 建出 %d 个面板", panels.length);
 if (panels.length !== 4) { console.log("FAIL: 面板数不是 4"); process.exit(1); }
 
@@ -177,7 +184,7 @@ if (new Set(qs).size !== 4) {
 
   let bad = 0;
   rs.forEach((r, i) => {
-    const stat = panels[i].stat.textContent;
+    const stat = statOf(panels[i].stat);
     const dot = panels[i].dot.classList.contains("on");
     const active = panels[i].el.classList.contains("active");
     console.log("\n--- 面板 %d ---", i + 1);

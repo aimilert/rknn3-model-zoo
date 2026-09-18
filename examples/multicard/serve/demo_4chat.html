@@ -149,7 +149,19 @@ function render(p) {
   p.go.disabled = p.streaming;
 }
 
-function setStat(p, text) { p.stat.textContent = text; }
+// 统一转义。这一页的统计行有几处是**拼 HTML** 的（速率要加粗），而错误信息来自网关
+// 返回的响应体——不转义就等于把服务端文本当标记塞进 DOM。自己人打自己的板卡，风险
+// 不高，但"十处拼 HTML、一处忘了转义"正是这类问题最常见的形态，一开始就堵上更省事。
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+
+// 统计行**是 HTML**、不是纯文本：调用方要拼 <b> 把速率加粗。
+// 原来这里写的是 textContent —— 于是页面上直接印出字面的 `<b>11.63 tok/s</b>`，
+// 标签跟着数字一起显示了很久没人发现（看起来只是"没那么粗"，不像坏了）。
+function setStat(p, html) { p.stat.innerHTML = html; }
 
 function parseKV(s) {
   // 形如 session=2; reset=0; sent=118; base=248; full=366
@@ -296,7 +308,7 @@ async function send(p) {
   } catch (err) {
     bubble.textContent = "出错：" + err.message;
     bubble.parentNode.className = "msg err";
-    setStat(p, "失败：" + err.message);
+    setStat(p, "失败：" + esc(err.message));
     return null;
   } finally {
     p.streaming = false;
