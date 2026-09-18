@@ -17,6 +17,10 @@
 //   7. 统计行必须带会话号         —— 拿不到 X-KV-Reuse 时（缺 Expose-Headers）会静默变空
 //   8. 页面要的 id 必须真实存在   —— 桩不再给不存在的 id 现造元素，拼错的 id 会像浏览器一样
 //     返回 null（见 byId 那段注释）
+//   9. 面板头的性能小字必须写出来 —— `data-role="perf"` 拼错、元素被删、setPerf 忘了调，
+//     这三种坏法页面都照跑照出答案，只是那格永远空着（2026-09-18 加）
+//  10. 新一轮开始时那格必须是空的 —— 挂着**上一轮**的首字延迟/速率，在最该判断"到底开始
+//     没有"的那一帧上给的是旧数字，比空着更坏（2026-09-18 加）
 //
 // 用法（**必须在 serve/ 目录下跑**，它按相对路径读 demo_4chat.html）：
 //   node page_check.js http://<板卡IP>:8080
@@ -219,10 +223,19 @@ if (new Set(qs).size !== 4) {
     console.log("  返回:", r ? (r.tok + " tok / " + r.el.toFixed(1) + "s = "
                                  + r.rate.toFixed(2) + " tok/s") : "null");
     console.log("  统计行:", stat);
+    console.log("  性能小字:", statOf(panels[i].perf) || "(空)");
     console.log("  会话:", panels[i].sess.textContent || "(空)");
     console.log("  答案前 40 字:", JSON.stringify((r ? r.text : "").slice(0, 40)));
     if (!r) { console.log("  FAIL: 这一路没返回"); bad++; return; }
     if (!/tok\/s/.test(stat)) { console.log("  FAIL: 统计行里没有 tok/s（render 把统计行覆盖了？）"); bad++; }
+    // 面板头右边那格性能小字（首字延迟 + tok/s）。守的是**结构性**的坏法：`data-role` 拼错、
+    // 元素在 innerHTML 里被删掉、setPerf 忘了调 —— 这三种情况下页面照跑、答案照出，只是那格
+    // 永远空着，看演示的人根本不会发现少了个数。
+    const perf = statOf(panels[i].perf);
+    if (!/首字/.test(perf) || !/tok\/s/.test(perf)) {
+      console.log("  FAIL: 面板头的性能小字没写出来（首字延迟/tok/s）：" + JSON.stringify(perf));
+      bad++;
+    }
     if (!/会话/.test(panels[i].sess.textContent)) { console.log("  FAIL: 没拿到会话号"); bad++; }
     if (dot || active) { console.log("  FAIL: 流结束了但状态还是 active"); bad++; }
     if (!r.exact) { console.log("  WARN: usage 没到，token 数是数块数出来的"); }
@@ -324,11 +337,13 @@ if (new Set(qs).size !== 4) {
   {
     const realFetch = ctx.fetch;
     let midWait = null;
+    let midPerf = null;
     ctx.fetch = function () {
       return new Promise(function (resolve) {
         setTimeout(function () {
           // fetch 还没回，此刻页面处在"等会话"状态——正是要抓的这一帧
           midWait = statOf(panels[0].stat);
+          midPerf = statOf(panels[0].perf);
           resolve({
             ok: true,
             headers: { get: (k) => (k === "X-KV-Reuse"
@@ -360,6 +375,13 @@ if (new Set(qs).size !== 4) {
     console.log("拿到会话后的统计行:", finalStat);
     if (!/等待空闲会话/.test(midWait || "")) {
       console.log("FAIL: 等会话期间统计行没说话（屏幕上只剩转圈，看着像卡死）");
+      bad++;
+    }
+    // 新的一轮开始时，面板头上那格**必须是空的**。留着上一轮的首字延迟/速率，
+    // 在最该判断"到底开始了没有"的那一帧上给的是上一轮的数 —— 比空着更坏。
+    console.log("等待期间的性能小字:", JSON.stringify(midPerf || ""));
+    if (midPerf) {
+      console.log("FAIL: 新一轮开始了，面板头上还挂着上一轮的性能数字：" + JSON.stringify(midPerf));
       bad++;
     }
     if (!/排队 42\.0s/.test(finalStat)) {
