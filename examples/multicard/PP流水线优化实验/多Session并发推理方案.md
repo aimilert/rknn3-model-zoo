@@ -725,7 +725,7 @@ git checkout -b feature/multisession-concurrency
 #   8bba09e  multicard/serve: draw the demo page's stat line as HTML, not as text
 #   9804a41  multicard/serve: let the demo page set its own output length  (v1.16)
 #   0d3e22c  multicard/serve: prefill the model template's think tail when thinking is off  (v1.17；§9.13)
-#   （本次提交）  multicard/serve: reclaim the idlest session when someone is waiting, and surface the wait  (v1.18；§9.14)
+#   b5483bd  multicard/serve: reclaim the idlest session when someone is waiting  (v1.18；§9.14)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
