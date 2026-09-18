@@ -743,7 +743,7 @@ git checkout -b feature/multisession-concurrency
 #   0d3e22c  multicard/serve: prefill the model template's think tail when thinking is off  (v1.17；§9.13)
 #   b5483bd  multicard/serve: reclaim the idlest session when someone is waiting  (v1.18；§9.14)
 #   bd49947  multicard/serve: rework the demo page's UI (badge, perf strip, growing input)  (v1.19；§9.15)
-#   <本次>   multicard/serve: split the aggregate into per-path rate sum and wall-clock average  (v1.20；§9.16)
+#   7c425b9  multicard/serve: split the aggregate into per-path rate sum and wall-clock average  (v1.20；§9.16)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
