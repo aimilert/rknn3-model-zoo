@@ -21,6 +21,12 @@
 //     这三种坏法页面都照跑照出答案，只是那格永远空着（2026-09-18 加）
 //  10. 新一轮开始时那格必须是空的 —— 挂着**上一轮**的首字延迟/速率，在最该判断"到底开始
 //     没有"的那一帧上给的是旧数字，比空着更坏（2026-09-18 加）
+//  11. 汇总那一句的两种"平均"不许混 —— 各路速率和 Σ(tok_i/el_i) 与单路基线**同口径**，
+//     伸缩比只能用它；墙钟摊薄 Σtok/墙钟 在四路长短不齐时会被空转的尾巴摊小。用户
+//     2026-09-18 报过这次真事：一路跑 135.7s、三路约 16s，屏幕上给"聚合 15.43 tok/s"，
+//     看着跟单路基线 10.6 是一路的。下面那组 fixture 拿那几个真实数钉死两个数都要算对
+//  12. 被摊薄/排过队必须当场说破 —— 稀释时不报"平均只有 1.37/4 路在跑"、排队时不标
+//     "伸缩比不可引用"，这两种数就会被当成并发性能读走。**数没错，是没人知道它是什么**
 //
 // 用法（**必须在 serve/ 目录下跑**，它按相对路径读 demo_4chat.html）：
 //   node page_check.js http://<板卡IP>:8080
@@ -173,9 +179,81 @@ ctx.globalThis = ctx;
 // 页面脚本没导出任何东西，补一行把内部函数交出来供测试调用
 vm.createContext(ctx);
 vm.runInContext(script + "\n;globalThis.__t = { panels: panels, send: send, "
-               + "streamChat: streamChat, updateGlobal: updateGlobal };", ctx);
+               + "streamChat: streamChat, updateGlobal: updateGlobal, "
+               + "summarize: summarize, runAll: runAll, "
+               + "lastRound: function () { return lastRound; }, "
+               // 基线速率是页面里一个会被改的变量，"交出当时的值"没有意义——
+               // 要的是**读得到当下的值**，所以交一个闭包而不是快照。
+               + "baselineRate: function () { return lastSingleRate; } };", ctx);
 
-const { panels, send } = ctx.__t;
+const { panels, send, summarize } = ctx.__t;
+
+// ---------- 汇总那一句的算术（纯函数，不联网） ----------
+//
+// 2026-09-18 用户报的："合计 2095 tok / 墙钟 135.7s → 聚合 15.43 tok/s"，看着跟单路基线
+// 10.6 是一路的，于是"四路并发没什么用"就是那么读出来的。**问题不在数，在口径**：
+// 那 135.7s 里只有前 18 秒是四路在跑，后面 120 秒是**一路**在长生成（1602 tok），
+// 把"一路的吞吐"摊进了"四路并发"的分母。所以这里钉死两个数**都算出来、且不混淆**，
+// 并且钉死**伸缩比只许用各路速率和**（口径与基线一致）。
+//
+// 这几个数是从用户那次真实运行抄下来的，不是编的：改了公式而忘了改断言，这一节会报 FAIL。
+const near = (got, want, tol) => Math.abs(got - want) <= (tol === undefined ? 0.011 : tol);
+const grab = (html, re) => { const m = html.match(re); return m ? parseFloat(m[1]) : NaN; };
+
+function fixture(name, rs, wall, baseline) {
+  const html = summarize(rs, wall, baseline);
+  console.log("  [%s] %s", name, html.replace(/<[^>]*>/g, ""));
+  return html;
+}
+
+{
+  let bad = 0;
+  const chk = (ok, msg) => { if (!ok) { console.log("  FAIL: " + msg); bad++; } };
+
+  // ① 用户那次真事的数字：四路 153/182/1602/158 tok，墙钟 135.7s
+  const long = [{ tok: 153, el: 15.6, waited: 0 }, { tok: 182, el: 18.1, waited: 0 },
+                { tok: 1602, el: 135.7, waited: 0 }, { tok: 158, el: 16.3, waited: 0 }];
+  const h1 = fixture("长短不齐", long, 135.7, 10.63);
+  chk(near(grab(h1, /速率和 <b>([\d.]+)/), 41.36), "各路速率和应为 41.36 tok/s（实测值）");
+  chk(near(grab(h1, /墙钟摊薄 ([\d.]+)/), 15.44), "墙钟摊薄应为 15.44 tok/s（实测值）");
+  chk(/1\.37\/4 路在跑/.test(h1), "应报出「平均只有 1.37/4 路在跑」（稀释诊断）");
+  chk(near(grab(h1, /伸缩 ([\d.]+)×/), 3.89), "伸缩比应为 3.89× = 41.36/10.63（用速率和，不是摊薄值）");
+  // 摊薄值除以基线只有 1.45×，看着像"四路并发毫无用处"——那正是用户报的读数，
+  // 所以这条不许只查"等于 3.89"，还要查它**大于**摊薄口径算出来的值。
+  chk(grab(h1, /伸缩 ([\d.]+)×/) > 2,
+      "伸缩比不许用摊薄值算（否则得到 1.45×，屏幕上就是「并发没用」）");
+  // 这两条是"口径不许混"的正面断言：主数必须是速率和，摊薄值必须戴着它的帽子出现
+  chk(h1.indexOf("各路速率和") < h1.indexOf("墙钟摊薄"), "速率和必须排在摊薄值前面（它是主数）");
+  chk(/别当并发性能看/.test(h1), "摊薄时有义务说明「这不是并发性能」");
+  chk(/合计 2095 tok/.test(h1), "合计 token 数应为 2095");
+
+  // ② 四路等长：两个数本来就该接近，这时摊薄值是可以看的，且不许报稀释
+  const even = [{ tok: 150, el: 15, waited: 0 }, { tok: 150, el: 15, waited: 0 },
+                { tok: 150, el: 15, waited: 0 }, { tok: 150, el: 15, waited: 0 }];
+  const h2 = fixture("四路等长", even, 15.1, null);
+  chk(near(grab(h2, /速率和 <b>([\d.]+)/), 40.00, 0.005), "速率和应为 40.00 tok/s");
+  chk(near(grab(h2, /墙钟摊薄 ([\d.]+)/), 39.74), "摊薄应为 39.74 tok/s");
+  chk(!/长短不齐/.test(h2), "四路等长时不该报稀释警告（假警报会让人不再信这条）");
+  chk(/二者等价/.test(h2), "等长时应说明两个数等价");
+  chk(/先点「①」/.test(h2), "没有基线时应提示去量基线，不许默默不显示伸缩比");
+
+  // ③ 排过队：伸缩比必须当场标成不可引用（排队混在墙钟里，数看着像"并发退化"）
+  const q = [{ tok: 153, el: 15.6, waited: 0 }, { tok: 182, el: 18.1, waited: 40.2 },
+             { tok: 1602, el: 135.7, waited: 0 }, { tok: 158, el: 16.3, waited: 0 }];
+  const h3 = fixture("某路排队", q, 135.7, 10.63);
+  chk(/有 1 路排过队（最多 40\.2s），上面的数含伸缩比都不可引用/.test(h3),
+      "应报出排队并声明伸缩比不可引用");
+  chk(/伸缩 3\.89×/.test(h3), "排队时数照样显示，只是标明不可引用");
+  chk(h3.indexOf("伸缩 3.89×") < h3.indexOf("排过队"),
+      "排队警告必须排在伸缩比之后（它撤的就是刚印出来的那个数）");
+  chk(!/排过队/.test(h1), "没人排队时不许报排队（假警报会把真警报淹掉）");
+
+  if (bad) {
+    console.log("FAIL: 汇总算术有 %d 条不对（上面每一条都对着真实运行数钉过）", bad);
+    process.exit(1);
+  }
+  console.log("  汇总算术 3 组 fixture 全过\n");
+}
 
 // 统计行是**HTML**（速率要加粗，见页面里的 setStat），桩又把 _text 与 _html 分开存
 // （和浏览器一样），所以读 `stat.textContent` 会拿到空串。2026-09-18 修：页面把 setStat
@@ -210,9 +288,14 @@ if (new Set(qs).size !== 4) {
     return held;
   }
 
-  const t0 = Date.now();
-  const rs = await Promise.all(panels.map(p => send(p)));
-  const wall = (Date.now() - t0) / 1000;
+  // 走**用户点「②」的那条路**（runAll），不是自己 `panels.map(send)` 一遍。
+  // 差别就在汇总行：自己发的话，页面里 summarize + setSum 那两句压根不执行，
+  // 于是"四路那一句怎么算的"完全没有检查覆盖 —— 2026-09-18 改口径时就是这么发现的。
+  // 代价是拿不到 runAll 的返回值，得问它要（lastRound）。
+  await ctx.__t.runAll();
+  const round = ctx.__t.lastRound();
+  if (!round) { console.log("FAIL: runAll 没留下这一轮的结果"); process.exit(1); }
+  const rs = round.rs, wall = round.wall;
 
   let bad = 0;
   rs.forEach((r, i) => {
@@ -295,9 +378,27 @@ if (new Set(qs).size !== 4) {
     }
   });
 
-  const total = rs.reduce((a, r) => a + (r ? r.tok : 0), 0);
-  console.log("合计 " + total + " tok / 墙钟 " + wall.toFixed(1) + "s → 聚合 "
-              + (total / wall).toFixed(2) + " tok/s");
+  // 汇总行：印**页面上真写出来的那一句**（#gsum），再和这里独立算的一遍对一下。
+  // 以前这里只是自己重算一个"聚合 tok/s"印出来——那是**检查自己的口径**，页面把它改了
+  // 这里也照样印老口径，读日志的人会以为页面还是老样子。现在这里读的是页面产物。
+  // 对不上就 FAIL：说明「②」那条路没走 summarize（或者走了别的公式）。
+  const okr = rs.filter(Boolean);
+  const gsum = byId["gsum"] ? statOf(byId["gsum"]) : "";
+  // 比的是**各路速率和**，不是整句：墙钟这一项两边算不出同一个值（页面用 performance.now()，
+  // 这里用 Date.now()，还差着一次 await 的往返），拿整句比等于在测时钟抖动。
+  // 速率和只用到 tok 与 el —— 那是页面自己量出来、这里直接读回来的同几个对象，应该逐位相等。
+  const want = summarize(okr, wall, ctx.__t.baselineRate());
+  const soloOf = (s) => { const m = s.match(/速率和 <b>([\d.]+)/); return m ? parseFloat(m[1]) : NaN; };
+  console.log("页面汇总行:", gsum.replace(/<[^>]*>/g, "") || "(空)");
+  if (!(Math.abs(soloOf(gsum) - soloOf(want)) < 0.005)) {
+    console.log("FAIL: 页面汇总行里的速率和与独立算的对不上（%s vs %s）——「②」没走 summarize？",
+                soloOf(gsum), soloOf(want));
+    bad++;
+  }
+  if (!/速率和/.test(gsum)) {
+    console.log("FAIL: 汇总行里没有「速率和」——伸缩比的分母口径必须写在一句话里");
+    bad++;
+  }
   console.log("\n统计行渲染后的全局栏:", byId["gstats"].textContent || byId["gstats"].innerHTML);
   // 从这里开始验"页面走了以后，会话有没有还回去"。两条路，代码不是同一段：
   // 关页面走 sendBeacon（beforeunload），点「清空」走 closeConv（fetch）。
