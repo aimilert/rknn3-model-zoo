@@ -52,7 +52,8 @@ MODEL_DIR=<模型目录> \
 环境变量（都有默认值，见脚本头部注释）：`INSTALL_DIR`（含后端二进制与 `lib/`）、
 `MODEL_DIR`、`GATEWAY_DIR`、`B`（后端二进制名）、`NSESSION`（默认 4）、`PORT`（默认 8080）、
 `NP`（每轮 max_new_tokens 默认值）、`HOST`（默认 `0.0.0.0`）、`LOG`、
-`IDLE_TTL`（默认 300，一段对话静默这么久就把它占的会话收回给排队者；0=不回收）、
+`IDLE_TTL`（默认 300，一段对话静默这么久就把它占的会话收回给排队者；**0=不回收，是这一套的总开关**）、
+`CONTEND_IDLE`（默认 15，**已经有人非等不可**时用的那一级阈值，见下；0=关掉这一级）、
 `QUEUE_TIMEOUT`（默认 600，取不到会话时最多排队等这么久，超了返回 503；要大于 `IDLE_TTL`）、
 `CTX`（上下文长度，默认 4096）。
 
@@ -103,6 +104,11 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'X-Conversation-Id: bob' 
   3.40×/1.90×/1.00× 三种结果——演示场合最不该有的就是这种不确定性。
 - 一段对话静默超过 `IDLE_TTL` → 它占的会话被收回给排队者。被收回的人下次提问前缀对不上，
   会走一次 RESET + 完整 prefill（多约 2–3 秒），**正确性不受影响**（上下文一直在客户端手上）。
+- **已经有人在等的时候，上面这条的阈值降到 `CONTEND_IDLE`（默认 15 秒），而且只收最闲的那一段。**
+  没有这一级，第 N+1 个人要等到某一段对话静默满 `IDLE_TTL` 才拿得到会话——而那段时间里 NPU
+  是**真空着的**，用户看到的就是"明明没人用，我却要等"。它只在"一个空闲会话都找不到"时才发作
+  （还有空闲会话时常规路径逐字节不变），也只收一段（收多了会把 KV 复用成片打掉，而等的人是**一个**）；
+  `IDLE_TTL=0` 仍是总开关，两级一起关。
 - 排队超过 `QUEUE_TIMEOUT` → 返回 **503** + `Retry later or reuse a conversation_id...`，
   不让终端用户无限期干等。
 - 这一轮的 prompt 太长、装不进上下文 → 后端在 prefill **之前**就把这一轮拒掉，网关回
@@ -129,7 +135,7 @@ curl -s http://<板卡>:8080/v1/conversations/close -H 'Content-Type: applicatio
 排队的人不是变慢了，是还没拿到：
 
 ```json
-{"sessions": 4, "idle_ttl_s": 300.0, "queue_timeout_s": 600.0, "reaped_total": 2,
+{"sessions": 4, "idle_ttl_s": 300.0, "contend_idle_s": 15.0, "queue_timeout_s": 600.0, "reaped_total": 2,
  "slots": [{"session": 0, "state": "busy", "conversation": "id:alice", "key": "id:alice", "idle_s": null},
            {"session": 1, "state": "free", "conversation": null, "key": null, "idle_s": null}],
  "waiting": [{"conversation": "id:dave", "waited_s": 12.4}]}
@@ -172,8 +178,11 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
 - **多轮会话粘性**：`messages` 里带上完整历史即可，网关按历史自动把同一段对话钉在同一个会话上，
   跨轮只给后端发**差异部分**（KV 复用）。想强制不复用就换一段全新的对话（首条 user 内容不同）。
   **多人接入时不要靠内容认对话**，用上面的 `X-Conversation-Id` 显式给身份。
-- **`X-KV-Reuse` 响应头**：`session=<i>; reset=<0|1>; sent=<n>; base=<n>; full=<n>`——
+- **`X-KV-Reuse` 响应头**：`session=<i>; reset=<0|1>; sent=<n>; base=<n>; full=<n>; wait=<s>`——
   复用有没有生效只看这里。**答案正确但慢 3~4 倍**这类问题，正确性测试抓不到，全靠这个头。
+  `wait` 是**拿到会话之前在队列里等的时间**：它非零时，这一轮的总耗时和按总耗时算出来的
+  tok/s **都不是解码速度**（SSE 的响应头要等拿到租约才发出去，"变慢"和"还没轮到"在旧版本里
+  从响应上分不开，只能去翻网关日志）。
 
 ## 已知限制（完整清单见方案文档 §9.7）
 
@@ -184,7 +193,8 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
   让后来的人（包括真人）在队列里等到 `QUEUE_TIMEOUT`。**"超过 5 个排队"只在参与者都守规矩时成立。**
 - **排队的公平性是"先到先得"，但不保证严格顺序**：醒来后谁先抢到锁谁先拿，同一批排队的
   用户完成顺序可能与到达顺序不同（实测 5 人 2 会话时是 u3/u5/u4）。不承诺 FIFO 严格性。
-- **`IDLE_TTL=0` = 永不回收**（诊断/压测用得着，见测试一节）。这时唯一能释放会话的手段
+- **`IDLE_TTL=0` = 永不回收**（诊断/压测用得着，见测试一节）。**它同时也是 `CONTEND_IDLE` 的
+  总开关**——设 0 就是两级回收一起关。这时唯一能释放会话的手段
   就是 `POST /v1/conversations/close`；用匿名对话的客户端**没有**这个手段，会话会被它占到
   网关重启。默认值是 300，不要为了"省事"把它设成 0 跑多人场景。
 - **匿名对话占住的会话认得出、踢得掉，但不是常规操作**：得从 `/v1/pool` 读 `key` 再 close。
@@ -296,7 +306,10 @@ cached 从 567/584 掉到 44/443，`> 0` 依然通过。
 想单独看"排队 + TTL 回收"这条路，另起一个网关并给一个短的 TTL：
 
 ```sh
-python3 rkllm_gateway.py --port 8098 --sessions 2 --idle-ttl 3 --queue-timeout 60 --verbose \
+# CONTEND_IDLE=0：关掉"有人在等就收最闲的"那一级，才看得到纯 TTL 回收（默认 15 秒下，
+# 排队的人在你挑的 --idle-ttl 之前就被补上了，这条路上的等待是看不长的）
+python3 rkllm_gateway.py --port 8098 --sessions 2 --idle-ttl 3 --contend-idle 0 \
+    --queue-timeout 60 --verbose \
     --frames-stdout -- python3 fake_backend.py --sessions 2 --delay 0.05 --think-prefix
 python3 demo_multiuser.py http://127.0.0.1:8098 5 20 --stagger 0.3 --plain   # 5 人 2 会话，排队可见
 ```

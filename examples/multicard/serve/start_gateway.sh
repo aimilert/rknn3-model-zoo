@@ -18,6 +18,9 @@
 #   B            后端二进制名；默认 ./rknn_multicard_demo.serve（由 build_serve.sh 产出）
 #   NSESSION     会话数 = **同时活跃的对话数上限**（板卡硬上限实测 5）；默认 4
 #   IDLE_TTL     一段对话静默超过这么多秒就把它占的会话收回给排队者；默认 300（0=不回收）
+#   CONTEND_IDLE **已经有请求非等不可**时用的静默阈值（只收最闲的那一段对话）；默认 15。
+#                没有它，第 N+1 段对话要等到某一段静默满 IDLE_TTL——那段时间里 NPU 是
+#                真空着的，用户看到的就是"没人用，我却要等"。0 = 关掉这一级。
 #   QUEUE_TIMEOUT 取不到会话时最多排队等这么多秒，超了返回 503；默认 600（要 > IDLE_TTL）
 #   PORT         监听端口；默认 8080
 #   NP           每轮 max_new_tokens 的进程默认值；默认 512
@@ -45,6 +48,7 @@ MODEL_DIR=${MODEL_DIR:-$REPO_ROOT/Qwen3.5-27B}
 B=${B:-./rknn_multicard_demo.serve}
 NSESSION=${NSESSION:-4}
 IDLE_TTL=${IDLE_TTL:-300}
+CONTEND_IDLE=${CONTEND_IDLE:-15}
 QUEUE_TIMEOUT=${QUEUE_TIMEOUT:-600}
 PORT=${PORT:-8080}
 NP=${NP:-512}
@@ -59,7 +63,8 @@ export LD_LIBRARY_PATH=./lib
 exec taskset f0 python3 "$GATEWAY_DIR/rkllm_gateway.py" \
   --host "$HOST" --port "$PORT" \
   --sessions "$NSESSION" --verbose \
-  --idle-ttl "$IDLE_TTL" --queue-timeout "$QUEUE_TIMEOUT" \
+  --idle-ttl "$IDLE_TTL" --contend-idle "$CONTEND_IDLE" \
+  --queue-timeout "$QUEUE_TIMEOUT" \
   --backend-log "$LOG" \
   -- "$B" \
      --model "$MODEL_DIR/Qwen3.5-27B-llm_seg0.rknn" \

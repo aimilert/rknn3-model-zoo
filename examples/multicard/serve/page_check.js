@@ -130,6 +130,11 @@ const winListeners = {};
 const ctx = {
   document, performance, TextDecoder, console, JSON, Promise, Math, Date,
   setTimeout, Error,
+  // 页面用 setInterval 在"还没拿到会话"的那段时间里每 200ms 刷新一次统计行（2026-09-18
+  // 加：那一刻页面上本来只有一个转圈，看着像卡死）。桩里必须是**真的**定时器，不能是
+  // 空函数——空函数会让踩醒间隔的那条路在桩里悄悄走不通，绿了也说明不了页面没问题
+  // （这次就是先漏了它，页面在桩里直接报 `setInterval is not defined`，四路全灭）。
+  setInterval, clearInterval,
   // 页面里的 API 是 ""（同源相对路径），浏览器会自动按页面来源补全；node 不会，
   // 所以这里替它补——**只是替浏览器补全这一步，请求本身没做任何改写**。
   fetch: (url, opts) => {
@@ -305,6 +310,62 @@ if (new Set(qs).size !== 4) {
   if (afterClear.length) {
     console.log("FAIL: 清空了但会话没还回去（后来的人要等 IDLE_TTL 超时）");
     bad++;
+  }
+
+  // ---- 排队那段等待，页面上必须"会说话" ----
+  // 场景：四个会话都被别的对话占着，网关让这一路在队列里等。**这段时间里 fetch 还没
+  // resolve**（响应头是拿到会话之后才发的），所以整段时间页面上一个字都不会多——用户
+  // 2026-09-18 报的"NPU 明明没人用，输入问题后还是在等"就长这样：屏幕上只有一个转圈，
+  // 看不出是模型慢、是排队、还是板卡坏了。
+  //
+  // 造法不靠真排队（那要占满会话、还得掐时间）：直接把 fetch 换成一个**慢 350ms + 头里
+  // 带 wait=42.0** 的假响应。350ms > 页面的 200ms 刷新间隔，所以至少刷一次；头里的
+  // wait 是**权威的那个数**（网关自己记的排队时长），比页面 tick 出来的更准。
+  {
+    const realFetch = ctx.fetch;
+    let midWait = null;
+    ctx.fetch = function () {
+      return new Promise(function (resolve) {
+        setTimeout(function () {
+          // fetch 还没回，此刻页面处在"等会话"状态——正是要抓的这一帧
+          midWait = statOf(panels[0].stat);
+          resolve({
+            ok: true,
+            headers: { get: (k) => (k === "X-KV-Reuse"
+              ? "session=0; reset=1; sent=204; base=0; full=204; wait=42.0" : null) },
+            body: { getReader: () => {
+              const chunks = ["data: {\"choices\":[{\"delta\":{\"content\":\"杭\"}}]}\n\n",
+                              "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],"
+                              + "\"usage\":{\"completion_tokens\":1}}\n\n",
+                              "data: [DONE]\n\n"];
+              let i = 0;
+              return { read: () => Promise.resolve(
+                i < chunks.length ? { done: false, value: new TextEncoder().encode(chunks[i++]) }
+                                  : { done: true }) };
+            } },
+          });
+        }, 350);
+      });
+    };
+    try {
+      // 上一步「清空」已经把输入框清掉了，而 send() 对着空输入框会直接 return null
+      // （不发请求）——不填这一下，这条检查就会变成"空跑也算过"。
+      panels[0].input.value = "排队那一格";
+      await send(panels[0]);
+    } finally {
+      ctx.fetch = realFetch;
+    }
+    const finalStat = statOf(panels[0].stat);
+    console.log("\n等待期间的统计行:", midWait);
+    console.log("拿到会话后的统计行:", finalStat);
+    if (!/等待空闲会话/.test(midWait || "")) {
+      console.log("FAIL: 等会话期间统计行没说话（屏幕上只剩转圈，看着像卡死）");
+      bad++;
+    }
+    if (!/排队 42\.0s/.test(finalStat)) {
+      console.log("FAIL: 统计行没把排队时长摊出来（tok/s 会把排队算进分母，看着像模型慢）");
+      bad++;
+    }
   }
 
   // 页面要过、但 HTML 里不存在的 id。上面每次命中都会打一行 FAIL，这里补一句汇总，

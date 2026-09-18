@@ -529,6 +529,12 @@ def main():
           "slots=%d waiting=%d reaped=%d idle_ttl=%ss"
           % (len(pool.get("slots", [])), len(pool.get("waiting", [])),
              pool.get("reaped_total", 0), pool.get("idle_ttl_s")))
+    # 第二级阈值必须在快照里。只看 `/v1/pool` 的人要能算出"我这个请求最坏等几秒"；
+    # 2026-09-18 那次"NPU 没人用却等 226s"就是因为屏幕上和快照里都看不出这一级的存在。
+    check("/v1/pool 报出了 contend_idle（有人在等时的那一级阈值）",
+          "contend_idle_s" in pool,
+          "contend_idle=%ss（idle_ttl=%ss）" % (pool.get("contend_idle_s"),
+                                                pool.get("idle_ttl_s")))
     closed = close_conv("probe-never-existed")
     check("close 一段不存在的对话是幂等的（不报错）",
           closed.get("closed") is False and closed.get("session") is None,

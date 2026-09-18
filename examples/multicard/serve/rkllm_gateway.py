@@ -65,6 +65,21 @@ DEFAULT_MAX_NEW_TOKENS = 512
 # 每一轮都要全量重算 prefill（多花 2~3 秒）。它必须明显大于"正常人相邻两轮之间的间隔"。
 DEFAULT_IDLE_TTL = 300.0          # 秒；0 = 不回收（= 第 N+1 段对话永远排队）
 DEFAULT_QUEUE_TIMEOUT = 600.0     # 秒；排队超过它就返回 503，不要让终端用户干等
+# 上面那对默认值有个不对称，2026-09-18 被用户抓出来："NPU 明明没人用，输入问题后还是
+# 在等"。**只有 IDLE_TTL 一条路决定谁腾会话**，而它被调得很大（300s）是为了保住 KV
+# 复用——可这段静默期里 NPU 是**真闲着**，等的人却在空转。板上实测（`rt_work/
+# page_repro.py` 的 queue 场景）：四段对话各自静默 70~90s，第 5 段对话干等 **226.0s**
+# 才拿到会话，全程四个会话都是 idle。等待时长 = IDLE_TTL − 它自己静默了多久。
+#
+# 所以把"静默"分成两级：
+#   · 没人等：按 IDLE_TTL（300s）——保住"多轮对话的第二轮直接命中 KV"这条主路径；
+#   · 有人在等（请求进来发现一个空闲会话都没有，非等不可）：按 CONTEND_IDLE 收，
+#     取**最闲的那一段**对话，只收一个。多花的是被收走那段对话下一轮的 prefill
+#     （页面上这种两百来字节的对话不到 0.3s），换来的是让等的人从"分钟级"降到"秒级"。
+# 这不违反"不抢占"：只收**没在跑**的会话，而且按静默时长挑受害者（不是按请求到达顺序），
+# 行为可预期。CONTEND_IDLE 必须明显大于"同一段对话相邻两轮的真实间隔"，否则一个正常的
+# 多轮用户每轮都在被收走、每轮都全量重算。
+DEFAULT_CONTEND_IDLE = 15.0       # 秒；0 = 关掉这一级（退回"永远等到 IDLE_TTL"）
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>\n"
@@ -449,7 +464,8 @@ class SessionPool(object):
     """
 
     def __init__(self, backend, idle_ttl=DEFAULT_IDLE_TTL,
-                 queue_timeout=DEFAULT_QUEUE_TIMEOUT):
+                 queue_timeout=DEFAULT_QUEUE_TIMEOUT,
+                 contend_idle=DEFAULT_CONTEND_IDLE):
         self.backend = backend
         self.n = backend.sessions
         self.cv = threading.Condition()
@@ -464,6 +480,9 @@ class SessionPool(object):
         # 对话永远等不到——网关根本不知道谁"说完了"（客户端不发结束消息，浏览器关了也
         # 没人通知）。0 或负数 = 不回收（那就等价于第 6 段对话永远排队）。
         self.idle_ttl = float(idle_ttl or 0)
+        # 第二级：**已经有请求非等不可**（一个空闲会话都没有）时用的静默阈值。见文件头
+        # DEFAULT_CONTEND_IDLE 的注释。0 = 关掉第二级。
+        self.contend_idle = float(contend_idle or 0)
         self.queue_timeout = float(queue_timeout)
         self.reaped = 0          # 累计回收了几次（观测用）
         # bound 的上限：键是"system + 首条 user"的摘要或被回收之前攒下的对话。有了空闲
@@ -499,27 +518,42 @@ class SessionPool(object):
                     self.last_used.pop(key, None)
             self.cv.notify_all()
 
-    def _reap_idle_locked(self, now):
+    def _reap_idle_locked(self, now, ttl=None, limit=None, why="静默"):
         """把静默超过 TTL 的对话占的会话收回。调用方必须已持 self.cv。
 
         只收**没在跑**的会话；正在跑的那一轮不能被打断（打断也没意义，它马上就还回来）。
         回收只解绑 + 作废 known，**不动 KV**——下一个拿到这个会话的对话若前缀对不上，
         `_make_lease` 自己会 RESET。所以回收本身不会有额外的清 KV 开销。
+
+        `ttl=None` 用常规的 `idle_ttl`（没人排队时的行为）；给 `contend_idle` 就是
+        "有人在等"那一级。`limit` 限制收几个——**抢手的那一级只收一个**，收多了等于把
+        好几段对话的 KV 一起扔掉，只为了给一个请求腾地方。
+
+        一轮里按**静默时长从长到短**收，不是按 dict 顺序：受害者必须是"最闲的那一段"，
+        否则同一份脚本会有时抢到 A、有时抢到 B，行为不可预期（这正是当初决定"不抢占"
+        的理由，现在用"按静默挑"把它解决掉）。
         """
-        if self.idle_ttl <= 0:
-            return
-        for k, s in list(self.bound.items()):
-            if self.busy[s]:
-                continue
-            last = self.last_used.get(k, now)
-            if now - last > self.idle_ttl:
-                del self.bound[k]
-                self.last_used.pop(k, None)
-                if 0 <= s < self.n:
-                    self.known[s] = None        # 里面的内容从此未知，下一轮必须 RESET
-                self.reaped += 1
-                _note("会话回收：%s 静默 %.1fs > %.1fs，s%d 交还给排队者"
-                      % (_key_label(k), now - last, self.idle_ttl, s))
+        ttl = self.idle_ttl if ttl is None else ttl
+        if ttl <= 0:
+            return 0
+        victims = sorted(((now - self.last_used.get(k, now), k, s)
+                          for k, s in self.bound.items() if not self.busy[s]),
+                         reverse=True)
+        n = 0
+        for idle, k, s in victims:
+            if idle <= ttl:
+                break                       # 已按静默倒序排好，后面只会更不闲
+            if limit is not None and n >= limit:
+                break
+            del self.bound[k]
+            self.last_used.pop(k, None)
+            if 0 <= s < self.n:
+                self.known[s] = None        # 里面的内容从此未知，下一轮必须 RESET
+            self.reaped += 1
+            n += 1
+            _note("会话回收：%s %s %.1fs > %.1fs，s%d 交还给排队者"
+                  % (_key_label(k), why, idle, ttl, s))
+        return n
 
     def acquire(self, key, prompt, timeout=None):
         """返回 Lease；排队超过 timeout 仍拿不到就抛 BackendError。
@@ -574,6 +608,20 @@ class SessionPool(object):
                     owned = set(self.bound.values())
                     free = [s for s in range(self.n)
                             if not self.dead[s] and not self.busy[s] and s not in owned]
+                    # `idle_ttl <= 0` 是**总开关**（文档里的"0 = 不回收"）：第二级只是
+                    # 对它的细化，不能绕过它。回归套件正是靠 `--idle-ttl 0` 来证明自己
+                    # 真的在主动 close、而不是碰巧被回收救了——这里绕过就等于把那套证明
+                    # 悄悄作废。
+                    if not free and self.contend_idle > 0 and self.idle_ttl > 0:
+                        # 一个空闲会话都没有 = 这个请求**非等不可**，才启用第二级阈值。
+                        # 放在"确认没得用"之后判，是为了让常规路径（还有空闲会话）与
+                        # 之前逐字节一样——那才是 KV 复用真正省下时间的地方。
+                        # 只收一个：腾出够它用的地方就行，别顺手把好几段对话的 KV 扔掉。
+                        self._reap_idle_locked(now, ttl=self.contend_idle, limit=1,
+                                               why="静默（有人排队）")
+                        owned = set(self.bound.values())
+                        free = [s for s in range(self.n)
+                                if not self.dead[s] and not self.busy[s] and s not in owned]
                     if free:
                         # 优先没装过东西的（省一次 RESET）：unknown（None）排在有内容的前面，
                         # 反正都要 RESET，清空的会话至少不用先扔垃圾。
@@ -600,11 +648,16 @@ class SessionPool(object):
                         return self._make_lease(best, prompt, t_enter, key)
                 if time.time() >= deadline:
                     self.waiting.pop(key, None)
+                    # 能排满 timeout 才走到这里，说明不是"别人占着没放"，而是**四个会话
+                    # 全都在真的跑**（第二级回收只收没在跑的，所以它救不了这种情况）。
+                    # 这条区分很重要：用户问"NPU 没人用为什么还要等"时，看一眼这个提示
+                    # 和 `GET /v1/pool` 就能知道是排队还是真忙。
                     raise BackendError(
-                        "no session available: all %d sessions are bound to other "
-                        "conversations (waited %.0fs; idle_ttl=%.0fs). Retry later or "
-                        "reuse a conversation_id that already has a session."
-                        % (self.n, timeout, self.idle_ttl))
+                        "no session available: all %d sessions are busy or bound to "
+                        "other conversations (waited %.0fs; idle_ttl=%.0fs; "
+                        "contend_idle=%.0fs). Retry later or reuse a conversation_id "
+                        "that already has a session."
+                        % (self.n, timeout, self.idle_ttl, self.contend_idle))
                 if not queued:
                     queued = True
                     self.waiting[key] = t_enter
@@ -680,6 +733,9 @@ class SessionPool(object):
             return {
                 "sessions": self.n,
                 "idle_ttl_s": self.idle_ttl,
+                # 第二级阈值也报出来：只看 `/v1/pool` 的人得能算出"我这个请求最坏等几秒"。
+                # 有它，`排队 226s` 这种现场不用再翻日志猜是哪一级没生效。
+                "contend_idle_s": self.contend_idle,
                 "queue_timeout_s": self.queue_timeout,
                 "reaped_total": self.reaped,
                 "slots": slots,
@@ -1115,10 +1171,14 @@ class Handler(BaseHTTPRequestHandler):
             q.kv = {"session": lease.session, "reset": lease.reset,
                     "sent": len(lease.sent_prompt.encode("utf-8")),
                     "base": len(lease.base.encode("utf-8")),
-                    "full": len(prompt.encode("utf-8"))}
-            self.gateway.log("lease: session=%d reset=%s sent=%d/%d bytes (base=%d)",
+                    "full": len(prompt.encode("utf-8")),
+                    "wait": lease.waited}
+            self.gateway.log("lease: session=%d reset=%s sent=%d/%d bytes (base=%d)%s",
                              q.kv["session"], q.kv["reset"], q.kv["sent"], q.kv["full"],
-                             q.kv["base"])
+                             q.kv["base"],
+                             # 排过队就一定要打出来：**"慢"和"没轮到"在日志里必须分得开**，
+                             # 否则事后只能靠 pool 快照的时间线去猜（见 CHANGELOG 09-18）。
+                             (" 排队 %.1fs" % lease.waited) if lease.waited >= 0.05 else "")
             if stream:
                 self._stream_response(req, q, lease, enable_thinking)
             else:
@@ -1532,12 +1592,17 @@ def kv_reuse_headers(kv):
     为什么值得占一个响应头：**光看 usage.prompt_tokens 分不清「复用生效」和「换了个
     空会话」**——两种情况下 prefill 都可能等于全量。这里直接把会话号、是否 RESET、
     实际发出去多少字节摊开，出问题时不用猜。（也方便 Agent 侧观察缓存命中率。）
+
+    `wait` 是**排队等了多久**（秒，0 = 没等）。它不是锦上添花：客户端看到的"慢"往往是
+    这个数，而它此前在报文里**完全隐形**——页面上只看到 `1.57 tok/s`，看起来像模型慢，
+    实际是四个会话都闲着、请求在队列里干等（2026-09-18 用户就是这么报上来的）。
+    分母里带着它，速率就不是"解码速度"了，所以必须能单独看。
     """
     if not kv:
         return {}
-    return {"X-KV-Reuse": "session=%d; reset=%d; sent=%d; base=%d; full=%d"
+    return {"X-KV-Reuse": "session=%d; reset=%d; sent=%d; base=%d; full=%d; wait=%.1f"
                           % (kv["session"], 1 if kv["reset"] else 0, kv["sent"],
-                             kv["base"], kv["full"])}
+                             kv["base"], kv["full"], kv.get("wait", 0.0))}
 
 
 # ===========================================================================
@@ -1896,6 +1961,82 @@ def selftest(backend, pool):
           "fill-1 在 s%d 上跑着，仍在 bound 里" % s1_busy)
     pool.idle_ttl = saved_ttl
 
+    print("== 会话池：有人在等时按 contend_idle 收（NPU 空着不许让人干等）==")
+    # 用户 2026-09-18 报的："明明 NPU 没人使用，但是我输入问题后还是在等待"。
+    # 机制：**只有 idle_ttl 一条路决定谁腾会话**，而它必须调得很大（300s）才保得住多轮
+    # 对话的 KV 复用。于是四段对话把四个会话绑住后，第 5 段对话要等到某一段静默满 300s；
+    # 那段时间里四个会话全是 idle、NPU 一个 token 都没在算。板上实测等了 226.0s。
+    # 修法：**已经有请求非等不可**（进来发现一个空闲会话都没有）时，改用 contend_idle
+    # 这一级：只收**最闲的**那一段，且只收一个。没人排队时这一级完全不生效——常规路径
+    # 逐字节不变，这也是下面第一条断言要钉的。
+    saved_ttl3, saved_contend, saved_reaped3 = (pool.idle_ttl, pool.contend_idle,
+                                                pool.reaped)
+    pool.idle_ttl, pool.contend_idle = 999.0, 1.0
+    # ① 常规路径：还有空闲会话可用时，**不许**用第二级阈值把别人踢掉。
+    #    这里 fill-0 已经静默 30s（远超 contend_idle=1.0），但只要还有空会话，它就该
+    #    原地留着——它的 KV 是下一轮复用的本钱，为了"顺手腾地方"扔掉就是白花 prefill。
+    if pool.n >= 2:
+        arrange([None] * pool.n, dict(("fill-%d" % i, i) for i in range(pool.n - 1)))
+        pool.last_used["fill-0"] = time.time() - 30.0
+        lease_free = pool.acquire("newbie", render_messages([{"role": "user", "content": "甲"}]))
+        check("还有空闲会话时，第二级回收不生效（常规路径不变）",
+              pool.reaped == saved_reaped3 and "fill-0" in pool.bound,
+              "reaped %d->%d，fill-0 %s"
+              % (saved_reaped3, pool.reaped,
+                 "仍在 bound 里" if "fill-0" in pool.bound else "被踢了"))
+        pool.release(lease_free, "", True)
+
+        # ② 抢手时：一个空闲会话都没有 => 立刻收**最闲的那一段**，而且只收一个。
+        #    fill-0 静默 5s、fill-1 静默 60s：受害者必须是 fill-1。按静默挑而不是按
+        #    dict 顺序，行为才可预期（当初决定"不抢占"就是怕"谁被抢看到达顺序"）。
+        arrange([None] * pool.n, dict(("fill-%d" % i, i) for i in range(pool.n)))
+        pool.last_used["fill-0"] = time.time() - 5.0
+        pool.last_used["fill-1"] = time.time() - 60.0
+        # fill-2（如果有）正在跑：再闲也不许收——收走没用（它马上就还回来），还会让
+        # 正跑着的那一轮的 KV 被标成"内容未知"。
+        s_busy = pool.bound.get("fill-2")
+        if s_busy is not None:
+            pool.busy[s_busy] = True
+            pool.last_used["fill-2"] = time.time() - 120.0
+        t0q = time.time()
+        lease_c = pool.acquire("late-comer", render_messages([{"role": "user", "content": "乙"}]))
+        took = time.time() - t0q
+        check("一个空闲会话都没有时，立刻收最闲的那一段（不再等到 idle_ttl）",
+              lease_c.waited < 1.0 and "fill-1" not in pool.bound
+              and pool.reaped == saved_reaped3 + 1,
+              "等了 %.2fs，reaped %d->%d，拿到 s%d"
+              % (lease_c.waited, saved_reaped3, pool.reaped, lease_c.session))
+        check("收的是**最闲的**那一段（fill-1 静默 60s > fill-0 的 5s）",
+              "fill-0" in pool.bound, "bound=%s" % sorted(pool.bound))
+        check("只收一个（多收等于把几段对话的 KV 一起扔掉）", pool.reaped == saved_reaped3 + 1)
+        if s_busy is not None:
+            check("正在跑的会话即使在抢手时也不被收", "fill-2" in pool.bound,
+                  "fill-2 在 s%d 上跑着" % s_busy)
+            pool.busy[s_busy] = False
+        check("收走的那段对话回来必须 RESET（内容已归别人）",
+              lease_c.reset is True and pool.known[lease_c.session] is None,
+              "known=%r reset=%s" % (pool.known[lease_c.session], lease_c.reset))
+        pool.release(lease_c, "", True)
+    else:
+        print("  [SKIP] 只有 %d 个会话，跳过" % pool.n)
+
+    # ③ contend_idle=0 = 关掉这一级，退回老行为（排到 idle_ttl 为止）。留这个开关是
+    #    为了让"到底该不该抢"这件事可以被现场实验推翻，而不是写死在代码里。
+    if pool.n >= 2:
+        pool.contend_idle = 0.0
+        arrange([None] * pool.n, dict(("fill-%d" % i, i) for i in range(pool.n)))
+        pool.last_used["fill-1"] = time.time() - 600.0
+        try:
+            pool.acquire("waiter-2", render_messages([{"role": "user", "content": "丙"}]),
+                         timeout=0.3)
+            check("contend_idle=0 时退回老行为（只排队，不回收）", False, "竟然拿到了会话")
+        except BackendError:
+            check("contend_idle=0 时退回老行为（只排队，不回收）",
+                  "fill-1" in pool.bound and pool.reaped == saved_reaped3 + 1,
+                  "超时报错，绑定未变")
+    pool.idle_ttl, pool.contend_idle, pool.reaped = (saved_ttl3, saved_contend,
+                                                     saved_reaped3)
+
     # 无身份的请求（key=None）**不许记绑定**：记了的话 bound[None] 只有一条，所有匿名
     # 请求都会读到它，于是素不相识的几段对话被钉到同一个会话上互相等——正好是这个池子
     # 存在的意义的反面。这条是差点被我改丢的：原来的代码有 `if key is not None`，
@@ -2018,6 +2159,12 @@ def main():
                     help="一段对话静默超过这么多秒就把它占的会话收回给排队者"
                          "（0 = 不回收，等于第 N+1 段对话永远排队）。默认 %.0f"
                          % DEFAULT_IDLE_TTL)
+    ap.add_argument("--contend-idle", type=float, default=DEFAULT_CONTEND_IDLE,
+                    help="**已经有请求非等不可**（一个空闲会话都没有）时用的静默阈值："
+                         "静默超过这么多秒的对话所占的会话立刻收回给等的人，只收最闲的"
+                         "那一个。没人排队时仍按 --idle-ttl。默认 %.0f；0 = 关掉这一级"
+                         "（退回「一定要等到 --idle-ttl」）"
+                         % DEFAULT_CONTEND_IDLE)
     ap.add_argument("--queue-timeout", type=float, default=DEFAULT_QUEUE_TIMEOUT,
                     help="取不到会话时最多排队等这么多秒，超了返回 503。"
                          "默认 %.0f；应大于 --idle-ttl，否则会出现"
@@ -2054,10 +2201,14 @@ def main():
         print("[gateway] warning: --sessions %d but backend reports %d"
               % (args.sessions, backend.sessions), file=sys.stderr)
 
-    pool = SessionPool(backend, idle_ttl=args.idle_ttl, queue_timeout=args.queue_timeout)
+    pool = SessionPool(backend, idle_ttl=args.idle_ttl,
+                       queue_timeout=args.queue_timeout,
+                       contend_idle=args.contend_idle)
     print("[gateway] 会话调度: 最多 %d 段对话同时活跃，多的排队；"
-          "静默 %.0fs 回收，排队 %.0fs 未轮到则返回 503"
-          % (backend.sessions, pool.idle_ttl, pool.queue_timeout), flush=True)
+          "静默 %.0fs 回收（**有人在等时**降到 %.0fs，只收最闲的一段），"
+          "排队 %.0fs 未轮到则返回 503"
+          % (backend.sessions, pool.idle_ttl, pool.contend_idle,
+             pool.queue_timeout), flush=True)
     try:
         if args.selftest:
             return selftest(backend, pool)

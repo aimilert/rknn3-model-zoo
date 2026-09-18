@@ -217,28 +217,45 @@ function parseKV(s) {
 // "system + 首问"的内容摘要认对话，这样造出来的对话**认不出也关不掉**（只能从 /v1/pool
 // 读原始 key 再关），会一直占着会话到 IDLE_TTL 超时。这一页四个面板本来就该是四段对话，
 // 给它一个稳定的名字，是谁、占着哪几个会话、要不要放掉，就都是明面上的事了。
-async function streamChat(messages, onDelta, convId) {
+// onWait(elapsed)：**响应头还没回来**时每 200ms 叫一次。
+// 必须有它：响应头是在网关拿到会话之后才发的，所以"在队列里排队"这段时间里
+// `fetch` 还没 resolve、一个字节都没到——页面上只剩一个转圈，用户看到的就是
+// "NPU 明明没人用，我却在干等"（2026-09-18 就是这样报上来的）。有了这个回调，
+// 等待期间屏幕上写的就是"等待空闲会话 12.3s"，而不是沉默。
+async function streamChat(messages, onDelta, convId, onWait) {
   const t0 = performance.now();
   let ntok = 0, nchunk = 0, answer = "";
   const headers = { "Content-Type": "application/json" };
   if (convId) { headers["X-Conversation-Id"] = convId; }
-  const res = await fetch(API + "/v1/chat/completions", {
-    method: "POST",
-    headers: headers,
-    body: JSON.stringify({
-      model: MODEL,
-      messages: messages,
-      max_tokens: maxtok(),
-      stream: true,
-      stream_options: { include_usage: true },
-      chat_template_kw: { enable_thinking: document.getElementById("think").checked },
-    }),
-  });
+  const tick = onWait
+    ? setInterval(function () { onWait((performance.now() - t0) / 1000); }, 200)
+    : null;
+  let res;
+  try {
+    res = await fetch(API + "/v1/chat/completions", {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify({
+        model: MODEL,
+        messages: messages,
+        max_tokens: maxtok(),
+        stream: true,
+        stream_options: { include_usage: true },
+        chat_template_kw: { enable_thinking: document.getElementById("think").checked },
+      }),
+    });
+  } finally {
+    // 头一到就停：接下来的时间就是真的在跑模型了，由 onDelta 那条线接管。
+    if (tick !== null) { clearInterval(tick); }
+  }
   if (!res.ok) {
     throw new Error("HTTP " + res.status + " " + (await res.text()).slice(0, 200));
   }
   // 自定义响应头能被 JS 读到，靠网关的 Access-Control-Expose-Headers
   const kv = parseKV(res.headers.get("X-KV-Reuse") || "");
+  // 网关自己记的排队时长（秒）。拿它而不是上面那个 tick 的终值：网关是**真在队列里**
+  // 计时的一方，tick 还含了 TCP/浏览器那一小段。
+  const waited = Number(kv.wait || 0) || 0;
 
   const reader = res.body.getReader();
   const dec = new TextDecoder();
@@ -277,7 +294,7 @@ async function streamChat(messages, onDelta, convId) {
   const el = (performance.now() - t0) / 1000;
   const tok = ntok || nchunk;          // usage 没到就退化成数出来的块数
   return { tok: tok, el: el, rate: tok / el, text: answer, kv: kv, exact: !!ntok,
-           finish: finish };
+           finish: finish, waited: waited };
 }
 
 // 问完了就主动把会话还回去（POST /v1/conversations/close）。
@@ -332,7 +349,12 @@ async function send(p) {
       } else {
         setStat(p, "⏳ " + el.toFixed(1) + "s · " + n + " 块");
       }
-    }, "web-" + (p.id + 1));
+    }, "web-" + (p.id + 1), function (el) {
+      // 还没拿到会话。**这里一定要说话**：这几秒到几分钟里页面上本来只有一个转圈，
+      // 看着像卡死，而真相是"四个会话都被别的对话占着"。写清楚是"等会话"还是
+      // "等模型"，用户才不会把它当成"板卡坏了/网络断了"。
+      setStat(p, "⏳ " + el.toFixed(1) + "s · 等待空闲会话…（会话都被别的对话占着）");
+    });
     const kv = r.kv;
     p.kvSession = kv.session;
     if (kv.session !== undefined) { p.sess.textContent = "会话 " + kv.session; }
@@ -340,8 +362,15 @@ async function send(p) {
     // 复用到底有没有生效只看 base：base 是**真正被复用的前缀长度**。
     // 别拿 reset 当判据——首次对话落在"已知为空"的会话上时是 reset=0 但 base=0，
     // 一个字都没省；照 reset 标"（复用）"就是骗人（第一版就是这么写的）。
+    // 排过队就把排队的时长单独标出来：`el` 是端到端的，分母里含排队，所以那会儿算出来的
+    // `tok/s` **不是解码速度**（226s 排队 + 3s 生成 = 屏幕上写着 1.57 tok/s，看着像模型慢）。
+    // 把两段时间拆开摆着，是这一行最该说清楚的事。
     setStat(p, "<b>" + r.rate.toFixed(2) + " tok/s</b> · " + r.tok + " tok · "
-            + r.el.toFixed(1) + "s · 会话 " + (kv.session !== undefined ? kv.session : "?")
+            + r.el.toFixed(1) + "s"
+            + (r.waited > 0.05
+               ? "（其中排队 " + r.waited.toFixed(1) + "s，实际推理 "
+                 + Math.max(0, r.el - r.waited).toFixed(1) + "s）" : "")
+            + " · 会话 " + (kv.session !== undefined ? kv.session : "?")
             + (kv.full ? " · KV " + kv.sent + "/" + kv.full
                        + (Number(kv.base) > 0
                           ? "（复用 " + kv.base + "，省 "
@@ -383,18 +412,24 @@ function updateGlobal() {
 // 那一批里它会直接不发）。所以这里单独发一次请求量数，量完就丢。
 //
 // 但"丢"要丢得干净：量完必须 close。只有 4 个会话，基线占着 1 个不还，点「②」时
-// 四路里就有一路拿不到会话，会排到 IDLE_TTL 超时——看起来就是"某一路卡住不动"，
-// 而三条腿的画面最容易被当成"并发坏了"。
+// 四路里就有一路拿不到会话——**改前**它会一路排到 IDLE_TTL（300s）超时，看起来就是
+// "某一路卡住不动"，而三条腿的画面最容易被当成"并发坏了"。2026-09-18 起网关多了一级
+// 「有人在等就按 contend_idle 收最闲的那段对话」，这种等待被压到秒级，但**基线照样该
+// 还就得还**：交还了才是满 4 路，不然「②」永远只有三路命中 KV。
 document.getElementById("baseline").addEventListener("click", async function () {
   if (panels.some(function (p) { return p.streaming; })) { return; }
   const el = document.getElementById("gstats");
   el.textContent = "单路基线测量中…（约 20 秒）";
   try {
     const r = await streamChat([{ role: "user", content: "用一句话介绍杭州。" }],
-                               function () {}, "web-baseline");
+                               function () {}, "web-baseline", function (w) {
+      el.textContent = "单路基线：等待空闲会话 " + w.toFixed(1) + "s…";
+    });
     lastSingleRate = r.rate;
     el.innerHTML = "单路基线：<b>" + r.rate.toFixed(2) + " tok/s</b>（" + r.tok
-                 + " tok / " + r.el.toFixed(1) + "s）→ 现在点「② 4 路同时提问」";
+                 + " tok / " + r.el.toFixed(1) + "s"
+                 + (r.waited > 0.05 ? "，其中排队 " + r.waited.toFixed(1) + "s" : "")
+                 + "）→ 现在点「② 4 路同时提问」";
   } catch (err) {
     el.textContent = "基线测量失败：" + err.message;
   } finally {
@@ -422,6 +457,14 @@ document.getElementById("all").addEventListener("click", async function () {
   const agg = total / wall;
   let html = ok.length + " 路并发：合计 <b>" + total + "</b> tok / 墙钟 "
            + wall.toFixed(1) + "s → 聚合 <b>" + agg.toFixed(2) + " tok/s</b>";
+  // 有哪一路排过队，这个聚合值和下面的伸缩比就**不是并发性能**（墙钟里混进了等待），
+  // 必须当场说破——不然一个"某一路没拿到会话"的现场会被读成"并发退化"。
+  const q = ok.filter(function (r) { return r.waited > 0.05; });
+  if (q.length) {
+    html += " · <span style='color:var(--warn)'>有 " + q.length + " 路排过队（最多 "
+          + Math.max.apply(null, q.map(function (r) { return r.waited; })).toFixed(1)
+          + "s），伸缩比不可引用</span>";
+  }
   if (lastSingleRate) {
     html += " · <span style='color:var(--warn)'>伸缩 "
           + (agg / lastSingleRate).toFixed(2) + "×</span>（基线 "
