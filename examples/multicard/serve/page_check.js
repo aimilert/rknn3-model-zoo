@@ -40,6 +40,15 @@
 //     三块加起来不到一屏。这类坏法**别的检查一条都照不到**：答案照样对、资源条照样刷、
 //     会话照样还，只有把页面真的渲染出来才看得见。桩 DOM 没有排版引擎，所以这一节
 //     解析 `<style>` 源码判高度关系（注释先剥掉，见那一段）。
+//  16. 底部七块卡片**一样高、两条底边齐**（2026-09-20 加）—— 用户报"高低不平"。等高是
+//     三步叠出来的（外层拉伸 / 子网格 align-content 拉伸 / 卡片被拉满），**缺任何一步都
+//     不齐，而每一步单独看都像是对的**；列数还得写死，auto-fit 会在 1500px 以下自己折行
+//     （1366 折成 3+1、1280 折成 2+1），一折行高度立刻对不上、整块还更高。「服务」那五行
+//     改两列同样只靠一个类名联系着 JS 与 CSS。这些坏法**功能性检查一条都照不到**：
+//     答案照样对、会话照样还、资源条照样刷。
+//  17. 宽度不够时该"整段折"、不该"断词"、更不该溢出（2026-09-20 加）—— 温度那一行在
+//     1600/1366/1280 上真的**溢出过卡片边框**（`.m` 是 nowrap，文字压在隔壁那张卡上），
+//     而"内存"那一行会在自己内部断成四截。改法是让行可折、让尾注成为一个整体。
 //
 // 用法（**必须在 serve/ 目录下跑**，它按相对路径读 demo_4chat.html）：
 //   node page_check.js http://<板卡IP>:18280
@@ -686,7 +695,9 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
       gateway: { busy: 1, bound: 2, dead: 0, waiting: 0, uptime_s: 3600 },
     };
     const run = (d) => { ctx.__t.renderSys(d); return ctx.__t.sysHtml(); };
-    const txt = (d) => stripHtml(run(d));
+    // 温度那一行的格间空格是**不折空格** ` `（普通空格会落在折行点上被吃掉，
+    // 屏幕上的"npu 81°· bigcore0"就贴上去了）——读文本的断言先把它看成普通空格。
+    const txt = (d) => stripHtml(run(d)).replace(/\u00a0/g, " ")   // 不折空格;
     const chk2 = (ok, msg) => { if (!ok) { console.log("  FAIL: " + msg); bad2++; } };
 
     const t = txt(SYS_FIX);
@@ -963,6 +974,105 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
       chk2(decl(".syssec .swrap", "grid-template-columns", "@media") === "1fr",
            "窄屏该退回上下两块：媒体查询里没有 `grid-template-columns:1fr` 的话，" +
            "窄窗口下两栏各自都放不下一整行（四张卡会一列排下去）");
+
+      // ---- 2026-09-20 第三次改：七块卡片**一样高、两条底边齐**（用户报"高低不平"）----
+      // 等高是**三步叠出来的**，缺任何一步都不齐，而每一步单独看都像是对的：
+      //   ① 外层 `.swrap` 拉伸两个子网格 —— 写成 `start` 就退回"各按自己内容长"
+      //   ② 子网格 `.sgrid` 的 `align-content` —— **最容易漏**：单行网格在 `start` 下
+      //      只占内容高，外层的 stretch 根本传不到卡片上
+      //   ③ 卡片 `.sblock` 被拉满这一行（默认 `align-self:stretch`，别写成 flex-start）
+      // 这三条**没有任何功能检查能覆盖**：不齐的时候数字全对、会话照还、资源条照刷。
+      chk2(decl(".syssec .swrap", "align-items") === "stretch",
+           "两栏该等高（.swrap 的 align-items 要 stretch）：写成 start 的话左边三块与" +
+           "右边四张卡各按自己内容长，两条底边差 48px（实测 1600 上 771 vs 723）——" +
+           "用户报的就是这个。现在是 " + decl(".syssec .swrap", "align-items"));
+      chk2(decl(".syssec .sgrid", "align-content") === "stretch",
+           "**这一步最容易漏**：单行的网格在 align-content:start 下只占内容高，外层" +
+           "stretch 传不到卡片上，七张卡照样不等高。现在是 " +
+           decl(".syssec .sgrid", "align-content"));
+      chk2((decl(".sblock", "align-self") || "stretch") === "stretch",
+           "卡片该被拉到整行高（.sblock 的 align-self 别写成 flex-start）：" +
+           decl(".sblock", "align-self"));
+      // 等高之后内容是**贴顶**的：齐平的是底边、不是里面的行，内容少的卡片（热区）多出来
+      // 的空白全留在底部。不这么做的话七块的"块头 + 第一行数据"就不在一条横线上。
+      chk2(decl(".sblock", "display") === "flex" &&
+           decl(".sblock", "justify-content") === "flex-start",
+           "等高之后内容要贴顶（.sblock 该是 flex 列 + justify-content:flex-start）：" +
+           decl(".sblock", "display") + " / " + decl(".sblock", "justify-content"));
+
+      // 列数**写死**，不许 auto-fit / auto-fill：它会在 1500px 以下自己折行——实测
+      // 1366 上右栏折成 3+1、1280 上左栏折成 2+1，一折行两组高度就再也对不上，
+      // 而且整块反而更高（245→293px）。写死之后卡片只是变窄，永远是一条线。
+      chk2(cols.indexOf("auto-fit") < 0 && cols.indexOf("auto-fill") < 0,
+           "两栏的列数要写死，不能用 auto-fit / auto-fill（它自己折行、高度立刻对不上）：" + cols);
+      chk2((decl(".syssec .sg-host", "grid-template-columns") || "").indexOf("repeat(3") === 0 &&
+           (decl(".syssec .sg-cards", "grid-template-columns") || "").indexOf("repeat(4") === 0,
+           "左三右四要写死（3:4 正好让七张卡一样宽）：" +
+           decl(".syssec .sg-host", "grid-template-columns") + " / " +
+           decl(".syssec .sg-cards", "grid-template-columns"));
+
+      // 资源块**不许被压小**。shrink=1（原来是 `flex:0 1 auto`）时，矮屏上多出来的高度
+      // 在它和 `main` 之间**按基准尺寸分摊**，于是它掉到比 `max-height` 还小——实测
+      // 1366×768 下 249px 的内容只分到 185px，底部那句"NPU 是卡级忙时占比"的说明被切掉，
+      // 而那句正是防止屏幕上两个百分数被当成硬件读数读走的。改成 0 之后它的高度只有两种
+      // 可能：装得下就按内容、装不下就正好卡在 max-height，要挤全部由 `main` 让。
+      const sysFlex = (decl(".syssec", "flex") || "").split(/\s+/);
+      chk2(sysFlex[0] === "0" && sysFlex[1] === "0",
+           "资源块不该被 flex 压小（flex:0 0 auto）：" + decl(".syssec", "flex"));
+
+      // 「服务」那五行的两列（用户 2026-09-20 点名要的）。和上面 swrap 一样，这一条钉的是
+      // JS 与 CSS 的耦合：类名两边唯一的联系，谁单方面改名，页面照跑照对，只是五行又变回
+      // 一列、这一块重新变成七块里最高的那块（整条线的高度就由它决定）。
+      chk2(/class="svc"/.test(sysHtmlFix),
+           "「服务」那一块该包一层 .svc（没有它五行退回一列、这一块重新变成最高的）");
+      chk2(decl(".syssec .svc", "display") === "grid" &&
+           (decl(".syssec .svc", "grid-template-columns") || "").indexOf("repeat(2") === 0,
+           "「服务」该是两列网格：" + decl(".syssec .svc", "grid-template-columns"));
+      // 但窄屏要退回一列，而且**两头都有界**。忘了下界（min-width:1181px）的话，1180 以下
+      // 又退回上下两组、卡片变回 360px 宽、两列完全放得下，单列白把这一块顶高 48px
+      // （实测 217 → 235）。
+      const svcMedia = rules.filter(function (r) {
+        return r.sel.split(",").map(function (s) { return s.trim(); })
+          .indexOf(".syssec .svc") >= 0 && /grid-template-columns\s*:\s*1fr/.test(r.body);
+      }).map(function (r) { return r.media; });
+      chk2(svcMedia.length === 1 && /max-width:1500px/.test(svcMedia[0]) &&
+           /min-width:1181px/.test(svcMedia[0]),
+           "「服务」退回一列那条媒体查询要两头都有界（max-width:1500px 且 min-width:1181px）：" +
+           JSON.stringify(svcMedia));
+
+      // ---- 宽度不够时的两种"折"（2026-09-20 第三次改的另一半）----
+      // 温度那一行是七块里唯一一条**长度不设上界的**：三个热区名 + 度数在 1920 上是 190px，
+      // 卡片一窄到 207px 就顶出去了。`.m` 是 nowrap，于是文字**溢出卡片边框、压在隔壁
+      // 那张卡上**（实测 1600 / 1366 / 1280 上都是这个症状）。改法不是缩字号，是让它折行。
+      chk2(/class="m therm"/.test(sysHtmlFix) && /class="ti"/.test(sysHtmlFix),
+           "温度那一行该是会折的 .therm + 不折的 .ti（热区名和它的度数不许被拆开）");
+      chk2(decl(".syssec .m.therm", "display") === "inline-flex" &&
+           decl(".syssec .m.therm", "flex-wrap") === "wrap" &&
+           (decl(".syssec .m.therm", "flex") || "").indexOf("1 1") === 0,
+           "会折的那一行要写成会折的 inline-flex、且拿得到行宽（flex:1 1 auto + min-width:0，" +
+           "flex 项默认 min-width:auto 会硬撑到内容宽、撑出边框）：" +
+           decl(".syssec .m.therm", "display") + " / " + decl(".syssec .m.therm", "flex"));
+      chk2(decl(".syssec .srow", "flex-wrap") === "wrap",
+           "资源行要允许折（.srow 的 flex-wrap:wrap）：窄卡片上尾注放不下时，不折行它会" +
+           "在**自己内部**一个词一个词地断——实测 1280 上「内存」那一行断成四截、74px 高");
+      // 断言要**指到具体那一段**（带字节数/带 title）而不是泛泛地找 `class="m dim2"`：
+      // 页面上有三处尾注，泛泛地找的话改坏其中一处、另外两处照样命中，这条就成了空转的。
+      chk2(/<span class="m dim2">9\.6 GB \/ 16\.0 GB<\/span>/.test(sysHtmlFix),
+           "内存那一行的字节数该标 .m（white-space:nowrap）：光有折行还不够，它得是个" +
+           "整体、整段挪到下一行去（否则就是在自己内部断成四截）");
+      chk2(/<span class="m dim2" title="全卡最紧那个 node/.test(sysHtmlFix),
+           "RK1828 的 node 那一行同理（尾注要整段折，不许断词）");
+
+      // 分隔符必须是**真文本**（写在每一格的开头），不能是 CSS 的 `content:"·"`：生成的内容
+      // 复制不出来、读屏软件也时常不念——屏幕上明明是"npu 81° · bigcore0 51°"，复制下来
+      // 却是"npu 81°bigcore0 51°"。同一个文件里别处为"标签与值之间那个空格"写过同样的理由。
+      // ⚠️ 这一条**只有读页面真跑出来的文本才查得到**（桩 DOM 里 `::after` 根本不生成文本），
+      // 所以它跟着下面那句"热区按温度排序"的断言一起放在夹具那一节，这里只判它没被搬回 CSS。
+      chk2(/<span class="ti">· /.test(sysHtmlFix),
+           "温度那一行的分隔符该是**文本**（写在每一格开头），不是 CSS 生成的 content：" +
+           "生成的内容复制不出来、读屏软件也时常不念");
+      chk2(!/\.therm[^{,]*\{[^}]*content\s*:/.test(styleSrc),
+           "别把温度那一行的分隔符搬回 CSS 的 content——那样复制出来就没有分隔符了");
 
       // 标题与两条状态行锁住高度。少了这个，长句子会被对话区按 flex-shrink 压扁换行。
       const squeezed = ["header", ".capline", ".sumline"].filter(function (s) {

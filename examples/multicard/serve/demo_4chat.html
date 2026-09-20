@@ -120,39 +120,83 @@
      RK1828 那几块来自后端的一包原子量、带"多久之前采的"。底部那句 note 不是客套话：
      RK1828 是 PCIe 设备（驱动 rkep），主机侧既没有 hwmon 也没有 NPU 利用率查询接口，
      不写出来屏幕上那两个百分数会被当成硬件读数读走。
-     高度上它**钉在页面底部**（`flex:0 1 auto` = 按内容长）：屏幕够高时对话区自然把它
-     剩下的都吃掉；屏幕矮时这条 `max-height` 封顶，超出的部分它**在自己里面滚**，
-     既不把对话区挤扁，也不会把内容顶出屏幕。
+     高度上它**钉在页面底部**（`flex:0 0 auto` = 按内容长、**且不许被压小**）：屏幕够高时
+     对话区自然把它剩下的都吃掉；屏幕矮时这条 `max-height` 封顶，超出的部分它**在自己
+     里面滚**，既不把对话区挤扁，也不会把内容顶出屏幕。
+     ⚠️ 2026-09-20 把 `flex-shrink` 从 1 改成 0：原来它和 `main` 都是 `1`，矮屏上多出来的
+     高度按基准尺寸**在两块之间分摊**，于是它被压到**比 `max-height` 还小**（实测 1366×768
+     下 249px 的内容只分到 185px），底部那句"NPU 是卡级忙时占比"的说明被切掉了——而那句
+     正是防止屏幕上两个百分数被当成硬件读数读走的。改成 0 之后它的高度只有两种可能：
+     装得下就按内容（1600 上 221px）、装不下就正好卡在 `max-height`（1366 上 227.8px），
+     要挤就全部由 `main` 让（`main` 本来就是 `min-height:0` + 自己滚的那个）。
      **34vh 不是"目标比例"，是矮屏的保险**：并排之后这一块实测 250px，1080p（可视
      1010px）上占 25%、1440p 上占 17%，正是用户要的 1/5~1/4；只有可视高度掉到 735px
      以下时才轮到这条上限起作用（那时它滚，而不是继续挤压对话区）。 */
-  .syssec { flex:0 1 auto; max-height:34vh; overflow:auto;
+  .syssec { flex:0 0 auto; max-height:34vh; overflow:auto;
             margin:0 12px 12px; background:var(--panel); border:1px solid var(--line);
             border-radius:10px; padding:12px 14px 13px; }
   .syssec .shead { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
                    margin:0 0 11px; }
   .syssec .shead h2 { margin:0; font-size:13px; font-weight:600; letter-spacing:.3px; }
   .syssec .shead .snote { color:#5f6878; font-size:11px; }
-  /* 两块网格**左右并排**（见 renderSys 里那段：上下两行要 376px，并排只要 250px）。
-     左栏给"RK3588 + 服务"、右栏给四张卡；两栏各自的块宽由下面两条 `minmax` 定。
-     `min-width` 那两个字很要紧：卡片块窄到 168px 就会换行（块头那行 "RK1828 #0 ctx 8192"
-     一行要 134px），而块一变高，右栏就比左栏高，并排省下来的高度又还回去了。
-     窄屏（<1180px）退回上下两块——那点宽度分两栏，每栏都放不下完整的一行。 */
-  .syssec .swrap { display:grid; gap:10px; align-items:start;
-                   grid-template-columns:minmax(600px,1fr) minmax(0,1fr); }
-  .syssec .sgrid { display:grid; gap:10px; align-content:start; }
-  .syssec .sg-host { grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
-  .syssec .sg-cards { grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); }
-  @media (max-width:1050px) { .syssec .swrap { grid-template-columns:1fr; } }
+  /* 七块卡片**在同一个网格里、一条线上、一样高**（2026-09-20 第二次改）。
+     原来两栏各自按内容长（`align-items:start` + `align-content:start`），于是右侧四张卡
+     比左侧三块矮 48px，两条底边不齐——用户报的就是这个（"高低不平"）。
+     改法三步，缺一步都不齐：
+       ① 外层 `.swrap` 的 `align-items` 用**默认的 stretch**（原来是 start）⇒ 两个子网格
+          等高，高度 = 左三块与右四块里**最高的那一块**；
+       ② 子网格 `.sgrid` 的 `align-content` 也要 stretch（原来是 start）——**这一条最容易漏**：
+          单行的网格在 `align-content:start` 下只占内容高，外层的 stretch 传不到卡片上；
+       ③ `.sblock` 默认 `align-self:stretch`，于是每块都被拉满这一行。
+     列数**写死**（左 3 右 4、都用 `minmax(0,1fr)`）而不是 `auto-fit`：auto-fit 会在
+     1500px 以下自己折行（实测 1366 上右栏折成 3+1、1280 上左栏折成 2+1），一折行
+     两组的高度就再也对不上，而且整块反而更高（245→293px）。写死之后卡片只是变窄，
+     永远是一条线。左右的比例取 3:4，正好让七张卡**一样宽**。
+     窄屏（<1180px）退回上下两组——那时 7 列每张只有 160px 上下，数字会挤成两行。 */
+  .syssec .swrap { display:grid; gap:10px; align-items:stretch;
+                   grid-template-columns:minmax(0,3fr) minmax(0,4fr); }
+  .syssec .sgrid { display:grid; gap:10px; align-content:stretch; }
+  .syssec .sg-host { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .syssec .sg-cards { grid-template-columns:repeat(4,minmax(0,1fr)); }
+  @media (max-width:1180px) { .syssec .swrap { grid-template-columns:1fr; } }
   /* 一块 = 一样东西。**边框是刻意的**：四张卡各自成块，屏幕上立刻能数出"四张卡"，
-     而排成一行时它们看起来是一条数据线。 */
+     而排成一行时它们看起来是一条数据线。
+     `display:flex` + `justify-content:flex-start` 是为了等高之后内容仍然**贴顶**：
+     齐平的是底边，不是里面的行；内容少的那块（热区只有一行温度）多出来的空白全留在
+     底部，七块卡片的块头和第一行数据因此横向对齐成一排。 */
   .sblock { border:1px solid var(--line); border-radius:9px; background:#12151b;
-            padding:9px 11px 10px; min-width:0; font-size:12px; color:var(--dim); }
+            padding:9px 11px 10px; min-width:0; font-size:12px; color:var(--dim);
+            display:flex; flex-direction:column; justify-content:flex-start; }
   .sblock .bhead { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;
                    margin-bottom:8px; }
+  /* `flex-wrap:wrap` + `row-gap:2px` 是给**窄卡片**准备的：一行里最后那段说明文字
+     （"6.3 GB / 15.6 GB"、"· 开机 3d 4h"）在卡片只有 160px 宽时放不下，不折行的话
+     它会在**自己内部**一个词一个词地折——实测 1280 上"内存"那一行折成了 40+34 两截、
+     整行 74px 高（四行），屏幕上是一列断词。给它 `.m`（`white-space:nowrap`）之后它是
+     一个整体，再允许行折，它整段挪到第二行去。 */
   .syssec .srow { display:flex; align-items:center; gap:9px; min-width:0;
-                  font-variant-numeric:tabular-nums; }
+                  flex-wrap:wrap; row-gap:2px; font-variant-numeric:tabular-nums; }
   .syssec .srow + .srow { margin-top:7px; }
+  /* "服务"那一块里的五行改**两列**（后端/会话/排队/数据/网关）：它是七块里行数最多的一块，
+     等高之后正是它把整条线的高度顶上去。两列之后 5 行变 3 行，条子的高度就由"跟它一样高"
+     变成"跟四张卡一样高"了。
+     行距交给 grid 的 gap（`7px 9px` = 与上面 `.srow + .srow` 同一档），所以要把那条
+     margin 抵消掉——两套间距叠在一起会变成 14px。 */
+  .syssec .svc { display:grid; grid-template-columns:repeat(2,minmax(0,1fr));
+                 gap:7px 9px; }
+  .syssec .svc .srow + .srow { margin-top:0; }
+  /* 格子里那点余量再抠 5px：1600 上一格 89.5px，而"网关 已跑 8m"要 89px，差一点就折行。 */
+  .syssec .svc .srow { gap:7px; }
+  .syssec .svc .srow .lab { width:29px; }
+  /* 但**窄屏上两列反而更糟**：七张卡片并排、每张掉到 160px 上下时每格只有 ~65px，
+     「数据 0.0s 前」装不进一格就自己折成两行，五个格子一共折出六行——比一列五行还高
+     （实测 1280 上 210px vs 192px）。所以这一段退回一列。1500 是实测的转折点：1600 上
+     两列 3 行、一列 5 行；1366 上两列已经折到 5 行以上，一列赢。
+     下界 1181px **不能省**：再窄就退回上下两组，卡片又变回 360px 宽、两列完全放得下，
+     那时单列反而把这一块顶高 48px（实测 1180 上 235px vs 187px）。 */
+  @media (max-width:1500px) and (min-width:1181px) {
+    .syssec .svc { grid-template-columns:1fr; }
+  }
   /* 标签固定宽度，几行的数字才会对齐成一列；`flex:none` 保证它不被条子挤扁。 */
   .syssec .srow .lab { flex:none; width:32px; color:#5f6878; font-size:11px; }
   /* 条子**撑满行宽**（不再是 52px 的小方块）：一块里只有一条，宽一点才能一眼看出
@@ -161,6 +205,21 @@
   .syssec b { color:var(--fg); font-weight:600; }
   .syssec .tag { font-size:10px; letter-spacing:.6px; color:#5f6878; text-transform:uppercase; }
   .syssec .m { white-space:nowrap; }
+  /* 温度那一行是七块里唯一一条**长度不设上界的**：三个热区名 + 各自的度数
+     （"温度 soc 32° · bigcore0 32° · bigcore1 32° +4"）在 1920 上是 190px，塞得进 255px
+     的卡；卡片一窄到 207px 就顶出去了——`.m` 是 `nowrap`，于是文字**溢出卡片边框**
+     压在隔壁那张卡上（实测 1600 / 1366 / 1280 上都是这个症状）。
+     改法不是缩字号，是**允许它折行**：整条改成会折的 inline-flex，每个热区各自成为一个
+     不折的格（`.ti`，名字和度数永远在一起）。
+     ⚠️ 分隔符 `·` 是**真文本**（写在每一格的开头，见 `thermHtml`），不是这里的 `::after`
+     ——生成的内容复制不出来、读屏软件时常也不念，屏幕上明明是"npu 81° · bigcore0 51°"、
+     复制下来却成了"npu 81°bigcore0 51°"。**这一条的检查在 page_check.js 里**（它读的是
+     页面真跑出来的文本），别在这里加 `content:"·"`。
+     它同时是 `.srow` 里唯一的孩子，所以要 `flex:1 1 auto; min-width:0` 才拿得到行宽、
+     才有得折（flex 项默认 `min-width:auto`，会硬撑到内容宽、撑出边框）。 */
+  .syssec .m.therm { flex:1 1 auto; min-width:0; display:inline-flex;
+                     flex-wrap:wrap; align-items:baseline; row-gap:2px; }
+  .syssec .therm .ti { white-space:nowrap; }
   .syssec .dim2 { color:#6b7488; }
   .syssec .off { color:#5f6878; }
   .syssec b.warn, .syssec .m.warn { color:var(--warn); }
@@ -480,15 +539,31 @@ function thermHtml(list) {
   const full = list.map(function (t) {
     return shortLabel(t.label) + " " + (typeof t.c === "number" ? t.c.toFixed(0) + "°" : "—");
   }).join(" · ");
-  const head = all.slice(0, THERM_SHOW).map(function (t) {
+  const inner = all.slice(0, THERM_SHOW).map(function (t) {
     const c = t && t.c;
     const cls = (typeof c !== "number") ? "" : (c >= 80 ? " crit" : (c >= 65 ? " warn" : ""));
     return '<b class="' + cls.trim() + '">' + esc(shortLabel(t.label)) + " " +
            (typeof c === "number" ? c.toFixed(0) + "°" : "—") + "</b>";
-  }).join(" · ");
+  });
   const rest = all.length - THERM_SHOW;
-  return '<span class="m" title="全部热区：' + esc(full) + '">温度 ' + head +
-         (rest > 0 ? ' <span class="dim2">+' + rest + "</span>" : "") + "</span>";
+  // 一格 = "· soc 32°"（第一格是"温度 soc 32°"）。**"温度"跟着第一格走**：它俩不是一个
+  // 整体，折在中间会变成孤零零的"温度"两个字占一行。
+  const cells = inner.map(function (s, i) {
+    return '<span class="ti">' + (i ? "· " : "温度 ") + s + "</span>";
+  });
+  if (rest > 0) { cells.push('<span class="ti dim2">+' + rest + "</span>"); }
+  // 分隔符是**真文本、不是 CSS 生成的**（`::after` 那种写法复制不出来、读屏软件也时常
+  // 不念，屏幕上明明是"npu 81° · bigcore0 51°"、复制下来却是"npu 81°bigcore0 51°"；
+  // 同一个文件里别处为"标签与值之间那个空格"写过同样的理由）。所以它写在**后一格的开头**
+  // ——折行时下一行以"· "起头，是列表的常规长相。
+  // 每格尾巴补一个**不折空格**，转义写成 `\u00a0`——**别把那个字符直接敲进来**：
+  // 它在编辑器里和普通空格长得一模一样，下一个人改这一行时会当空格删掉，屏幕上的
+  // "npu 81° · bigcore0"就悄悄变成"npu 81°· bigcore0"。普通空格还有一个毛病：
+  // 它会落在折行点上被吃掉，贴成同一个样子。
+  return '<span class="m therm" title="全部热区：' + esc(full) + '">' +
+         cells.map(function (s, i) {
+           return (i < cells.length - 1) ? s.replace("</span>", "\u00a0</span>") : s;
+         }).join("") + "</span>";
 }
 
 // 一样东西 = 一块。**块内一行一个指标**（标签 + 数 + 条子），不是把四张卡和主机状态
@@ -536,12 +611,14 @@ function renderSys(d) {
   let hostBody =
     sRow("CPU", "<b>" + fmtPct(cpu.pct) + "</b>", coresHtml(cpu.per_core)) +
     sRow("内存", "<b>" + fmtPct(mem.used_pct) + "</b>", bar(mem.used_pct, 80, 92) +
-      (memTotal && memUsed ? ' <span class="dim2">' + memUsed + " / " + memTotal + "</span>" : ""));
+      // `.m`（不折）在这一段上是必须的，见 CSS 里 `.srow` 那条：不加它这一行会在
+      // "5.7 GB /"、"15.6"、"GB" 之间断成四行。
+      (memTotal && memUsed ? ' <span class="m dim2">' + memUsed + " / " + memTotal + "</span>" : ""));
   const load = (cpu.loadavg && cpu.loadavg.length) ? cpu.loadavg[0].toFixed(2) : null;
   const up = (typeof host.uptime_s === "number") ? fmtDur(host.uptime_s) : null;
   if (load || up) {
     hostBody += sRow("负载", load ? "<b>" + load + "</b>" : '<span class="off">—</span>',
-                     up ? '<span class="dim2">· 开机 ' + up + "</span>" : "");
+                     up ? '<span class="m dim2">· 开机 ' + up + "</span>" : "");
   }
   blocks.push(sBlock('<span class="tag">RK3588</span> <span class="dim2">本机现读</span>',
                      hostBody));
@@ -569,7 +646,10 @@ function renderSys(d) {
   if (typeof gw.uptime_s === "number") {
     svc += sRow("网关", '<span class="dim2">已跑 ' + fmtDur(gw.uptime_s) + "</span>");
   }
-  blocks.push(sBlock('<span class="tag">服务</span>', svc));
+  // 五行排成两列（见 CSS 里 `.svc` 那段）：这一块原来是七块里最高的，等高之后整条线的高度
+  // 就由它决定；两列之后它与四张卡一样高。**顺序是"先左右后上下"**（后端/会话 一行，
+  // 排队/数据 一行，网关 单独一行），所以屏幕上从左到右、从上到下读仍是原顺序。
+  blocks.push(sBlock('<span class="tag">服务</span>', '<div class="svc">' + svc + "</div>"));
 
   // ---- RK1828：后端 STAT 帧。**一张卡一块**（原来四张卡挤在同一行里）----
   // 单开一个数组而不是接在 blocks 后面：没卡的时候那一块"读不到"也要画出来，
@@ -598,7 +678,7 @@ function renderSys(d) {
     // 后面那个 `|| "—"` 是第二道保险——fmtBytes 读不到时返回 null，少了它屏幕上会
     // 印出字面的 "node null"。
     if (typeof c.node_min_free === "number" && c.node_min_free > 0) {
-      body += sRow("node", '<span class="dim2" title="全卡最紧那个 node 还剩多少——' +
+      body += sRow("node", '<span class="m dim2" title="全卡最紧那个 node 还剩多少——' +
         '这是最先撞墙的一格">' + (fmtBytes(c.node_min_free) || "—") + "</span>");
     }
     // 块头和第一行之间的那个空格：`.bhead` 是块级元素，多这一个空格在屏幕上不占位，
