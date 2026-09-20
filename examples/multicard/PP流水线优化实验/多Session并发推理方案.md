@@ -787,7 +787,7 @@ git checkout -b feature/multisession-concurrency
 #   ba95e4c  multicard/serve: move the resource block to the page footer, and share one snapshot  (v1.24；§9.19)
 #   24cf699  multicard/serve: judge only this run's own pool leases  (v1.24；§9.19.4)
 #   7fc3b14  multicard/serve: move off 8080, close CORS by default, and fit the page to one screen  (v1.25；§9.20)
-#   <hash>   multicard/serve: equalise the resource cards' bottoms, and two-column the service block  (v1.26；§9.21)
+#   b8d2ee6   multicard/serve: equalise the resource cards' bottoms, and two-column the service block  (v1.26；§9.21)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
