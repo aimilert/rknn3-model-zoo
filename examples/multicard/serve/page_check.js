@@ -43,6 +43,8 @@
 // 需要 node。后端**不一定是板卡**：对着本地桩后端（`fake_backend.py`，起法见 README.md 测试
 // 一节）就能整跑，2026-09-18 实测全绿——改完这一页先在本地过一遍，省一次板卡往返。桩验不
 // 到的是真后端的**长度与内容**行为（截断、吐不吐 <think>），那些还得上板。
+// 板卡是台**在用的**机器：对着真板卡跑时，别人开着的 /demo 页面会占着 `id:web-*` 的会话，
+// 开工时先拍一张池子快照，只判这一轮自己开的那些（2026-09-20 加，起因见那段注释）。
 // 不进 run_all_board_tests.sh（那套是纯 python3 的）。
 const fs = require("fs");
 const vm = require("vm");
@@ -345,11 +347,23 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
   async function waitReleased() {
     let held = [];
     for (let k = 0; k < 40; k++) {
-      held = webHeld(await poolSlots());
+      // 只判**这一轮自己开的**那些身份（见下面 foreignWeb）。
+      held = webHeld(await poolSlots()).filter(x => !foreignWeb.has(x));
       if (!held.length) { return []; }
       await new Promise(r => setTimeout(r, 100));
     }
     return held;
+  }
+
+  // 开工之前先给会话池拍一张快照：**来的时候就占着的 `id:web-*` 是别人的**，不是这一轮开的。
+  // 板卡是台在用的机器——有人开着 /demo 页面，池子里本来就躺着 `id:web-1` 这样的租约，而这
+  // 份检查只认前缀，于是"删窗口没把会话还回去"会指着一份**跟它无关**的会话报 FAIL，还顺手
+  // 让整份检查在这一节 `exit(1)`（后面几节根本不跑）。2026-09-20 板上真事：一个浏览器开着
+  // 页面，两轮检查全红在这里，看着像页面坏了。别人占着会说一句，但不影响判定。
+  const foreignWeb = new Set(webHeld(await poolSlots()));
+  if (foreignWeb.size) {
+    console.log("（来的时候池子里就占着 %s —— 这台板卡上还有别的页面/客户端在用，"
+                + "下面只判这一轮自己开的那些身份）", JSON.stringify([...foreignWeb]));
   }
 
   let bad0 = 0;

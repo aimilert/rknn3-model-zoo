@@ -785,6 +785,7 @@ git checkout -b feature/multisession-concurrency
 #   242ddec  multicard/serve: put per-card and host resource usage on the demo page  (v1.22；§9.18)
 #   1b92d3d  multicard/serve: read card memory from the nodes, and hold the busy window still  (v1.23；§9.18.6)
 #   ba95e4c  multicard/serve: move the resource block to the page footer, and share one snapshot  (v1.24；§9.19)
+#   <本次>   multicard/serve: judge only this run's own pool leases  (v1.24；§9.19.4)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
@@ -3221,6 +3222,19 @@ JSON 体当下一帧的头行读 ⇒ 之后每个请求都 503。
 第二遍就在"增删窗口"那一节红，看着像页面坏了。现在走 `removePanel` 交还并**等它落地**
 （交还是异步发出去的，不等等于没交）：连跑两遍全绿、池子干净。这类"检查脚本自己留下状态"
 的坑，和被测代码里的泄漏一样，只在**连跑第二遍**时才现形。
+
+**上板实跑**：`MAXTOK=64 node page_check.js http://<板卡IP>:8080` → **`===== 全部通过 =====`**。
+RK3588 那半是板卡上的真数字（现场：CPU 17%、内存 40%（6.2 / 15.6 GB）、负载 1.37、热区
+`bigcore0 32° · bigcore1 32° · littlecore 32°`），卡那半是 `Σ node`（§9.18.6）。
+第一遍是**红**的，但根因不在页面：板卡是台**在用的**机器，当下池子里躺着**别人的**
+`id:web-1`（同一份网关日志里有两个 IP 在轮询 `/v1/system`），而判据只认 `id:web-*` 前缀
+⇒ 把**别人的**租约算成了"我这一轮没还回去"，还在这一节 `exit(1)`、后面几节全没跑。
+改法：开工前先给 `/v1/pool` 拍一张快照，只判这一轮自己开的那些身份（别人占着会打一句，
+不进判定）；变异体（把过滤去掉）在本机桩上复现出板上**一模一样**的那个 FAIL。
+这类"把环境算成被测对象的错"本地永远碰不到——**桩网关刚起时池子是空的**。
+（顺带记一笔：两边页面都从 `web-1` 起数，身份会撞车 ⇒ 网关当成同一段对话，对方的历史顶在
+前面、前缀对不上就**静默整段重算**，答案照样对、只是那一路变慢。要多页面共享一台板卡，
+身份得带上装载时刻。）
 
 ---
 
