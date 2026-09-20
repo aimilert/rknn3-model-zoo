@@ -781,7 +781,7 @@ git checkout -b feature/multisession-concurrency
 #   b5483bd  multicard/serve: reclaim the idlest session when someone is waiting  (v1.18；§9.14)
 #   bd49947  multicard/serve: rework the demo page's UI (badge, perf strip, growing input)  (v1.19；§9.15)
 #   7c425b9  multicard/serve: split the aggregate into per-path rate sum and wall-clock average  (v1.20；§9.16)
-#   <本次>   multicard/serve: size the session count from the export, and bound the page by it  (v1.21；§9.17)
+#   b53d328  multicard/serve: size the session count from the export, and bound the page by it  (v1.21；§9.17)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
