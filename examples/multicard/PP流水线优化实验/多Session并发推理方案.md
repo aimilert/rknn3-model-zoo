@@ -785,7 +785,7 @@ git checkout -b feature/multisession-concurrency
 #   242ddec  multicard/serve: put per-card and host resource usage on the demo page  (v1.22；§9.18)
 #   1b92d3d  multicard/serve: read card memory from the nodes, and hold the busy window still  (v1.23；§9.18.6)
 #   ba95e4c  multicard/serve: move the resource block to the page footer, and share one snapshot  (v1.24；§9.19)
-#   <本次>   multicard/serve: judge only this run's own pool leases  (v1.24；§9.19.4)
+#   24cf699  multicard/serve: judge only this run's own pool leases  (v1.24；§9.19.4)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
