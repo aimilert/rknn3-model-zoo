@@ -14,10 +14,16 @@
     网关那边如果没把 stdin 的帧写整体加锁，这里的解析器立刻会解析失败；
   · 头行解析不了一律 rc=2 退出，让失败显式暴露，而不是静默丢帧。
 
+它也照抄了 `STAT` 资源帧（2026-09-20 加的）：真后端在**输入线程上就地**答一包 JSON，
+桩就用合成数字答同一包——这样网关的 `CardStats`、`/v1/system` 和网页那块资源面板
+在没有板卡的时候也能端到端跑起来。**合成数字是编的**，但它按同一本账算（1078 MB/卡
+可分配 ÷ 单价 × 路数），好让页面上的进度条看着是对的。
+
 用法（由网关自动拉起，一般不手跑）：
     python3 fake_backend.py --sessions 2 [--serve-fd N] [--think-prefix] [--tool-call]
 """
 import argparse
+import json
 import os
 import sys
 import threading
@@ -77,6 +83,10 @@ def main():
     # `cached_tokens` 归零，板上直接红。桩默认行为不变（调一次），要复现这个场景就用它。
     ap.add_argument("--tool-call-repeats", action="store_true",
                     help="每一轮都回工具调用（模仿真模型），而不是拿到 tool 结果就收手")
+    # STAT 帧的合成数字用。真后端是 4 个 stage（每卡一个），桩默认也报 4 张卡，
+    # 但**卡的编号与请求的会话号无关**——桩里没有流水线，随便挑一张记账就行。
+    ap.add_argument("--stat-cards", type=int, default=4)
+    ap.add_argument("--ctx-len", type=int, default=8192)
     args, _unknown = ap.parse_known_args()
 
     if args.serve_fd is not None:
@@ -92,6 +102,24 @@ def main():
     ctx = [0] * args.sessions
     ctx_lock = threading.Lock()
     workers = []
+
+    # 合成资源账本。与启动闸同一条线性式：32K 下每路 406.7 MB/卡 ≈ 12.4 KB/token/卡，
+    # 每卡权重+内部占完之后剩 1078 MB 可分配给 KV。`node_min_free` 比整卡空闲更紧
+    # （真机 32K 两路时整卡还剩 406 MB、最紧的 node 只剩 12.6 MB），这里按 1/8 造。
+    kv_per_session = max(1, args.ctx_len) * 12400
+    mem_total = 5071 * 1024 * 1024
+    mem_free = max(0, 1078 * 1024 * 1024 - args.sessions * kv_per_session)
+    stat_lock = threading.Lock()
+    stat_cards = [{"name": "stage%d" % i,
+                   "busy_us": 0,
+                   "run_calls": 0,
+                   "mem_total": mem_total,
+                   "mem_free": mem_free,
+                   "node_num": 8,
+                   "node_min_free": mem_free // 8,
+                   "ctx_len": args.ctx_len}
+                  for i in range(max(1, args.stat_cards))]
+    stat_mem_at_us = int(time.monotonic() * 1e6)
 
     def serve(rid, session, max_new, reset, prompt):
         s = session if 0 <= session < args.sessions else 0
@@ -116,7 +144,15 @@ def main():
                    "conversation or trim the history" % (was, args.ctx_limit))
             emit(out, "REJECT ", "%d %d %d" % (rid, s, len(msg)), msg.encode("utf-8"))
             return
+        # 忙时只算这一小段 sleep（真后端算的是 `rknn3_session_run` 的墙钟）。桩里这就
+        # 等价于"设备在干活"，好让网关的 busy_pct 有东西可算、页面上的数字会动。
+        card = stat_cards[s % len(stat_cards)]
+        t_busy0 = time.monotonic()
         time.sleep(args.delay)
+        busy_us = int((time.monotonic() - t_busy0) * 1e6)
+        with stat_lock:
+            card["busy_us"] += busy_us
+            card["run_calls"] += 1
         # 切得要"不整齐"：把多字节字符也切开，逼网关用增量解码器
         reply = ("<think>  </think>  " + REPLY) if args.think_prefix else REPLY
         if args.tool_call and (args.tool_call_repeats or "<tool_response>" not in prompt):
@@ -149,6 +185,17 @@ def main():
             continue
         if line == b"QUIT":
             break
+        if line == b"STAT":
+            # 资源快照。真后端在**输入线程上就地**答（只读原子量、不碰设备、不进队列），
+            # 所以解码再久也照样秒回；桩没有设备也没有队列，照抄"随时可答"这条契约。
+            # ⚠️ 这帧**必须在读循环里被消费掉**：网关那头也认它、也把载荷读走，两边
+            # 少一边就会整条帧流错位（就是 ERR 帧咬过一次的那个坑）。
+            with stat_lock:
+                cards = [dict(c, mem_at_us=stat_mem_at_us) for c in stat_cards]
+            body = json.dumps({"now_us": int(time.monotonic() * 1e6), "cards": cards},
+                              separators=(",", ":")).encode("utf-8")
+            emit(out, "STAT ", "%d" % len(body), body)
+            continue
         try:
             parts = line.split()
             if parts[0] != b"REQ" or len(parts) != 6:

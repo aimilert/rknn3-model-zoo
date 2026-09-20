@@ -24,6 +24,7 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
@@ -110,11 +111,19 @@ static std::mutex g_output_mutex;
 //   启动横幅 (fd): READY <nsessions> <default_max_new_tokens>
 //   请求 (stdin):   REQ <rid> <session| -1> <max_new_tokens> <reset> <prompt_len>
 //                   <prompt_len 字节 UTF-8 原文>
+//                   STAT                              （无载荷，资源观测，见 serve_stat）
+//                   QUIT
 //   输出 (fd3):     DELTA <rid> <n>            / <n 字节原文>
 //                   DONE  <rid> <session> <finish_reason> <prefill_tok> <decode_tok>
 //                         <prefill_ms> <decode_ms> <ctx_tok>
 //                   CLEAR <rid> <session> <ctx_tok> <ctx_limit>
 //                   ERR   <rid> <session> <n>  / <n 字节原文>
+//                   REJECT <rid> <session> <n> / <n 字节原文>
+//                   STAT  <n>                  / <n 字节 JSON（{now_us, cards:[…]}）
+//
+//   ⚠️ STAT 是**新加的帧类型**，所以这一版的后端要与**同一版的网关**配对：
+//   旧网关的读线程不认识 STAT，不会去消费它声明的那 <n> 个字节，整条帧流从此错位
+//   （最坏读线程直接死 → 全 503）。这条坑已经咬过一次（ERR 帧那次），所以别只换一半。
 // ============================================================================
 static bool  g_serve_mode = false;
 static FILE* g_serve_out  = nullptr;
@@ -313,6 +322,28 @@ struct StageContext
   // 每份约 1.3 MB）能去掉这把锁，但需要 runtime 支持同 context 真并发，
   // 留待后续验证。
   std::mutex run_mutex;
+
+  // ---- 资源观测（--serve 的 STAT 帧读这几个）----
+  //
+  // 为什么是"worker 在锁内顺手更新 + 输入线程只读原子量"，而不是输入线程现查设备：
+  // 从输入线程直接查就得先拿 run_mutex，而一次 decode 可能跑几十秒——那等于把整个请求
+  // 入口堵死，而且恰好堵在"板卡正忙、最想看一眼"的时候。所以设备查询只在已经持有锁的
+  // 地方发生（见 refresh_stage_mem_stat），STAT 帧本身零设备访问、零锁等待。
+  //
+  // `stat_busy_us` 累加的是**卡级锁内**跑 session_run 的微秒数，也就是这张卡真正在算的
+  // 时间（等锁的时间不算，那段是别的会话在占着它）。两次采样之差 ÷ 墙上时间 = 该卡
+  // NPU 的利用率。这是**量出来的**，不是估的。
+  //
+  // 内存那几项是**快照**不是累计：KV 在 session_init 时按满上下文一次性预分配，之后
+  // 填满上下文新增分配 0.0 MB（§4.1 实测），所以一次会话集合确定后整卡空闲量就不再变，
+  // 刷新一次就够准。`stat_mem_at_us` 是采样时刻，网关据此说出这个数有多旧。
+  std::atomic<uint64_t> stat_busy_us{0};
+  std::atomic<uint64_t> stat_run_calls{0};
+  std::atomic<uint64_t> stat_mem_at_us{0};    // 0 = 一次都还没采过
+  std::atomic<uint64_t> stat_mem_total{0};    // 整卡 sys_total（字节）
+  std::atomic<uint64_t> stat_mem_free{0};     // 整卡 sys_free（字节）
+  std::atomic<uint64_t> stat_node_min_free{0};// 全卡最紧那个 node 的空闲（字节）
+  std::atomic<uint32_t> stat_node_num{0};
 };
 
 // 一个会话在一张卡上占用的部分：session 句柄 + 注册到它上面的回调。
@@ -536,6 +567,106 @@ static size_t get_dtype_elem_size(int dtype)
 static double elapsed_us(const timeval& start, const timeval& end)
 {
   return (end.tv_sec - start.tv_sec) * 1e6 + (end.tv_usec - start.tv_usec);
+}
+
+// 资源观测用的单调时钟（微秒）。**不用 gettimeofday**：利用率是两次采样的差值之比，
+// 中间被 NTP 校一次表，epoch 时钟会算出一个荒谬的比值（甚至负数）。
+static uint64_t stat_now_us()
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+// 每卡内存快照的刷新间隔。2s：够页面看着是"实时"，又不至于让每轮 decode 都多一次
+// 设备查询（那会实打实地吃掉吞吐）。
+static const uint64_t kStatRefreshUs = 2000000ull;
+
+// 采集一张卡的内存快照，写进 StageContext 的原子量（--serve 的 STAT 帧读它们）。
+//
+// **调用者必须持有 stage.run_mutex**，或者处于"还没有并发跑起来"的初始化阶段：
+// rknn3_query 与 rknn3_session_run 走的是同一条到设备的传输通道，SDK 没承诺两者
+// 并发安全，而踩坏这条通道的代价是四张卡僵死（见 --probe-sessions 那一段的记录）。
+// 这里故意**不自己加锁**——worker 是在锁内顺势调用的，再锁一次就是死锁。
+static void refresh_stage_mem_stat(StageContext& stage)
+{
+  rknn3_dev_mem_info dev_mem;
+  memset(&dev_mem, 0, sizeof(dev_mem));
+  if (rknn3_query(stage.ctx, RKNN3_QUERY_DEVICE_MEM_INFO, &dev_mem, sizeof(dev_mem)) !=
+      RKNN3_SUCCESS) {
+    // 查不到就保留上一次的快照。**不更新采样时刻**，这样网关能看出这个数旧了——
+    // 宁可显示"这个数有 12s 没更新过"，也不要拿旧值冒充新的。
+    return;
+  }
+  const uint32_t n = dev_mem.node_num < RKNN3_MAX_NPU_NODE_NUM ? dev_mem.node_num
+                                                              : RKNN3_MAX_NPU_NODE_NUM;
+  uint64_t tightest = 0;
+  bool     have_tightest = false;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint64_t node_free = dev_mem.node_mem_info[i].free;
+    if (!have_tightest || node_free < tightest) {
+      tightest = node_free;
+      have_tightest = true;
+    }
+  }
+  stage.stat_mem_total.store(dev_mem.sys_total, std::memory_order_relaxed);
+  stage.stat_mem_free.store(dev_mem.sys_free, std::memory_order_relaxed);
+  stage.stat_node_min_free.store(have_tightest ? tightest : 0, std::memory_order_relaxed);
+  stage.stat_node_num.store(n, std::memory_order_relaxed);
+  stage.stat_mem_at_us.store(stat_now_us(), std::memory_order_relaxed);
+}
+
+// 一次 session_run 回来之后的资源观测：忙时累计 + 顺手刷一次内存快照。
+//
+// **调用者必须持有该卡的 run_mutex**（与 refresh_stage_mem_stat 同样的理由），并且
+// 传进来的 busy_us 必须就是这一次 run 的时长——忙时最后要跟 STAT 的 `now_us` 相除算
+// 利用率，量到别的区间（比如"等锁的那一段"）就等于把排队算成了算力。
+//
+// ⚠️ 这个函数有**两个**调用点，都要调：run_stage_worker 里的各段，以及
+// run_pipeline_once 里就地跑的 stage0（stage0 不走 worker）。2026-09-20 就是漏了后者
+// ——主机测试 t12 抓到的：第 0 张卡永远报 run_calls=0、内存永远"还没采到"，页面上
+// 一张卡一直空着，而另外三张在动。所以这里收成一个函数，而不是把三行抄两遍。
+static void record_stage_run_stat(StageContext& stage, uint64_t busy_us)
+{
+  stage.stat_busy_us.fetch_add(busy_us, std::memory_order_relaxed);
+  stage.stat_run_calls.fetch_add(1, std::memory_order_relaxed);
+  if (stat_now_us() - stage.stat_mem_at_us.load(std::memory_order_relaxed) >= kStatRefreshUs) {
+    refresh_stage_mem_stat(stage);
+  }
+}
+
+// 资源观测帧。请求是 stdin 上的一行 `STAT`（不带载荷、不带 rid），答复是
+//   `STAT <len>` + <len 字节 JSON>
+//
+// 为什么载荷用 JSON 而不是像别的帧那样排空格：这一帧是**嵌套**的（每张卡一组数），
+// 排空格就得先定死字段序、以后加一个字段两边一起改；而两边本来就都在处理 JSON
+// （C++ 侧 nlohmann，网关侧标准库 json），用 JSON 之后加字段是纯加法。
+//
+// **这一帧只读原子量、不碰设备、也不进调度队列**（理由见 StageContext 里 stat_busy_us
+// 的注释）：它得在一次长 decode 正跑着的时候也能立刻回答——那正是最需要它的时候。
+static void serve_stat(const std::vector<StageContext>& stages)
+{
+  nlohmann::json doc;
+  doc["now_us"] = stat_now_us();
+  nlohmann::json cards = nlohmann::json::array();
+  for (const auto& stage : stages) {
+    nlohmann::json card;
+    card["name"] = stage.name;
+    card["busy_us"] = stage.stat_busy_us.load(std::memory_order_relaxed);
+    card["run_calls"] = stage.stat_run_calls.load(std::memory_order_relaxed);
+    // 快照时刻。**0 = 一次都没采到**，与"采过但很旧"是两回事：前者只能显示"未知"，
+    // 拿 0 当时刻去算年龄会得到一个天文数字（页面会显示成"53 年没更新"）。
+    card["mem_at_us"] = stage.stat_mem_at_us.load(std::memory_order_relaxed);
+    card["mem_total"] = stage.stat_mem_total.load(std::memory_order_relaxed);
+    card["mem_free"] = stage.stat_mem_free.load(std::memory_order_relaxed);
+    card["node_num"] = stage.stat_node_num.load(std::memory_order_relaxed);
+    card["node_min_free"] = stage.stat_node_min_free.load(std::memory_order_relaxed);
+    card["ctx_len"] = stage.max_ctx_len;
+    cards.push_back(card);
+  }
+  doc["cards"] = cards;
+  const std::string body = doc.dump();
+  serve_frame("STAT ", std::to_string(body.size()), body.data(), body.size());
 }
 
 static void print_performance_statistics(uint64_t prefill_tokens, float prefill_ms,
@@ -2303,11 +2434,21 @@ static void run_stage_worker(size_t stage_idx, std::vector<StageContext>& stages
       // 卡级串行：持锁覆盖整个 session_run，回调里读 output_tensors 也在锁内。
       // 计时放在锁内，统计到的是纯 NPU 时间，等锁的时间只体现在并发模式的墙钟里。
       std::lock_guard<std::mutex> card_lock(stage.run_mutex);
+      const uint64_t busy_t0 = stat_now_us();
       gettimeofday(&run_start, NULL);
       ret = rknn3_session_run(session, &embed_input, 1, &local_param);
       gettimeofday(&run_end, NULL);
-      record_stage_performance(stage, phase, batch.n_tokens,
-                               elapsed_us(run_start, run_end) / 1e3);
+      const uint64_t busy_t1 = stat_now_us();
+      const double run_us = elapsed_us(run_start, run_end);
+      record_stage_performance(stage, phase, batch.n_tokens, run_us / 1e3);
+      // 资源观测。区间与 record_stage_performance 一模一样，都在锁内。
+      //
+      // ⚠️ 忙时用的是**单调钟**、不是上面那个 gettimeofday 算出来的 run_us，尽管两者
+      // 量的是同一个区间：忙时最后要跟 STAT 的 `now_us`（也是单调钟）相除算利用率，
+      // 中间被 NTP 校一次表的话，分子是 epoch 口径、分母是单调口径，比值就是荒谬的
+      // （可能算出负数或几百个百分点）。gettimeofday 那一对留着不动，是因为
+      // record_stage_performance 的历史口径就是它，改了历史数字就不可比了。
+      record_stage_run_stat(stage, busy_t1 - busy_t0);
     }
 
     if (output_slot) {
@@ -2378,9 +2519,15 @@ static bool run_pipeline_once(std::vector<StageContext>& stages, Conversation& c
   {
     // 与 worker 同源：stage0 也要拿本卡的串行锁（多会话时别的会话也在抢这张卡）。
     std::lock_guard<std::mutex> card_lock(stages[0].run_mutex);
+    const uint64_t busy_t0 = stat_now_us();
     gettimeofday(&stage0_start, NULL);
     ret = rknn3_session_run(conv.stages[0].session, &first_input, 1, &infer_param);
     gettimeofday(&stage0_end, NULL);
+    const uint64_t busy_t1 = stat_now_us();
+    // 这里是 session_run 的**第二个**调用点：stage0 不走 run_stage_worker，是就地跑在
+    // 本函数里的（其余各段才由 worker 跑）。两个调用点都要记观测——漏掉这个的后果
+    // 就是"第 0 张卡永远是一张空卡"（见 record_stage_run_stat 的注释）。
+    record_stage_run_stat(stages[0], busy_t1 - busy_t0);
   }
   if (ret != RKNN3_SUCCESS) {
     printf("[stage0] run failed ret=%d\n", ret);
@@ -3100,7 +3247,8 @@ static void discard_serve_payload(unsigned long long prompt_len)
 // 与交互模式的关键差别是**载荷不定长**：prompt 里可以有换行、制表符、任意字节，
 // 所以不能用 getline 读完整条请求——头行定长可解析，载荷按头行里声明的长度原样读，
 // 不做任何转义/反转义。网关能用中文、多行 prompt，靠的就是这个。
-static void run_serve_input_worker(InteractiveDispatcher* dispatcher, int session_count)
+static void run_serve_input_worker(InteractiveDispatcher* dispatcher, int session_count,
+                                   const std::vector<StageContext>& stages)
 {
   std::string header;
   while (std::getline(std::cin, header)) {
@@ -3112,6 +3260,14 @@ static void run_serve_input_worker(InteractiveDispatcher* dispatcher, int sessio
     }
     if (header == "QUIT") {
       break;  // 网关要求收工：不必等 stdin EOF，便于优雅关闭
+    }
+    if (header == "STAT") {
+      // 资源观测。**必须在这里就地答复、不让它进调度队列**：这一帧不需要会话，
+      // 而排队的话它会被前面那条正在跑的长 decode 挡在后面——恰恰是"板卡正忙、
+      // 想看它在忙什么"的时候出不来数。serve_stat 只读原子量，所以就地答复是
+      // 零阻塞的（它不碰设备，也不需要任何锁）。
+      serve_stat(stages);
+      continue;
     }
 
     unsigned long long rid = 0, max_new = 0, reset = 0, prompt_len = 0;
@@ -4517,6 +4673,14 @@ int main(int argc, char** argv)
     return -1;
   }
 
+  // 资源观测的初值：此刻所有会话都已建好、工作线程还没起，所以这次设备查询是单线程的
+  // （refresh_stage_mem_stat 要求调用者持有卡锁，或者处于这个阶段）。
+  // 先采一次的价值不只是"页面早点有数"：这个快照就是"这份导出此刻占了多少内存"的
+  // 答案，而它决定了还能再开几路——启动横幅下面那几行的账本核对的就是它。
+  for (auto& stage : stages) {
+    refresh_stage_mem_stat(stage);
+  }
+
   // 检查命令行请求的上下文长度是否超过模型内建的 kvcache_buffer_len。
   if (stages[0].max_ctx_len > 0 && max_context_len > stages[0].max_ctx_len) {
     printf("\n[warning] --ctx-size %d exceeds the model's built-in kvcache_buffer_len %d; "
@@ -4670,7 +4834,8 @@ int main(int argc, char** argv)
         // 输入线程与上面 N 个会话线程并发跑；stdin 结束时它会唤醒所有会话线程，
         // 待办队列里剩下的输入仍会被处理完，全部退出后 join 才返回。
         std::thread input_thread = options.serve
-            ? std::thread(run_serve_input_worker, &dispatcher, session_count)
+            ? std::thread(run_serve_input_worker, &dispatcher, session_count,
+                          std::cref(stages))
             : std::thread(run_interactive_input_worker, &dispatcher);
         for (auto& driver : drivers) {
           driver.join();

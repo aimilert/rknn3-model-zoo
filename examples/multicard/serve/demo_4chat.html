@@ -97,6 +97,42 @@
   .capline.over { color:var(--warn); }
   .capline.over b { color:var(--warn); }
 
+  /* 资源条：RK3588（本机现读）+ RK1828（后端 STAT 帧）+ 服务状态。
+     **两半的可信度不一样，所以视觉上分组、并各带自己的时间**：左边是这一秒读到的，
+     右边是从后端来的一包原子量、带"多久之前采的"。末尾那句 note 不是客套话：
+     RK1828 是 PCIe 设备（驱动 rkep），主机侧既没有 hwmon 也没有 NPU 利用率查询接口，
+     不写出来，屏幕上那两个百分数会被当成硬件读数读走（2026-09-20 加）。 */
+  .sysline { display:flex; flex-wrap:wrap; align-items:center; gap:5px 16px;
+             padding:7px 18px; border-bottom:1px solid var(--line); background:#12151b;
+             font-size:12px; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .sysline .grp { display:flex; align-items:center; gap:7px; min-width:0; flex-wrap:wrap; }
+  .sysline .grp + .grp { padding-left:15px; border-left:1px solid var(--line); }
+  .sysline .tag { font-size:10px; letter-spacing:.6px; color:#5f6878; text-transform:uppercase; }
+  .sysline b { color:var(--fg); font-weight:600; }
+  .sysline .m { white-space:nowrap; }
+  .sysline .dim2 { color:#6b7488; }
+  .sysline .off { color:#5f6878; }
+  .sysline b.warn { color:var(--warn); }
+  .sysline b.crit { color:var(--danger); }
+  .sysline .m.warn { color:var(--warn); }
+  /* 一格资源 = 名字 + 数 + 一条横条。条子自己画：`<progress>` 在深色底上是浏览器默认
+     那套浅色描边，跟这一页对不上，而且各家渲染还不一样。 */
+  .bar { display:inline-block; width:52px; height:6px; border-radius:3px; overflow:hidden;
+         background:#0a0d13; border:1px solid var(--line); vertical-align:middle; flex:none; }
+  .bar i { display:block; height:100%; width:0; background:var(--accent);
+           transition:width .5s ease; }
+  .bar.warn i { background:var(--warn); }
+  .bar.crit i { background:var(--danger); }
+  /* 四张卡挤在一行里，条子窄一点才塞得下（RK3588 那几格宽一点更好读）。 */
+  .sysline .cards .bar { width:40px; }
+  /* 8 个核一根小柱子。高度**就是**占用率（0% 就是空柱子），不设最小高度——
+     给 0% 留一根看得见的"底座"就等于编了一个数出来。 */
+  .cores { display:inline-flex; gap:2px; align-items:stretch; height:15px; flex:none; }
+  .cores i { width:5px; border-radius:2px; background:#0a0d13; border:1px solid var(--line);
+             display:flex; align-items:flex-end; overflow:hidden; }
+  .cores i span { display:block; width:100%; background:var(--accent); }
+  .note { color:#5f6878; font-size:11px; }
+
   main { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:12px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
            display:flex; flex-direction:column; height:calc(50vh - 60px); min-height:300px; }
@@ -167,6 +203,11 @@
     <button id="clear" class="btn-danger">清空</button>
   </div>
 </header>
+
+<!-- 资源配置条（JS 每次轮询整块重写）。**常驻一行**，理由和容量条一样：它回答的是
+     "此刻板卡到底在干什么"——NPU 忙不忙、内存还剩多少、温度上没上来。演示时这几个数
+     比任何一句话都先被看到，所以宁可占一行也不藏进弹窗。 -->
+<div id="sys" class="sysline"></div>
 
 <!-- 基线/四路聚合那一整句（setSum）。**和徽标分开**：徽标只有一个词，这行是一句话，
      以前两者挤在 #gstats 里，一句汇总能把标题行撑到换行。 -->
@@ -290,6 +331,222 @@ function renderCap() {
 
   // 「②」的文案跟着窗口数走（以前写死"4 路"，窗口变成 2 个之后就成了假话）
   document.getElementById("all").textContent = "② " + n + " 路同时提问";
+}
+
+// ---------- 资源观测条（GET /v1/system，每 2s） ----------
+//
+// 这条上的数字有两半、来源和可信度都不一样，屏幕上必须分开说：
+//   · RK3588 那一半是**这一秒现读的**（/proc/stat、/proc/meminfo、thermal_zone*，
+//     由网关在读；页面只是显示）；
+//   · RK1828 那一半来自后端的 STAT 帧——一包原子量，带"多久之前采的"（stats_age_s）。
+// 还有两件最容易被读歪的事，写在条子上而不是只写在文档里：
+//   · **NPU 利用率是算出来的**（卡级忙时 ÷ 墙钟差），SDK 的查询枚举里根本没有利用率；
+//   · **温度只有 RK3588 自己的热区**。RK1828 是 PCIe 设备（驱动 rkep），主机侧没有
+//     hwmon、也没有 thermal_zone，那四张卡的结温在主机上取不到——这不是"没做"。
+const SYS_POLL_MS = 2000;
+const SYS_STALE_S = 6;      // 快照超过这么多秒就当场标旧（后端不答了）
+
+let sysOn = false;
+let sysTimer = null;
+let sysSeq = 0;             // 请求序号：晚到的旧响应不许覆盖新的一帧
+
+// 读不到就返回 null，由调用点决定怎么显示。**不能返回 0**：内存 0 GB 和"读不到"
+// 在屏幕上必须是两句话。
+function fmtBytes(v) {
+  if (typeof v !== "number" || !isFinite(v) || v <= 0) { return null; }
+  if (v >= 1073741824) { return (v / 1073741824).toFixed(1) + " GB"; }
+  return Math.round(v / 1048576) + " MB";
+}
+
+// **读不到显示 "—"，不是 "0%"**。刚打开页面的那一瞬间 NPU 利用率本来就没有值
+// （要两次采样才有差值），显示 0% 等于告诉人"板卡闲着"；CPU 同理。
+function fmtPct(v, digits) {
+  if (typeof v !== "number" || !isFinite(v)) { return "—"; }
+  return v.toFixed(digits === undefined ? 0 : digits) + "%";
+}
+
+function fmtDur(s) {
+  if (typeof s !== "number" || !isFinite(s) || s < 0) { return "—"; }
+  if (s < 60) { return Math.round(s) + "s"; }
+  const m = Math.floor(s / 60);
+  if (m < 60) { return m + "m"; }
+  return Math.floor(m / 60) + "h" + (m % 60) + "m";
+}
+
+function bar(v, warn, crit) {
+  const has = (typeof v === "number" && isFinite(v));
+  const w = has ? Math.max(0, Math.min(100, v)) : 0;
+  const cls = !has ? "" : (v >= crit ? " crit" : (v >= warn ? " warn" : ""));
+  return '<span class="bar' + cls + '"><i style="width:' + w.toFixed(1) + '%"></i></span>';
+}
+
+// 8 个核一根小柱。高度就是占用率，0% 就是空的（不设最小高度——给 0% 留一根看得见的
+// "底座"就等于编了一个数）。读不到的那个核留空柱、靠 title 说清楚。
+function coresHtml(list) {
+  if (!list || !list.length) { return ""; }
+  return '<span class="cores">' + list.map(function (v) {
+    const has = (typeof v === "number" && isFinite(v));
+    const h = has ? Math.max(0, Math.min(100, v)) : 0;
+    return '<i title="' + (has ? h.toFixed(0) + "%" : "未读到") + '"><span style="height:' +
+           h.toFixed(0) + '%"></span></i>';
+  }).join("") + "</span>";
+}
+
+// 热区标签是 "soc-thermal" / "bigcore0-thermal" 这种，屏幕上去掉后缀够认了。
+function shortLabel(s) {
+  return String(s || "").replace(/-thermal$/, "");
+}
+
+// 板上 RK3588 自己就有 7 个热区（soc / bigcore0 / bigcore1 / littlecore / center /
+// gpu / npu-thermal）。七个全长出来要 450px，把这条挤成两行还没人看；而真正要一眼
+// 看出来的只有一件事——**有没有哪个地方烫起来了**。所以按温度排前 3 显示，剩下的
+// 收进 title（一个都不丢，也没排序权重的谎言：谁热谁在前）。
+const THERM_SHOW = 3;
+
+function thermHtml(list) {
+  if (!list || !list.length) { return '<span class="m off">温度 —</span>'; }
+  const all = list.slice().sort(function (a, b) { return (b.c || 0) - (a.c || 0); });
+  const full = list.map(function (t) {
+    return shortLabel(t.label) + " " + (typeof t.c === "number" ? t.c.toFixed(0) + "°" : "—");
+  }).join(" · ");
+  const head = all.slice(0, THERM_SHOW).map(function (t) {
+    const c = t && t.c;
+    const cls = (typeof c !== "number") ? "" : (c >= 80 ? " crit" : (c >= 65 ? " warn" : ""));
+    return '<b class="' + cls.trim() + '">' + esc(shortLabel(t.label)) + " " +
+           (typeof c === "number" ? c.toFixed(0) + "°" : "—") + "</b>";
+  }).join(" · ");
+  const rest = all.length - THERM_SHOW;
+  return '<span class="m" title="全部热区：' + esc(full) + '">温度 ' + head +
+         (rest > 0 ? ' <span class="dim2">+' + rest + "</span>" : "") + "</span>";
+}
+
+function renderSysErr(msg) {
+  document.getElementById("sys").innerHTML =
+    '<span class="grp"><span class="tag">资源</span><span class="off">读不到 /v1/system（' +
+    esc(msg) + '）——网关没起、或者这一页是当本地文件打开的</span></span>';
+}
+
+// 把一份 /v1/system 画出来。**整块重写**：这样一个数字动一下整条就跟着重排，
+// 不会出现"一半是新的、一半还是上一次的"。
+function renderSys(d) {
+  const el = document.getElementById("sys");
+  if (!el) { return; }
+  if (!d) {
+    el.innerHTML = '<span class="grp"><span class="tag">资源</span>' +
+                   '<span class="off">正在读取…</span></span>';
+    return;
+  }
+  const host = d.host || {}, cpu = host.cpu || {}, mem = host.mem || {};
+  const npu = d.npu || {}, be = d.backend || {}, gw = d.gateway || {};
+  const g = [];
+
+  // ---- RK3588：本机现读 ----
+  const memTotal = fmtBytes(mem.total);
+  const memUsed = fmtBytes(mem.used);
+  // 每一格之间留一个空格。`.grp` 是 flex，纯空白节点不占位（不会因此多出间距），
+  // 但**去掉标签之后**文本才是「CPU 42% 内存 60%」而不是「CPU 42%内存 60%」——
+  // 复制出来和读屏软件读出来的都是前者，后者会连成一个词。
+  g.push('<span class="grp"><span class="tag">RK3588</span>' +
+    '<span class="m">CPU <b>' + fmtPct(cpu.pct) + "</b></span> " +
+    coresHtml(cpu.per_core) + " " +
+    '<span class="m">内存 <b>' + fmtPct(mem.used_pct) + "</b> " +
+      bar(mem.used_pct, 80, 92) +
+      (memTotal && memUsed ? ' <span class="dim2">' + memUsed + " / " + memTotal + "</span>" : "") +
+    "</span> " +
+    thermHtml(host.thermal) + " " +
+    ((cpu.loadavg && cpu.loadavg.length)
+      ? '<span class="m">负载 <b>' + cpu.loadavg[0].toFixed(2) + "</b></span> " : "") +
+    ((typeof host.uptime_s === "number")
+      ? '<span class="m dim2">开机 ' + fmtDur(host.uptime_s) + "</span>" : "") +
+    "</span>");
+
+  // ---- RK1828：后端 STAT 帧 ----
+  const cards = npu.cards || [];
+  if (cards.length) {
+    g.push('<span class="grp cards"><span class="tag">RK1828</span>' + cards.map(function (c, i) {
+      const nm = String(c.name || ("#" + i));
+      // 后端的 stage 名就是 `stage0`..`stage3`（一张卡一个）。页面上按卡号写更短。
+      const m = /^stage(\d+)$/.exec(nm);
+      // 名字和后面那几格之间**留一个空格**：`.grp` 是 flex，空白不会真的占位（不会
+      // 因此多出间距），但去掉标签之后文本才是「#0 NPU 55%」而不是「#0NPU 55%」。
+      return '<span class="m" title="' + esc(nm) + " 上下文 " + esc(String(c.ctx_len)) +
+             '"><b>' + esc(m ? "#" + m[1] : nm) + '</b></span> ' +
+        '<span class="m">NPU <b>' + fmtPct(c.busy_pct) + "</b></span> " +
+          bar(c.busy_pct, 70, 90) + " " +
+        '<span class="m">内存 <b>' + fmtPct(c.mem_used_pct) + "</b></span> " +
+          bar(c.mem_used_pct, 85, 95) +
+        // `> 0` 那一条是必须的：0 表示**后端一次都没采到**（查询失败），不是"还剩 0 字节"。
+        // 后面那个 `|| "—"` 是第二道保险——fmtBytes 读不到时返回 null，少了它屏幕上会
+        // 印出字面的 "node null"。
+        ((typeof c.node_min_free === "number" && c.node_min_free > 0)
+          ? ' <span class="m dim2" title="全卡最紧那个 node 还剩多少——这是最先撞墙的一格">node ' +
+            (fmtBytes(c.node_min_free) || "—") + "</span>" : "");
+    }).join(" ") + "</span>");
+  } else {
+    g.push('<span class="grp"><span class="tag">RK1828</span>' +
+           '<span class="off">读不到（后端还没答 STAT）</span></span>');
+  }
+
+  // ---- 服务：后端活着吗、会话占了几个、有没有人在排队、这份数据多旧 ----
+  const alive = (be.alive !== false);
+  const age = be.stats_age_s;
+  const ageNum = (typeof age === "number") ? age : null;
+  // **"一次都没采到"和"采过但很旧"是两回事**，不能合成一句话：前者是页面刚打开、
+  // 第一包还没回来（正常）；后者是后端不答了（有事）。所以只有后者才加警示。
+  const stale = (ageNum !== null && ageNum > SYS_STALE_S);
+  g.push('<span class="grp"><span class="tag">服务</span>' +
+    '<span class="m">后端 <b class="' + (alive ? "" : "crit") + '">' +
+      (alive ? "正常" : "已退出") + "</b></span> " +
+    '<span class="m">会话 <b>' + (gw.bound == null ? "—" : gw.bound) + " / " +
+      (be.sessions == null ? "—" : be.sessions) + "</b></span> " +
+    '<span class="m' + ((gw.waiting > 0) ? " warn" : "") + '">排队 <b>' +
+      (gw.waiting == null ? "—" : gw.waiting) + "</b></span> " +
+    '<span class="m">数据 <b class="' + (stale ? "warn" : "") + '">' +
+      (ageNum === null ? (alive ? "还没采到" : "—") : ageNum.toFixed(1) + "s 前") +
+      "</b>" + (stale ? "（后端没在答）" : "") + "</span> " +
+    ((typeof gw.uptime_s === "number")
+      ? '<span class="m dim2">网关已跑 ' + fmtDur(gw.uptime_s) + "</span>" : "") +
+    "</span>");
+
+  g.push('<span class="note">NPU 是卡级忙时占比（SDK 没有利用率查询接口）· ' +
+         "温度只有 RK3588 的热区，RK1828 是 PCIe 设备、主机侧没有 hwmon</span>");
+  el.innerHTML = g.join("");
+}
+
+async function refreshSystem() {
+  const mine = ++sysSeq;
+  let doc;
+  try {
+    const r = await fetch(API + "/v1/system");
+    if (!r.ok) { throw new Error("HTTP " + r.status); }
+    doc = await r.json();
+  } catch (e) {
+    // 观测端点拿不到**不该影响这一页的任何功能**：聊天照跑，只是这一条说明白。
+    if (mine === sysSeq) { renderSysErr(String((e && e.message) || e)); }
+    return;
+  }
+  if (mine !== sysSeq) { return; }   // 已经有更新的一帧在路上了，这份是旧的，丢掉
+  renderSys(doc);
+}
+
+function sysTick() {
+  sysTimer = null;
+  if (!sysOn) { return; }
+  // 自排下一拍（而不是 setInterval）：串行，慢响应不会堆起来把请求叠成一串。
+  refreshSystem().then(function () {
+    if (sysOn) { sysTimer = setTimeout(sysTick, SYS_POLL_MS); }
+  });
+}
+
+function startSysPoll() {
+  if (sysOn) { return; }
+  sysOn = true;
+  sysTick();
+}
+
+function stopSysPoll() {
+  sysOn = false;
+  if (sysTimer) { clearTimeout(sysTimer); sysTimer = null; }
 }
 
 // 读后端的容量。**失败不抛**：页面可能被当本地文件打开（那时没有同源后端），
@@ -868,9 +1125,21 @@ let capReady = refreshHealth().then(function () {
   updateGlobal();
 });
 
+// 资源条开轮询。**在建完面板之后再开**：它会让上面那一屏先落地，而且轮询本身
+// 跟窗口数没关系，没必要抢在容量查询前面发出去。
+renderSys(null);
+startSysPoll();
+
+// 切走了就别轮了：板卡上这一页是投影出来看的，没人看的时候多发一个请求都可能
+// 混进正在测量的那几路里去（带宽/CPU 都在同一台机器上）。切回来立刻补一次，
+// 不用等下一个 2 秒——切回来第一眼看到的不该是旧数字。
+document.addEventListener("visibilitychange", function () {
+  if (document.hidden) { stopSysPoll(); } else { startSysPoll(); }
+});
+
 // 后端被换成别的 NSESSION 重启之后，开着的这一页要能自己发现（容量条会转警告色、
-// 「＋」会禁用）。**用 focus 而不是定时轮询**：演示跑起来的时候多一个请求就是给
-// 测量添噪音，而且一个常驻的 setInterval 会让 page_check.js 那个 node 进程不退出。
+// 「＋」会禁用）。**容量这块仍然用 focus 而不是定时轮询**：它是一次性的、结论很少变，
+// 而资源条那边是每 2s 一次、量的是"现在"——两件事的时效要求不一样。
 window.addEventListener("focus", function () { refreshHealth(); });
 </script>
 </body>

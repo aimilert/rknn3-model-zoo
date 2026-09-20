@@ -34,8 +34,10 @@ import codecs
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -190,6 +192,238 @@ def _argv_int(argv, name):
     return None
 
 
+# ===========================================================================
+# 资源观测：RK3588 这边网关自己读，RK1828 那边问后端（STAT 帧）
+# ===========================================================================
+#
+# 为什么分两半：**只有持有设备的那个进程能查 RK1828**。四张卡是 PCIe 设备（driver
+# `rkep`），主机侧既没有 hwmon 也没有 thermal_zone，`rknn-smi` 在后端驻留时必然是
+# `Failed to initialize rknnsmi`（2026-09-20 实测；那个"还能出数"的 `rknn-smi info -w`
+# 是它在后端起来**之前**就抢住了设备）。所以每卡设备内存只能由后端用
+# `RKNN3_QUERY_DEVICE_MEM_INFO` 采，经 STAT 帧送过来。
+#
+# 而 RK3588 的一切都在 procfs/sysfs 里，网关直接读——不必为它绕一圈帧协议。
+
+STAT_MIN_INTERVAL = 0.9     # 两次 STAT 之间至少隔这么久（页面约 2s 轮一次，够用）
+STAT_WAIT = 0.35            # 发出 STAT 后最多等这么久；后端是就地答原子量，正常 <1ms
+
+_THERMAL_BASE = "sys/class/thermal"
+
+
+def _read_proc_stat(path):
+    """{'cpu': (busy, total), 'cpu0': …, …}，单位 jiffies。
+
+    busy = total − idle − iowait。iowait 算空闲：它等的是磁盘，不是 CPU 在干活。
+    """
+    out = {}
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                if not line.startswith("cpu"):
+                    break
+                f = line.split()
+                try:
+                    vals = [int(x) for x in f[1:]]
+                except ValueError:
+                    continue
+                if len(vals) < 5:
+                    continue
+                idle = vals[3] + vals[4]
+                out[f[0]] = (sum(vals) - idle, sum(vals))
+    except (OSError, ValueError):
+        return {}
+    return out
+
+
+def _read_meminfo(path):
+    want = {"MemTotal": "total", "MemFree": "free", "MemAvailable": "available",
+            "Buffers": "buffers", "Cached": "cached", "SReclaimable": "sreclaimable",
+            "SwapTotal": "swap_total", "SwapFree": "swap_free"}
+    out = {}
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) >= 2:
+                    key = want.get(f[0].rstrip(":"))
+                    if key:
+                        out[key] = int(f[1]) * 1024
+    except (OSError, ValueError):
+        return {}
+    return out
+
+
+def _read_thermals(base):
+    """板上 7 路热区。**全是 RK3588 自己的**（含它自己那个 npu-thermal），
+    RK1828 四张卡一个都不在里面——这一点别在页面上含糊掉。"""
+    out = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for name in names:
+        if not name.startswith("thermal_zone"):
+            continue
+        d = os.path.join(base, name)
+        try:
+            with open(os.path.join(d, "type"), "r") as fh:
+                label = fh.read().strip()
+            with open(os.path.join(d, "temp"), "r") as fh:
+                milli = int(fh.read().strip())
+        except (OSError, ValueError):
+            continue
+        out.append({"zone": name, "label": label, "c": round(milli / 1000.0, 1)})
+    return out
+
+
+class HostSampler(object):
+    """RK3588 的 CPU / 内存 / 温度。没有依赖，也不碰 NPU。
+
+    CPU 占用率是**两次采样之差**（和 `top` 同口径）。所以第一次调用没有"上一次"，
+    `pct` 是 None 而不是 0.0——"还没量到"和"占用 0%"在屏幕上必须是两句话，
+    否则页面刚打开那一瞬间会显示一个假的 0%。
+
+    `root` 是给测试用的：把 `/proc`、`/sys` 换成一个夹具目录，本机（Windows，没有
+    /proc）就能把**这段解析与百分比算术**真跑一遍。板卡上传默认的 `/`。
+    读不到文件时每一项都退化成空/None，不抛——观测端点不该因为读不到一个文件而 500。
+    """
+
+    def __init__(self, root="/"):
+        self.root = root
+        self._lock = threading.Lock()
+        self._prev = None          # (monotonic, {key: (busy, total)})
+
+    def _p(self, rel):
+        return os.path.join(self.root, rel)
+
+    def sample(self):
+        now = time.monotonic()
+        cur = _read_proc_stat(self._p("proc/stat"))
+        with self._lock:
+            prev = self._prev
+            self._prev = (now, cur)
+
+        def pct(key):
+            if not prev or not cur or key not in cur or key not in prev[1]:
+                return None
+            pb, pt = prev[1][key]
+            cb, ct = cur[key]
+            d_total = ct - pt
+            if d_total <= 0:
+                return None
+            cpu = (cb - pb) * 100.0 / d_total
+            return round(max(0.0, min(100.0, cpu)), 1)
+
+        mem = _read_meminfo(self._p("proc/meminfo"))
+        mem_out = dict(mem)
+        if mem.get("total"):
+            # MemAvailable 才是"还能拿来用的"，MemFree 不含可回收的页缓存。用 MemFree
+            # 会把占用率显示得偏高（板上 16 GB 的机器上差 1 GB 量级）。
+            usable = mem.get("available", mem.get("free", 0))
+            mem_out["used"] = max(0, mem["total"] - usable)
+            mem_out["used_pct"] = round(mem_out["used"] * 100.0 / mem["total"], 1)
+
+        load = []
+        try:
+            with open(self._p("proc/loadavg"), "r") as fh:
+                load = [float(x) for x in fh.read().split()[:3]]
+        except (OSError, ValueError):
+            pass
+
+        uptime = None
+        try:
+            with open(self._p("proc/uptime"), "r") as fh:
+                uptime = float(fh.read().split()[0])
+        except (OSError, ValueError):
+            pass
+
+        cores = sorted([k for k in cur if k != "cpu"],
+                       key=lambda s: int(s[3:]) if s[3:].isdigit() else 0)
+        return {
+            "cpu": {
+                "n": len(cores) or None,
+                "pct": pct("cpu"),
+                "per_core": [pct(k) for k in cores],
+                "loadavg": load,
+            },
+            "mem": mem_out,
+            "thermal": _read_thermals(self._p(_THERMAL_BASE)),
+            "uptime_s": round(uptime, 1) if uptime is not None else None,
+        }
+
+
+class CardStats(object):
+    """把后端 STAT 帧变成每张卡的"现在"。
+
+    NPU 利用率 = **Δ忙时 / Δ墙上时间**，两个数都取后端自己的单调时钟（`now_us`），
+    所以不受网关这边调度抖动影响。忙时由后端在卡级锁内累加，量的是"这张卡真在算"
+    的时间，不是"有没有人在等"。
+
+    第一次调用没有"上一次"，`busy_pct` 是 None——**不是 0%**。这和 HostSampler 是
+    同一个道理：刚打开页面就显示"NPU 0%"，会让人以为板卡闲着。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._prev = None          # (now_us, {card_name: busy_us})
+
+    def sample(self, doc):
+        if not isinstance(doc, dict):
+            return {"ok": False, "cards": [], "busy_pct": None}
+        now_us = doc.get("now_us") or 0
+        raw = doc.get("cards") or []
+        busy = {}
+        for c in raw:
+            if isinstance(c, dict) and c.get("name"):
+                busy[c["name"]] = c.get("busy_us") or 0
+        with self._lock:
+            prev = self._prev
+            self._prev = (now_us, busy)
+
+        cards = []
+        pcts = []
+        for c in raw:
+            if not isinstance(c, dict):
+                continue
+            name = c.get("name")
+            mem_at = c.get("mem_at_us") or 0
+            total = c.get("mem_total") or 0
+            free = c.get("mem_free") or 0
+            card = {
+                "name": name,
+                "ctx_len": c.get("ctx_len"),
+                "run_calls": c.get("run_calls"),
+                "mem_total": total,
+                "mem_free": free,
+                "mem_used": max(0, total - free) if total else None,
+                "mem_used_pct": (round(max(0.0, total - free) * 100.0 / total, 1)
+                                 if total else None),
+                "node_num": c.get("node_num") or None,
+                "node_min_free": c.get("node_min_free") or None,
+                # 快照年龄。mem_at_us == 0 表示后端**一次都没采到**（查询失败），
+                # 那和"采过但很旧"是两回事，得让页面分开说。
+                "mem_age_s": (round((now_us - mem_at) / 1e6, 1)
+                              if (mem_at and now_us >= mem_at) else None),
+                "busy_pct": None,
+            }
+            if prev and prev[0] and now_us > prev[0]:
+                p0 = prev[1].get(name)
+                p1 = busy.get(name)
+                if p0 is not None and p1 is not None and p1 >= p0:
+                    span = now_us - prev[0]
+                    card["busy_pct"] = round(max(0.0, min(100.0,
+                                                         (p1 - p0) * 100.0 / span)), 1)
+            if card["busy_pct"] is not None:
+                pcts.append(card["busy_pct"])
+            cards.append(card)
+        return {
+            "ok": True,
+            "cards": cards,
+            # 四张卡是一条流水线，同一时刻大致同样忙；取平均当"整机 NPU 利用率"。
+            "busy_pct": round(sum(pcts) / len(pcts), 1) if pcts else None,
+        }
+
+
 class Backend(object):
     """demo 子进程 + 帧协议。所有方法都线程安全。"""
 
@@ -217,6 +451,13 @@ class Backend(object):
         self._rfile = None
         self._reader = None
         self.on_clear = None                  # 回调 (session, ctx, limit)
+        # 资源观测：最近一次的 STAT 答复 + 它到达的时刻。读线程写、HTTP 线程读，
+        # 用一把 cond 同时当锁和"新的答复到了"的信号（见 request_stats）。
+        self.stats = None
+        self.stats_seq = 0
+        self.stats_at = 0.0
+        self._stats_cv = threading.Condition()
+        self._stats_sent_at = 0.0
 
     # ---- 生命周期 ----
 
@@ -299,6 +540,14 @@ class Backend(object):
                     n = int(f[-1])
                     payload = self._rfile.read(n) if n > 0 else b""
                     self._dispatch_payload(tag, int(f[0]), payload)
+                elif tag == b"STAT":
+                    # `STAT <n>` + JSON 载荷，没有 rid（它不是某个请求的答复）。
+                    # ⚠️ 这一帧**必须在这里被消费掉**：不认它的 tag 就读不走那 n 个
+                    # 字节，整条帧流从此错位——和 ERR 帧那次是同一个坑（§9.7 末）。
+                    f = rest.split()
+                    n = int(f[0]) if f else 0
+                    payload = self._rfile.read(n) if n > 0 else b""
+                    self._on_stats(payload)
                 elif tag == b"DONE":
                     f = rest.split()
                     self._handle_done(f)
@@ -329,6 +578,57 @@ class Backend(object):
                 q.dead = True
                 q.error = q.error or "backend exited"
                 q.done.set()
+
+    def _on_stats(self, payload):
+        """读线程收到一帧 STAT：解出 JSON 放进缓存，并叫醒等它的人。
+
+        解析失败**只丢这一帧**，不往上抛：帧流里出现一个解不开的 STAT 不应该把读线程
+        带走（读线程一死，所有在途请求都被判 "backend exited"，整个服务变 503）。
+        """
+        try:
+            doc = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            sys.stderr.write("[gateway] bad STAT payload: %r\n" % (exc,))
+            return
+        with self._stats_cv:
+            self.stats = doc
+            self.stats_at = time.monotonic()
+            self.stats_seq += 1
+            self._stats_cv.notify_all()
+
+    def request_stats(self, min_interval=STAT_MIN_INTERVAL, wait=STAT_WAIT):
+        """要一份最新的后端资源快照。**永远不会抛异常，也永远不长时间阻塞。**
+
+        两道节制：
+        · `min_interval` 之内问过就直接给缓存——STAT 和 REQ 走同一条 stdin，
+          没人在看页面时一个字节都不该发，有人在看时也不该比页面刷新还快；
+        · 发出去之后最多等 `wait` 秒。后端是**就地答原子量**（不排队、不碰设备），
+          正常 <1ms；等不到说明后端卡住了，那就返回上一次的缓存并让页面自己标旧
+          ——**卡住的时候返回旧数比返回 500 有用得多**，看护恰恰要看这个。
+        """
+        with self._stats_cv:
+            now = time.monotonic()
+            if now - self._stats_sent_at < min_interval:
+                return self.stats
+            if self._dead or self.proc is None or self.proc.stdin is None:
+                return self.stats
+            want = self.stats_seq + 1
+            self._stats_sent_at = now
+            try:
+                with self._write_lock:
+                    self.proc.stdin.write(b"STAT\n")
+                    self.proc.stdin.flush()
+            except Exception:                              # noqa: BLE001
+                # 写失败就是后端没了/管道断了。这条路径**不能抛**：/v1/system 是观测
+                # 端点，它挂掉不该把看页面的人也带走。
+                return self.stats
+            deadline = now + wait
+            while self.stats_seq < want:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._stats_cv.wait(left)
+            return self.stats
 
     def _get(self, rid):
         with self._lock:
@@ -963,11 +1263,43 @@ class Gateway(object):
         self.pool = pool
         self.verbose = verbose
         self.started_at = time.time()
+        self.host = HostSampler()
+        self.cards = CardStats()
 
     def log(self, fmt, *args):
         if self.verbose:
             sys.stderr.write("[gateway] " + (fmt % args) + "\n")
             sys.stderr.flush()
+
+    def system_snapshot(self):
+        """`/v1/system` 的内容：RK3588（本机读）+ RK1828（后端 STAT 帧）+ 网关自己。
+
+        **两半的可信度不一样，所以不用同一个形状糊在一起**：`host` 是这一秒读到的，
+        `cards` 是从后端来的、带着它的采样时刻；`backend_stats_age_s` 说后者有多旧。
+        """
+        doc = self.backend.request_stats()
+        cards = self.cards.sample(doc)
+        stats_age = (round(time.monotonic() - self.backend.stats_at, 1)
+                     if self.backend.stats_at else None)
+        pool = self.pool.snapshot()
+        return {
+            "ts": round(time.time(), 3),
+            "host": self.host.sample(),
+            "npu": cards,
+            "backend": {
+                "alive": self.backend.alive(),
+                "sessions": self.backend.sessions,
+                "ctx_size": self.backend.ctx_size,
+                "stats_age_s": stats_age,
+            },
+            "gateway": {
+                "busy": sum(1 for s in pool["slots"] if s["state"] == "busy"),
+                "bound": sum(1 for s in pool["slots"] if s["state"] in ("busy", "idle")),
+                "dead": sum(1 for s in pool["slots"] if s["state"] == "dead"),
+                "waiting": len(pool["waiting"]),
+                "uptime_s": round(time.time() - self.started_at, 1),
+            },
+        }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1111,6 +1443,15 @@ class Handler(BaseHTTPRequestHandler):
                                                           if s["state"] in ("busy", "idle")),
                                     "waiting": len(pool["waiting"]),
                                     "uptime_s": round(time.time() - self.gateway.started_at, 1)})
+        if path == "/v1/system":
+            # 非 OpenAI 标准端点，纯观测：板卡此刻的 CPU / 内存 / 温度 / 每卡 NPU。
+            # 页面每 2s 轮一次；**这个端点永远不会因为后端卡住而报错**——拿不到新数就
+            # 返回上一份并带上年龄，因为"看板卡现在怎么样"正是它卡住时最需要的。
+            try:
+                return self._json(200, self.gateway.system_snapshot())
+            except Exception as exc:                        # noqa: BLE001
+                return self._error(500, "system snapshot failed: %r" % (exc,),
+                                   err_type="server_error")
         if path == "/v1/pool":
             # 非 OpenAI 标准端点，纯观测：谁占着哪个会话、闲了多久、谁在排队。
             return self._json(200, self.gateway.pool.snapshot())
@@ -1773,6 +2114,244 @@ def selftest_pool_liveness(check):
     check("错误分得清是「会话没了」", err is not None and "dead" in str(err), "%r" % (err,))
 
 
+def _fixture(root, rel, text):
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(text)
+
+
+def selftest_system(check, backend=None):
+    """资源观测那半边：/proc 解析 + CPU 百分比算术 + STAT 帧往返。
+
+    为什么非要夹具目录：`HostSampler` 在**本机（Windows）根本没有 /proc**，只按真板卡
+    验的话，这段解析和百分比算术要等到上了板子、盯着页面看才发现算错。`root=` 就是
+    为这个留的——把 /proc、/sys 换成一个临时目录，本机就能把**算术**真跑一遍。
+
+    CPU 占用率是两次采样之差，夹具就靠**换 jiffies** 造出确定的一段：百分比只跟差值
+    有关，跟两次采样之间真实的墙钟无关，所以这里的期望值是精确的、不是"大约"。
+    """
+    root = tempfile.mkdtemp(prefix="sysfix-")
+    try:
+        # ---- /proc/stat：四个核各钉一件事 ----
+        # cpu0 差值 100/100 = 100.0%（满核）；cpu1 差 0/100 = 0.0%（空核）；
+        # cpu2 **这一段只涨 iowait**（iowait 必须算空闲，否则等磁盘会被报成 CPU 忙）
+        #  ⚠️ 涨的必须是 iowait 那一格、不能是 idle 格：只动 idle 的话"把 iowait 当忙"
+        #  这个错法在**两次采样的差值**上正好抵消（两个快照都多算了那 50），变异体
+        #  会活下来（第一版就是这样，M1 逃掉了）。
+        # cpu3 差值**为负**（时钟回摆/计数器重置那种形态）必须夹到 0.0，不能吐负数。
+        _fixture(root, "proc/stat", """\
+cpu  1000 0 200 7000 0 0 0 0 0 0
+cpu0 400 0 100 3000 0 0 0 0 0 0
+cpu1 300 0 50 2000 0 0 0 0 0 0
+cpu2 200 0 25 1500 50 0 0 0 0 0
+cpu3 100 0 25 500 0 0 0 0 0 0
+intr 0
+""")
+        # MemAvailable 6/16 GB ⇒ 用掉 62.5%。若误用 MemFree（2 GB）会算成 87.5%，
+        # 所以这个期望值同时钉住了"取的是哪一格"。
+        _fixture(root, "proc/meminfo", """\
+MemTotal:       16000000 kB
+MemFree:         2000000 kB
+MemAvailable:    6000000 kB
+Buffers:          100000 kB
+Cached:          3000000 kB
+SReclaimable:     200000 kB
+SwapTotal:       4194300 kB
+SwapFree:        4194300 kB
+""")
+        _fixture(root, "proc/loadavg", "0.50 0.40 0.35 2/1234 4567\n")
+        _fixture(root, "proc/uptime", "12345.67 12345.67\n")
+        # 温度：三个好区 + 一个 temp 是垃圾 + 一个连 type 都没有。后两个必须被跳过
+        # 而不是让整段报错（真机上某个区偶尔读不出来不能拖垮整个面板）。
+        _fixture(root, "sys/class/thermal/cooling_device0/type", "processor\n")
+        _fixture(root, "sys/class/thermal/thermal_zone0/type", "soc-thermal\n")
+        _fixture(root, "sys/class/thermal/thermal_zone0/temp", "45000\n")
+        _fixture(root, "sys/class/thermal/thermal_zone1/type", "bigcore0-thermal\n")
+        _fixture(root, "sys/class/thermal/thermal_zone1/temp", "51234\n")
+        _fixture(root, "sys/class/thermal/thermal_zone2/type", "npu-thermal\n")
+        _fixture(root, "sys/class/thermal/thermal_zone2/temp", "48000\n")
+        _fixture(root, "sys/class/thermal/thermal_zone3/type", "gpu-thermal\n")
+        _fixture(root, "sys/class/thermal/thermal_zone3/temp", "not-a-number\n")
+        _fixture(root, "sys/class/thermal/thermal_zone4/type", "missing-temp\n")
+
+        print("== HostSampler：第一次采样只该有「静态量」，百分比必须是 None 而不是 0 ==")
+        hs = HostSampler(root=root)
+        a = hs.sample()
+        check("核数认得出（cpu0..cpu3）", a["cpu"]["n"] == 4, "n=%r" % (a["cpu"]["n"],))
+        check("第一次 CPU%% 是 None（没上一次可减，不是 0%）",
+              a["cpu"]["pct"] is None, "= %r" % (a["cpu"]["pct"],))
+        check("第一次每核也都是 None",
+              a["cpu"]["per_core"] == [None] * 4, "= %r" % (a["cpu"]["per_core"],))
+        check("静态量第一次就有", a["mem"]["used_pct"] == 62.5 and len(a["thermal"]) == 3,
+              "used_pct=%r 热区=%d 个" % (a["mem"]["used_pct"], len(a["thermal"])))
+        check("loadavg 三个数", a["cpu"]["loadavg"] == [0.5, 0.4, 0.35],
+              "= %r" % (a["cpu"]["loadavg"],))
+        check("uptime 保留一位", a["uptime_s"] == 12345.7, "= %r" % (a["uptime_s"],))
+
+        # ---- 第二次采样：换一份 jiffies，差值就是上面设计好的那几组 ----
+        # 注意每一行都要自己算一遍：百分比只跟**差值**有关，写错一格就会得到一个
+        # "看着挺合理"的数（第一版把 cpu 行的 idle 写成了 7975，于是 25/100 变成了
+        # 2.5/100，自检报 FAIL —— 夹具写错和代码写错在这里是同一个现象）。
+        _fixture(root, "proc/stat", """\
+cpu  1025 0 200 7075 0 0 0 0 0 0
+cpu0 500 0 100 3000 0 0 0 0 0 0
+cpu1 300 0 50 2100 0 0 0 0 0 0
+cpu2 200 0 25 1500 150 0 0 0 0 0
+cpu3 90 0 20 600 0 0 0 0 0 0
+intr 0
+""")
+        b = hs.sample()
+        print("== 第二次采样：CPU 百分比 ==")
+        check("整机 25/100 => 25.0%", b["cpu"]["pct"] == 25.0, "= %r" % (b["cpu"]["pct"],))
+        check("cpu0 满核 => 100.0%", b["cpu"]["per_core"][0] == 100.0,
+              "= %r" % (b["cpu"]["per_core"][0],))
+        check("cpu1 差值为 0 => 0.0%", b["cpu"]["per_core"][1] == 0.0,
+              "= %r" % (b["cpu"]["per_core"][1],))
+        check("cpu2 只涨 iowait => 0.0%（等磁盘不算 CPU 在干活）",
+              b["cpu"]["per_core"][2] == 0.0, "= %r" % (b["cpu"]["per_core"][2],))
+        check("cpu3 差值为负 => 夹到 0.0%（不吐负数）",
+              b["cpu"]["per_core"][3] == 0.0, "= %r" % (b["cpu"]["per_core"][3],))
+        check("热区按 zone 号排序、label 与摄氏度都对",
+              [(t["zone"], t["label"], t["c"]) for t in b["thermal"]] ==
+              [("thermal_zone0", "soc-thermal", 45.0),
+               ("thermal_zone1", "bigcore0-thermal", 51.2),
+               ("thermal_zone2", "npu-thermal", 48.0)],
+              "%r" % (b["thermal"],))
+
+        print("== 读不到就退化，不抛（观测端点不该因为一个文件读不到就 500）==")
+        empty = HostSampler(root=os.path.join(root, "does-not-exist")).sample()
+        check("没有 /proc 也不抛，核数是 None（**不是 0**——0 核是假话）",
+              empty["cpu"]["n"] is None and empty["cpu"]["pct"] is None,
+              "n=%r pct=%r" % (empty["cpu"]["n"], empty["cpu"]["pct"]))
+        check("内存退化成空而不是 0 占用",
+              empty["mem"].get("total", 0) == 0 and "used_pct" not in empty["mem"],
+              "total=%r" % (empty["mem"].get("total"),))
+        check("热区退化成空表", empty["thermal"] == [], "= %r" % (empty["thermal"],))
+        check("uptime 退化成 None", empty["uptime_s"] is None, "= %r" % (empty["uptime_s"],))
+
+        print("== CardStats：Δ忙时 / Δ墙钟 ==")
+        def card(name, busy_us, mem_at_us, **kw):
+            d = {"name": name, "busy_us": busy_us, "run_calls": 7, "mem_at_us": mem_at_us,
+                 "mem_total": 1000, "mem_free": 400, "node_num": 8,
+                 "node_min_free": 50, "ctx_len": 8192}
+            d.update(kw)
+            return d
+
+        cs = CardStats()
+        first = cs.sample({"now_us": 1000000,
+                           "cards": [card("stage0", 100000, 900000),
+                                     card("stage1", 100000, 0)]})
+        check("第一次 busy_pct 是 None（不是 0%）",
+              first["busy_pct"] is None and
+              all(c["busy_pct"] is None for c in first["cards"]),
+              "= %r" % (first["busy_pct"],))
+        check("整卡占用 = (total-free)/total", first["cards"][0]["mem_used"] == 600 and
+              first["cards"][0]["mem_used_pct"] == 60.0,
+              "%r/%r" % (first["cards"][0]["mem_used"], first["cards"][0]["mem_used_pct"]))
+        check("mem_age_s 按后端自己的时钟算（0.1s）",
+              first["cards"][0]["mem_age_s"] == 0.1,
+              "= %r" % (first["cards"][0]["mem_age_s"],))
+        check("mem_at_us==0 => mem_age_s 是 None（一次都没采到，不是「很旧」）",
+              first["cards"][1]["mem_age_s"] is None,
+              "= %r" % (first["cards"][1]["mem_age_s"],))
+
+        second = cs.sample({"now_us": 2000000,           # 距上一次 1.0s
+                            "cards": [card("stage0", 600000, 1900000),
+                                      card("stage1", 1100000, 1900000),
+                                      card("stage2", 5, 1900000)]})
+        check("stage0 Δ0.5s / 1.0s => 50.0%", second["cards"][0]["busy_pct"] == 50.0,
+              "= %r" % (second["cards"][0]["busy_pct"],))
+        check("stage1 Δ1.0s / 1.0s => 100.0%", second["cards"][1]["busy_pct"] == 100.0,
+              "= %r" % (second["cards"][1]["busy_pct"],))
+        check("上一帧没出现过的卡 => None（不拿 0 冒充基线）",
+              second["cards"][2]["busy_pct"] is None,
+              "= %r" % (second["cards"][2]["busy_pct"],))
+        check("整机取的是**有值的那几张**的平均（不是拿 None 当 0 摊进去）",
+              second["busy_pct"] == 75.0, "= %r" % (second["busy_pct"],))
+
+        third = cs.sample({"now_us": 2500000,            # 距上一次只有 0.5s
+                           "cards": [card("stage0", 1600000, 2400000),
+                                     card("stage1", 1100000, 2400000)]})
+        check("Δ忙时 > Δ墙钟（采样点被压近）=> 夹到 100.0%，不吐 200%",
+              third["cards"][0]["busy_pct"] == 100.0,
+              "= %r" % (third["cards"][0]["busy_pct"],))
+        check("忙时倒退（不该发生但别崩）=> 该卡给 None、其余照算",
+              cs.sample({"now_us": 3000000,
+                         "cards": [card("stage0", 1, 2900000)]})["cards"][0]["busy_pct"]
+              is None, "")
+
+        print("== 后端 STAT 帧的解包与缓存 ==")
+        bad_input = CardStats().sample(None)
+        check("后端还没答过（stats=None）=> ok=False，不抛",
+              bad_input == {"ok": False, "cards": [], "busy_pct": None},
+              "= %r" % (bad_input,))
+
+        be = Backend(["true"], os.path.join(root, "unused.log"), frame_fd="stdout")
+        be._on_stats(b'{"now_us": 1, "cards": [{"name": "s", "busy_us": 2}]}')
+        check("好载荷进缓存、序号 +1", be.stats_seq == 1 and
+              be.stats["cards"][0]["name"] == "s", "seq=%d" % be.stats_seq)
+        be._on_stats(b"{ this is not json")
+        check("坏载荷只丢这一帧，读线程不许死（stats_seq 不动、stats 不脏）",
+              be.stats_seq == 1, "seq=%d" % be.stats_seq)
+        check("没起进程时 request_stats 返回缓存且不抛",
+              be.request_stats(min_interval=0) is be.stats, "")
+        try:
+            got = be.request_stats(min_interval=0)
+            raised = False
+        except Exception:                                   # noqa: BLE001
+            got, raised = None, True
+        check("观测端点永不抛异常", not raised, "= %r" % (got,))
+
+        if backend is not None and any("fake_backend" in str(a) for a in backend.argv):
+            print("== STAT 帧真往返（桩后端；真正要钉住的是**帧流没被这帧撑错位**）==")
+            seq0 = backend.stats_seq
+            live = backend.request_stats(min_interval=0, wait=2.0)
+            seq1 = backend.stats_seq
+            ok_live = isinstance(live, dict) and live.get("cards")
+            check("桩答得出 STAT", bool(ok_live),
+                  "%d 张卡" % (len(live.get("cards") or [])) if ok_live else repr(live))
+            if ok_live:
+                live2 = backend.request_stats(min_interval=0, wait=2.0)
+                seq2 = backend.stats_seq
+                # 每要一次就恰好该多一条答复。载荷没被读走的话，读线程下一帧看到的
+                # 是一段 JSON 当帧头，从此再也认不出 STAT ⇒ 序号就停在这儿了。
+                # 判"两张卡数一样"是不够的：错位之后页面拿到的是**同一份缓存**，
+                # 卡数一样、内容也一样旧。
+                check("每要一次恰好多一条答复（载荷被完整消费，没留下半帧）",
+                      seq1 == seq0 + 1 and seq2 == seq1 + 1,
+                      "seq %d -> %d -> %d" % (seq0, seq1, seq2))
+                check("第二次是**新**快照，不是把上一次的缓存还回来",
+                      isinstance(live2, dict) and (live2.get("now_us") or 0) >
+                      (live.get("now_us") or 0),
+                      "now_us %r -> %r" % (live.get("now_us"), (live2 or {}).get("now_us")))
+                c0 = (live.get("cards") or [{}])[0]
+                check("每张卡该带来的字段都在",
+                      all(k in c0 for k in ("name", "busy_us", "run_calls", "mem_at_us",
+                                            "mem_total", "mem_free", "node_num",
+                                            "node_min_free", "ctx_len")),
+                      "keys=%s" % sorted(c0.keys()))
+                # 上面几条都一样、但流已经错位一帧时，最先炸的是**下一个普通请求**。
+                # 所以最后再跑一轮真问答：这帧要是把流撑歪了，这里必然不通过。
+                q = backend.submit(render_messages([{"role": "user",
+                                                     "content": "答一个字。"}]),
+                                   16, session=0, reset=True)
+                # `wait()` 成功时**返回 q**、失败时抛，所以别写成 `err = wait(q)` 再判
+                # None——那永远是假的（第一版就这么写的，于是这一项无脑 FAIL）。
+                try:
+                    backend.wait(q, timeout=REQUEST_TIMEOUT)
+                    err = None
+                except BackendError as exc:
+                    err = exc
+                text = q.text()
+                backend.release_request(q)
+                check("STAT 之后普通请求照常（帧流对齐）",
+                      err is None and len(text) > 0,
+                      "%r / %d 字" % (err, len(text)))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def selftest(backend, pool):
     """验证 C++ 侧的帧协议。比"直接上 HTTP"分段定位得清楚：协议不通时不用怀疑 HTTP。"""
     ok = True
@@ -2167,6 +2746,9 @@ def selftest(backend, pool):
 
     print("== 后端死了 / 会话全 dead：不能让人排在队列里空等 ==")
     selftest_pool_liveness(check)
+
+    print("== 资源观测：/proc 解析、CPU 百分比算术、STAT 帧 ==")
+    selftest_system(check, backend)
 
     print("\n%s" % ("自检全部通过" if ok else "自检有失败项，见上面的 FAIL"))
     return 0 if ok else 1

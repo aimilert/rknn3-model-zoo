@@ -82,6 +82,29 @@ rope 外置张量的大小：每个位置 256 字节 + 432 字节头 ⇒ 8192 �
 - `GET /v1/models` → OpenAI 格式的模型列表
 - `POST /v1/chat/completions` → 兼容 OpenAI；`stream: true` 走 SSE，`stream: false` 一次性返回
 - `GET /v1/pool` → 会话池快照，**多用户场景诊断用**（见下）
+- `GET /v1/system` → 资源快照，**演示页那条资源条的数据源**（每 2s 拉一次）。形状：
+
+  ```json
+  {"ts": 1758...,
+   "host": {"cpu": {"n": 8, "pct": 12.5, "per_core": [8.0, 3.1, ...], "loadavg": [0.4,0.3,0.2]},
+            "mem": {"total": 168..., "available": 60..., "used": 108..., "used_pct": 64.3},
+            "thermal": [{"zone": "thermal_zone0", "label": "soc-thermal", "c": 61.2}, ...],
+            "uptime_s": 12345},
+   "npu": {"ok": true, "busy_pct": 43.1,
+           "cards": [{"name": "stage0", "ctx_len": 32768, "run_calls": 41, "busy_pct": 55.0,
+                      "mem_total": 5071..., "mem_free": 480..., "mem_used_pct": 90.6,
+                      "mem_age_s": 0.4, "node_num": 8, "node_min_free": 13...}, ...]},
+   "backend": {"alive": true, "sessions": 2, "ctx_size": 32768, "stats_age_s": 0.4},
+   "gateway": {"busy": 1, "bound": 1, "dead": 0, "waiting": 0, "uptime_s": 900}}
+  ```
+
+  ⚠️ **几个数别读错**：`npu.busy_pct`（与每卡的 `busy_pct`）是**算出来的**——累计推理
+  耗时 ÷ 墙钟，**SDK 没有 NPU 利用率查询接口**；`host.thermal` **只有 RK3588 的热区**
+  （RK1828 是 PCIe 设备，没有 hwmon/thermal_zone，拿不到卡温）；**缺值一律 `null`**
+  （页面画 `—`，绝不画 `0%`）：`cpu.pct` / `busy_pct` 第一次采样为 `null`（没有前一个点
+  可比），`node_min_free` / `node_num` 为 `null` 表示后端没报节点数，`mem_age_s` 为
+  `null` 表示**一次都没采到**（与"采过但很旧"是两回事）。后端挂了或答不上来这一接口
+  **不报错**：`backend.alive` 变 `false`、`stats_age_s` 变大（页面据此把数标成"旧的"）。
 - `POST /v1/conversations/close` → **"这段对话说完了"**：立刻把它占的会话交还给排队者（见下）
 - `GET /`、`GET /demo` → 网页演示页（网关把同目录的 `demo_4chat.html` 读出来发出去）。
   **每次请求现读磁盘，换页面不用重启网关**。页面启动时先 `GET /health`，按
@@ -257,6 +280,10 @@ node page_check.js http://<板卡IP>:8080             # 用桩 DOM 跑页面里�
 # 记着自己的名字、关页面与点「清空」之后会话真的还了回去（后面这一条肉眼看不出来）、
 # 面板头那格性能小字写出来了、新一轮开始时那格是空的（挂着上一轮的数比空着更坏）
 #
+# 2026-09-20 起还验**资源条**：每核小柱的高度要跟着占用率走、热区取最热的 3 个（不是前 3 个）、
+# 缺值必须画 —（画成 0% 就是在说"板卡闲着"）、「还没采到」与「超过 6s 没更新」要分开说、
+# 后端答不上来时这条不能消失（要标成旧的）、页面切到后台要停止轮询。
+#
 # 2026-09-20 起还验**窗口的增删与上限**：初始窗口数必须等于 min(4, /health 的 sessions)、
 # 页面上限必须等于 /health 的 sessions（自己编一个数就 FAIL）、到上限点「＋」不许多出窗口、
 # 新窗口不许复用旧身份（复用=网关认成旧对话，现场看着是"删了没删掉"）、删窗口要当场把
@@ -282,12 +309,18 @@ python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --stagger 1.5
 python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --close      # 问完主动交还，排队的人立刻补上
 python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --no-id      # 对照：不带身份会退化成串行
 
-# 本地（无板卡，用假后端；Windows 上 pass_fds 不可用，靠 --frames-stdout）
-python3 rkllm_gateway.py --selftest
-python3 fake_backend.py --frames-stdout &
+# 本地（无板卡，用假后端）。`--frames-stdout` 是**网关**的开关：帧走子进程的 stdout，
+# 绕开 pass_fds（Windows 上直接不支持，实测 AssertionError）。Linux 上不加也能跑。
+python3 rkllm_gateway.py --frames-stdout --selftest -- python3 fake_backend.py   # 协议自检
+python3 rkllm_gateway.py --frames-stdout -- python3 fake_backend.py &            # 起服务给下面用
 python3 serve_http_test.py http://127.0.0.1:8080 quick
 python3 check_template.py
 ```
+
+`fake_backend.py` 的 `--stat-cards`（默认 4）和 `--ctx-len`（默认 8192）**只影响资源条**
+（`/v1/system` 里那几张卡）：它按 `ctx_len × 12400` 字节/路 编一套 KV 账，好让本地的
+`sessions=2 @32768` 也能画出"快撑爆了"的样子。本地没有 `/proc`，所以 RK3588 那半边
+（CPU/内存/温度）在 Windows 上是空的——**这部分只能在板卡上验**。
 
 **`serve_http_test.py` 的每个请求都带 `conversation_id`**（v1.9 起）：网关现在只排队不抢占，
 "每问一个新问题就开一段新对话"的写法在会话数用完（默认 4）之后会一路排队到 `IDLE_TTL`，

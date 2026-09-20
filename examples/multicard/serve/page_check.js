@@ -130,6 +130,12 @@ const document = {
     return null;
   },
   createElement(tag) { return makeEl(tag); },
+  // 资源条（2026-09-20 加）在页面切走时停轮询、切回来立刻补一次。桩得给这两样：
+  // 少了 addEventListener，页面启动那行直接 TypeError，整页在桩里全灭——而"切走就
+  // 停轮询"这件事恰恰是**只有桩能验**的（浏览器里要人手动切标签页）。
+  hidden: false,
+  _listeners: {},
+  addEventListener(ev, fn) { (this._listeners[ev] = this._listeners[ev] || []).push(fn); },
 };
 
 let script = /<script>([\s\S]*?)<\/script>/.exec(html)[1];
@@ -163,6 +169,9 @@ const ctx = {
   // 空函数——空函数会让踩醒间隔的那条路在桩里悄悄走不通，绿了也说明不了页面没问题
   // （这次就是先漏了它，页面在桩里直接报 `setInterval is not defined`，四路全灭）。
   setInterval, clearInterval,
+  // 资源条的自排下一拍用的是 setTimeout/clearTimeout（串行，慢响应不会把请求叠起来）。
+  // 同上：桩不能摆空函数，否则"切走之后真的不再发请求"这条路径在桩里根本走不到。
+  clearTimeout,
   // 页面里的 API 是 ""（同源相对路径），浏览器会自动按页面来源补全；node 不会，
   // 所以这里替它补——**只是替浏览器补全这一步，请求本身没做任何改写**。
   fetch: (url, opts) => {
@@ -217,7 +226,18 @@ vm.runInContext(script + "\n;globalThis.__t = { panels: panels, send: send, "
                + "maxSessions: function () { return MAX_SESSIONS; }, "
                + "ctxSize: function () { return CTX_SIZE; }, "
                + "capHtml: function () { return document.getElementById(\"cap\").innerHTML; }, "
-               + "capOver: function () { return document.getElementById(\"cap\").className; } };", ctx);
+               + "capOver: function () { return document.getElementById(\"cap\").className; }, "
+               // 资源条这一整套（2026-09-20 加）。**把 renderSys 本身交出来**，检查才
+               // 能拿一份自己造的 /v1/system 去渲染——本机没有 /proc，真跑起来 RK3588
+               // 那半永远都是 "—"，那些数字格式（GB/MB、每核、°C、旧数据的标注）就
+               // 只能等上了板子靠眼睛看。这与 summarize 那一组 fixture 是同一个套路：
+               // 页面跑的是原函数，喂进去的是一份确定的输入。
+               + "renderSys: renderSys, renderSysErr: renderSysErr, "
+               + "sysHtml: function () { return document.getElementById(\"sys\").innerHTML; }, "
+               + "startSysPoll: startSysPoll, stopSysPoll: stopSysPoll, "
+               + "refreshSystem: refreshSystem, "
+               + "sysOn: function () { return sysOn; }, "
+               + "SYS_STALE_S: SYS_STALE_S };", ctx);
 
 const { panels, send, summarize, addPanel, removePanel, capReady } = ctx.__t;
 
@@ -574,6 +594,186 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
       process.exit(1);
     }
     console.log("  增删窗口全过（身份不复用 · 到上限加不动 · 删除当场交还会话 · 显示号重排）\n");
+  }
+
+  // ---------- 资源条：数字对不对、读不到时怎么说 ----------
+  // 用户 2026-09-20 要的"把 RK1828/RK3588 的内存、NPU、CPU、温度动态显示在网页上"。
+  // 这里守三条，都是**照跑照显示、屏幕上却不对**的坏法：
+  //   a) 缺值不许画成 0 —— 刚打开页面时 NPU 利用率本来就没有（要两次采样才有差值），
+  //      画成 0% 等于告诉看的人"板卡闲着"，而那正是最该判断"到底跑没跑起来"的一帧；
+  //   b) NPU 利用率是**算出来的**、温度**只有 RK3588 的**，这两句必须写在条子上 ——
+  //      RK1828 是 PCIe 设备，主机侧没有 hwmon、SDK 也没有利用率查询接口，不写出来
+  //      那两个百分数会被当成硬件读数读走；
+  //   c) 后端不答了要当场标旧，不能继续拿上一次的数冒充"现在"。
+  //
+  // 夹具那一半是必须的：本机（Windows）没有 /proc，RK3588 那半真跑起来永远都是 "—"，
+  // 那些格式（GB/MB、每核、°C、开多久）就只能等上了板子靠眼睛看。所以**页面跑的是原
+  // 函数**、喂进去的是一份确定的 /v1/system（与 summarize 那组 fixture 同一个套路）。
+  {
+    let bad2 = 0;
+    const liveText = stripHtml(ctx.__t.sysHtml());
+    console.log("资源条（本机实跑，RK3588 那半本机读不到）:", liveText.slice(0, 200) || "(空)");
+    if (!/RK1828/.test(liveText)) {
+      console.log("FAIL: 资源条没在跑（还是占位符？）—— 轮询没起来、或者渲染抛了");
+      bad2++;
+    }
+    if (/正在读取/.test(liveText)) {
+      console.log("FAIL: 页面开了这么久资源条还停在「正在读取…」");
+      bad2++;
+    }
+    // 本机的真后端数据（桩后端答的 STAT）：卡数、每卡 NPU/内存两格都得在。
+    // 卡数**不跟会话数挂钩**：四张卡就是流水线的四段，一卡一路，会话数是"每卡开几路"。
+    // 所以这里跟 /v1/system 自己对——不写死 4，换个配置（或换个 stage 数）也照样成立。
+    const sysDocLive = await (await fetch(BASE + "/v1/system")).json();
+    const wantCards = ((sysDocLive.npu || {}).cards || []).length;
+    const liveCards = (liveText.match(/#\d/g) || []).length;
+    if (!wantCards || liveCards !== wantCards) {
+      console.log("FAIL: 资源条上画了 %d 张卡，/v1/system 报的是 %d 张", liveCards, wantCards);
+      bad2++;
+    }
+
+    const SYS_FIX = {
+      ts: 1,
+      host: {
+        cpu: { n: 8, pct: 42, per_core: [10, 20, 30, 40, 50, 60, 70, 80],
+               loadavg: [0.51, 0.4, 0.3] },
+        mem: { total: 17179869184, available: 6871947673, used: 10307921511,
+               used_pct: 60, free: 2000000000 },
+        // 板上真有 7 个热区。这里给 4 个：条子上按**温度**排前 3，剩下那个收进 title
+        // （板卡上那 7 个全长出来要 450px，把资源条挤成两行还没人看；而真正要一眼看出
+        // 来的只有"有没有地方烫起来"）。顺序是 temp 降序：npu 81 · bigcore0 51 · gpu 47。
+        thermal: [{ zone: "thermal_zone0", label: "soc-thermal", c: 45.0 },
+                  { zone: "thermal_zone1", label: "bigcore0-thermal", c: 51.2 },
+                  { zone: "thermal_zone2", label: "npu-thermal", c: 81.0 },
+                  { zone: "thermal_zone3", label: "gpu-thermal", c: 47.0 }],
+        uptime_s: 12345,
+      },
+      npu: { ok: true, busy_pct: 55.0, cards: [
+        { name: "stage0", ctx_len: 32768, run_calls: 12, mem_total: 5319368704,
+          mem_free: 500000000, mem_used: 4819368704, mem_used_pct: 90.6, node_num: 8,
+          node_min_free: 13 * 1048576, mem_age_s: 1.2, busy_pct: 55.0 },
+        { name: "stage1", ctx_len: 32768, run_calls: 3, mem_total: 5319368704,
+          mem_free: 900000000, mem_used: 4419368704, mem_used_pct: 83.1, node_num: 8,
+          node_min_free: 0, mem_age_s: null, busy_pct: null },
+      ] },
+      backend: { alive: true, sessions: 2, ctx_size: 32768, stats_age_s: 0.4 },
+      gateway: { busy: 1, bound: 2, dead: 0, waiting: 0, uptime_s: 3600 },
+    };
+    const run = (d) => { ctx.__t.renderSys(d); return ctx.__t.sysHtml(); };
+    const txt = (d) => stripHtml(run(d));
+    const chk2 = (ok, msg) => { if (!ok) { console.log("  FAIL: " + msg); bad2++; } };
+
+    const t = txt(SYS_FIX);
+    console.log("资源条（夹具）:", t.slice(0, 210));
+
+    // ① RK3588 那半：数字、单位、每核、温度都要真算出来，不是把 JSON 印出来。
+    chk2(/CPU 42%/.test(t), "RK3588 的 CPU 占用率没画出来（该是 42%）：" + JSON.stringify(t));
+    chk2(/内存 60%/.test(t) && /9\.6 GB \/ 16\.0 GB/.test(t),
+         "RK3588 内存该显示「60%」和「9.6 GB / 16.0 GB」：" + JSON.stringify(t));
+    chk2(/温度 npu 81° · bigcore0 51° · gpu 47°/.test(t),
+         "热区该按温度排前 3、短标签 + 摄氏度（soc-thermal 去掉后缀）：" + JSON.stringify(t));
+    chk2(/\+1/.test(t) && /全部热区：soc 45°/.test(run(SYS_FIX)),
+         "被收起来的热区要有个 +N、并且一个都不丢地放进 title：" + JSON.stringify(t));
+    chk2(/负载 0\.51/.test(t), "负载没画出来");
+    chk2(/开机 3h25m/.test(t), "开机时长该被折成 3h25m：" + JSON.stringify(t));
+    chk2((run(SYS_FIX).match(/<i title="[^"]*"><span style="height:/g) || []).length === 8,
+         "每核小柱该有 8 根（cpu0..cpu7）");
+    chk2(/title="80%"><span style="height:80%"/.test(run(SYS_FIX)),
+         "每核小柱的高度必须**就是**占用率（不许给 0% 留底座、也不许统一高度）");
+
+    // ② RK1828 那半：卡号、两格数、最紧 node。
+    // `\s+` 而不是单个空格：每一格之间那点空白靠的是 HTML 源码里的空格（`.grp` 是
+    // flex，空白不占位），去掉标签之后可能是两个空格——**这里要钉的是"有没有这两格
+    // 数、数对不对"，不是空白的个数**。
+    chk2(/#0 NPU 55%\s+内存 91%/.test(t),
+         "0 号卡该显示 NPU 55% / 内存 91%：" + JSON.stringify(t));
+    chk2(/node 13 MB/.test(t), "最紧 node 的余量没画出来（这是最先撞墙的那一格）");
+    chk2(!/node 0 MB/.test(t), "node_min_free 为 0 说明**没采到**，不许画成「node 0 MB」");
+    chk2(!/node null/.test(t), "读不到的 node 余量漏成了字面的「null」");
+    // 没采到就**整格不显示**，不要印一个「node —」出来占位：四张卡各占一格，一格
+    // 空着没人会误解，一格写着「—」反倒要人去想"是 0 还是没读到"（0 才是真的危险）。
+    chk2(!/node —/.test(t), "没采到的 node 余量被画成了「node —」占位");
+    // 内存 90.6% 该是警告色（>=85），不是普通色、也不是危险色（<95）。
+    chk2(/<span class="bar warn"><i style="width:90\.6%"><\/i><\/span>/.test(run(SYS_FIX)),
+         "内存 90.6% 那条该是警告色：" + JSON.stringify(run(SYS_FIX).slice(0, 400)));
+    chk2(/<b class="crit"[^>]*>npu 81°/.test(run(SYS_FIX)),
+         "npu 81° 该是危险色（>=80）");
+
+    // ③ 缺值必须是「—」，**不是 0%**。1 号卡的 busy_pct 是 null（第一次采样还没有差值），
+    //    这一格画成 0% 就是"板卡闲着"，而它恰恰是最该判断"跑没跑起来"的那一帧。
+    chk2(/#1 NPU —\s/.test(t), "没采到值的 NPU 该显示「—」而不是 0%：" + JSON.stringify(t));
+    chk2(!/#1 NPU 0%/.test(t), "缺值被画成了 0%（= 谎报板卡闲着）");
+
+    // ④ 那两句"别读歪"的话必须在条子上，不能只写在文档里。
+    chk2(/NPU 是卡级忙时占比/.test(t), "没说明 NPU 利用率是算出来的（SDK 没有利用率查询接口）");
+    chk2(/温度只有 RK3588 的热区/.test(t), "没说明温度只有 RK3588 的（RK1828 是 PCIe 设备、无 hwmon）");
+    chk2(/SDK 没有利用率查询接口/.test(t) && /主机侧没有 hwmon/.test(t),
+         "那两句说明该写全（不然还是会被当成硬件读数）");
+
+    // ⑤ 服务那一格：会话占用、排队、以及**数据多旧**。
+    chk2(/会话 2 \/ 2/.test(t) && /排队 0/.test(t), "会话/排队没画出来：" + JSON.stringify(t));
+    chk2(/数据 0\.4s 前/.test(t), "没标出这份数据是多久之前采的：" + JSON.stringify(t));
+    chk2(!/后端没在答/.test(t), "数据是新的（0.4s）却标了「后端没在答」");
+
+    // ⑥ 后端不答了：当场标旧，而不是继续拿上一次的数冒充"现在"。
+    const stale = txt(Object.assign({}, SYS_FIX, {
+      backend: { alive: true, sessions: 2, ctx_size: 32768, stats_age_s: 12.0 } }));
+    chk2(/数据 12\.0s 前/.test(stale) && /后端没在答/.test(stale),
+         "快照 12s 前就该说明白（阈值是 " + ctx.__t.SYS_STALE_S + "s）：" + JSON.stringify(stale));
+    const dead = txt(Object.assign({}, SYS_FIX, {
+      backend: { alive: false, sessions: 2, ctx_size: 32768, stats_age_s: null },
+      npu: { ok: false, cards: [], busy_pct: null } }));
+    chk2(/后端 已退出/.test(dead), "后端退出时该显示「已退出」：" + JSON.stringify(dead));
+    chk2(/读不到（后端还没答 STAT）/.test(dead), "后端没答 STAT 时该说明白，不能留空");
+
+    // ⑦ 本机/没后端时的退化：不许抛、不许把缺的格子画成 0。
+    const emptyDoc = txt({ host: {}, npu: { ok: false, cards: [] },
+                           backend: {}, gateway: {} });
+    console.log("资源条（空数据）:", emptyDoc.slice(0, 200));
+    chk2(/CPU —/.test(emptyDoc), "读不到 CPU 该显示「—」：" + JSON.stringify(emptyDoc));
+    chk2(/温度 —/.test(emptyDoc), "读不到温度该显示「—」");
+    chk2(!/CPU 0%/.test(emptyDoc) && !/内存 0%/.test(emptyDoc),
+         "读不到被画成了 0%（0 是假话，缺是另一回事）");
+    ctx.__t.renderSysErr("boom");
+    const errText = stripHtml(ctx.__t.sysHtml());
+    console.log("资源条（读不到）:", errText);
+    chk2(/读不到 \/v1\/system/.test(errText) && /boom/.test(errText),
+         "拿不到 /v1/system 时该说明白是拿不到：" + JSON.stringify(errText));
+    // 走**真那条路**：把 fetch 换成 503，看轮询自己会不会把这一条画出来。
+    // 光调 renderSysErr 只能证明"那段文案会渲染"，证不了"抓异常那一段真的接到了它"。
+    // 而这条正是最要紧的：观测端点挂了**不许影响这一页的任何功能**（聊天照跑）。
+    {
+      const realFetch = ctx.fetch;
+      ctx.fetch = function () { return Promise.resolve({ ok: false, status: 503 }); };
+      try { await ctx.__t.refreshSystem(); } finally { ctx.fetch = realFetch; }
+      const viaFetch = stripHtml(ctx.__t.sysHtml());
+      console.log("资源条（/v1/system 503）:", viaFetch);
+      chk2(/读不到 \/v1\/system/.test(viaFetch) && /503/.test(viaFetch),
+           "HTTP 503 时该画出「读不到」而不是抛出去：" + JSON.stringify(viaFetch));
+    }
+
+    // ⑧ 切走标签页就停轮询。板卡上这一页是投影看的，没人看的时候多发一个请求都可能
+    //    混进正在测量的那几路里去（CPU/带宽都在同一台机器上）。
+    ctx.__t.stopSysPoll();
+    chk2(ctx.__t.sysOn() === false, "切走之后轮询该停掉");
+    ctx.__t.startSysPoll();
+    chk2(ctx.__t.sysOn() === true, "切回来该重新开轮询");
+    const visListeners = (document._listeners.visibilitychange || []);
+    chk2(visListeners.length > 0, "没挂 visibilitychange —— 切走了还在轮询");
+    if (visListeners.length) {
+      document.hidden = true; visListeners.forEach(f => f());
+      chk2(ctx.__t.sysOn() === false, "页面被切走（document.hidden）之后轮询还在跑");
+      document.hidden = false; visListeners.forEach(f => f());
+      chk2(ctx.__t.sysOn() === true, "切回来没重新开轮询");
+    }
+    // 上面把资源条改成了夹具/错误文案，恢复成真数据，别影响后面那几节（它们会重画页面）。
+    ctx.__t.renderSys(null);
+
+    if (bad2) {
+      console.log("FAIL: 资源条有 %d 项不对", bad2);
+      process.exit(1);
+    }
+    console.log("  资源条全过（缺值不画 0 · 单位与颜色 · 旧数据标注 · 两半来源说明）\n");
   }
 
   // 走**用户点「②」的那条路**（runAll），不是自己 `panels.map(send)` 一遍。
