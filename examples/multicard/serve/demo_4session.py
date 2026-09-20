@@ -21,7 +21,7 @@ http_scaling.py 量的是数，这个脚本要的是**眼睛能看见**：屏幕
    "并发有收益"，有对照才有意义。
 
 用法：python3 demo_4session.py [base_url] [N] [每路token数] [--plain] [--nothink]
-  默认 http://127.0.0.1:8080 / N=4 / 128 token / 开思考
+  默认 http://127.0.0.1:18280 / N=4 / 128 token / 开思考
   --plain    不用光标重绘（输出要重定向到文件或串口时用），改成逐块打带标签的行
   --nothink  关思考（软开关：网关给每条 user 贴 /no_think 并摘掉 <think> 段）。
              **上台演示建议加这个**：默认开思考时，流出来的是推理过程
@@ -36,7 +36,7 @@ import urllib.request
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 PLAIN = "--plain" in sys.argv
 NOTHINK = "--nothink" in sys.argv
-BASE = ARGS[0] if len(ARGS) > 0 else "http://127.0.0.1:8080"
+BASE = ARGS[0] if len(ARGS) > 0 else "http://127.0.0.1:18280"
 N = int(ARGS[1]) if len(ARGS) > 1 else 4
 NP = int(ARGS[2]) if len(ARGS) > 2 else 128
 TIMEOUT = 1800

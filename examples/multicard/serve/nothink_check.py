@@ -21,13 +21,13 @@
 这个脚本就是把这个判断钉死：同一段对话两轮都开 enable_thinking=false，看第二轮的
 X-KV-Reuse 头里 base 是不是非空、sent 是不是远小于 full。
 
-用法：python3 nothink_check.py http://127.0.0.1:8080
+用法：python3 nothink_check.py http://127.0.0.1:18280
 """
 import json
 import sys
 import urllib.request
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18280"
 NEEDLE = "青柠味苏打水"
 FAILS = []
 

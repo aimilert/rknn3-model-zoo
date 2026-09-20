@@ -11,7 +11,7 @@
 （1.03x，文档 §4.5.2 写明「推理执行排队串行」）；我们的执行器是 3.33x。
 用同一份脚本、同一台板子、同样的 N，这两个数才可比。
 
-用法：python3 http_scaling.py http://127.0.0.1:8080 [每路token数] [N列表,逗号分隔]
+用法：python3 http_scaling.py http://127.0.0.1:18280 [每路token数] [N列表,逗号分隔]
 
 **为什么每一路都必须显式给身份、用完必须 close**（2026-09-16 修）：
 这个脚本以前有个"热身"对话（无身份，靠内容哈希认身份）和 N 路匿名对话，全部**不释放**。
@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18280"
 NP = int(sys.argv[2]) if len(sys.argv) > 2 else 96
 NS = [int(x) for x in (sys.argv[3].split(",") if len(sys.argv) > 3 else ["1", "2", "4"])]
 TIMEOUT = 1800

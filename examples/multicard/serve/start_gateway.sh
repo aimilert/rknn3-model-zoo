@@ -25,7 +25,7 @@
 #                没有它，第 N+1 段对话要等到某一段静默满 IDLE_TTL——那段时间里 NPU 是
 #                真空着的，用户看到的就是"没人用，我却要等"。0 = 关掉这一级。
 #   QUEUE_TIMEOUT 取不到会话时最多排队等这么多秒，超了返回 503；默认 600（要 > IDLE_TTL）
-#   PORT         监听端口；默认 8080
+#   PORT         监听端口；默认 18280
 #   NP           每轮 max_new_tokens 的进程默认值；默认 512
 #   CTX          上下文长度（= --ctx-size）；默认 4096。⚠️ **它是一个"请求"，会在模型
 #                编进去的那一组 KV 候选里被夹住**——权威答案是 SDK 日志里的
@@ -48,6 +48,15 @@
 # 也是这么暴露的）。如果 Agent 就跑在板卡本机，把它设成 127.0.0.1 更稳妥——这个网关
 # 没有任何鉴权，谁能连上谁就能用满 4 张卡的算力。
 #
+# 关于 PORT（2026-09-20 从 8080 改成 18280）：**换端口本身不是安全控制**——同一个
+# 局域网里扫一遍就找到了，真正的门禁是 CORS（见下）和"要不要加鉴权"。改的是把这块
+# 板卡从"默认端口那一份名单"上挪开：8080 是几乎每个端口扫描器第一个试的，而这个服务
+# 没有任何鉴权，被扫到就等于被用上。想改回来 `PORT=8080 ./start_gateway.sh` 即可，
+# 但**所有客户端（同事的隧道、cc-switch 的 Base URL、书签）都得跟着改**。
+#
+#   CORS_ORIGIN  允许哪个**来源**跨源调用（浏览器那道门禁）。**默认空 = 一个都不放行**，
+#                演示页是同源的、用不到它。要放开就写全 `scheme://host[:port]`。
+#
 # 用法（板上）：
 #   INSTALL_DIR=.../install-Qwen/rk3588_linux_aarch64/rknn_multicard_demo \
 #   MODEL_DIR=.../Qwen3.5-27B ./start_gateway.sh
@@ -62,7 +71,7 @@ NSESSION=${NSESSION:-4}
 IDLE_TTL=${IDLE_TTL:-300}
 CONTEND_IDLE=${CONTEND_IDLE:-15}
 QUEUE_TIMEOUT=${QUEUE_TIMEOUT:-600}
-PORT=${PORT:-8080}
+PORT=${PORT:-18280}
 NP=${NP:-512}
 CTX=${CTX:-4096}
 HOST=${HOST:-0.0.0.0}
@@ -123,8 +132,14 @@ cd "$INSTALL_DIR" || { echo "cannot cd $INSTALL_DIR (set INSTALL_DIR)"; exit 1; 
 [ -d "$MODEL_DIR" ] || { echo "no such model dir: $MODEL_DIR (set MODEL_DIR)"; exit 1; }
 export LD_LIBRARY_PATH=./lib
 
+# CORS_ORIGIN 只在设了的时候才把那个开关递下去：不设就**一个跨源请求都不放行**
+# （网关那边的默认行为），命令行上也就不出现这个参数——省得看进程表的人以为放行了谁。
+CORS_ARG=""
+[ -n "${CORS_ORIGIN:-}" ] && CORS_ARG="--cors-origin $CORS_ORIGIN"
+
 exec taskset f0 python3 "$GATEWAY_DIR/rkllm_gateway.py" \
   --host "$HOST" --port "$PORT" \
+  $CORS_ARG \
   --sessions "$NSESSION" --verbose \
   --idle-ttl "$IDLE_TTL" --contend-idle "$CONTEND_IDLE" \
   --queue-timeout "$QUEUE_TIMEOUT" \

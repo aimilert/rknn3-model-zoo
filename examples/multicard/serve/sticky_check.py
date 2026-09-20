@@ -21,14 +21,14 @@
 不够——复用可能发生在**别的会话**上（换了会话也可能碰巧前缀相同）。所以同时看
 X-KV-Reuse 响应头（会话号 / 是否 RESET / 实发字节数）。
 
-用法：python3 sticky_check.py http://127.0.0.1:8080
+用法：python3 sticky_check.py http://127.0.0.1:18280
 """
 import json
 import sys
 import time
 import urllib.request
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18280"
 TIMEOUT = 1800
 # 暗号要中性：第一版用了「紫色犀牛731」，模型把它读成历史敏感事件直接拒答，
 # 实验就废了（踩过）。下面这个是纯无害的名词短语。

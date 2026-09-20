@@ -50,7 +50,7 @@ MODEL_DIR=<模型目录> \
 ```
 
 环境变量（都有默认值，见脚本头部注释）：`INSTALL_DIR`（含后端二进制与 `lib/`）、
-`MODEL_DIR`、`GATEWAY_DIR`、`B`（后端二进制名）、`NSESSION`（默认 4）、`PORT`（默认 8080）、
+`MODEL_DIR`、`GATEWAY_DIR`、`B`（后端二进制名）、`NSESSION`（默认 4）、`PORT`（默认 18280）、
 `NP`（每轮 max_new_tokens 默认值）、`HOST`（默认 `0.0.0.0`）、`LOG`、
 `IDLE_TTL`（默认 300，一段对话静默这么久就把它占的会话收回给排队者；**0=不回收，是这一套的总开关**）、
 `CONTEND_IDLE`（默认 15，**已经有人非等不可**时用的那一级阈值，见下；0=关掉这一级）、
@@ -138,11 +138,11 @@ rope 外置张量的大小：每个位置 256 字节 + 432 字节头 ⇒ 8192 �
 
 ```sh
 # 两个用户各自接入，各占一个会话（不传身份的话这两个请求会被当成同一段对话）
-curl -N -s http://<板卡>:8080/v1/chat/completions -H 'X-Conversation-Id: alice' \
+curl -N -s http://<板卡>:18280/v1/chat/completions -H 'X-Conversation-Id: alice' \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.5-27b","messages":[{"role":"user","content":"你好"}],"stream":true}'
 
-curl -N -s http://<板卡>:8080/v1/chat/completions -H 'X-Conversation-Id: bob' \
+curl -N -s http://<板卡>:18280/v1/chat/completions -H 'X-Conversation-Id: bob' \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.5-27b","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
@@ -174,7 +174,7 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'X-Conversation-Id: bob' 
 4 个不相干的问题就把 4 个会话占满，把后面所有人挡在队列里整整一个 `IDLE_TTL`。所以有这个端点：
 
 ```sh
-curl -s http://<板卡>:8080/v1/conversations/close -H 'Content-Type: application/json' \
+curl -s http://<板卡>:18280/v1/conversations/close -H 'Content-Type: application/json' \
      -d '{"conversation_id": "alice"}'
 # → {"conversation_id": "alice", "key": "id:alice", "closed": true, "session": 0}
 ```
@@ -206,18 +206,18 @@ curl -s http://<板卡>:8080/v1/conversations/close -H 'Content-Type: applicatio
 
 浏览器跨域是通的：网关对 `OPTIONS` 预检回 204，响应上带 `Access-Control-Allow-Origin: *`
 和 `Access-Control-Expose-Headers: X-KV-Reuse`（**没有最后这个头，前端读不到 `X-KV-Reuse`**，
-就只能靠猜来判断复用有没有生效）。页面**必须从 `http://<板卡>:8080/demo` 打开**，
+就只能靠猜来判断复用有没有生效）。页面**必须从 `http://<板卡>:18280/demo` 打开**，
 双击本地文件走 `file://` 会被浏览器的跨域策略挡掉。
 
 ```sh
 # 非流式
-curl -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+curl -s http://<板卡>:18280/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen3.5-27b",
   "messages": [{"role":"user","content":"1+1=?"}],
   "max_tokens": 64 }'
 
 # 流式 + 关思考（软开关：网关会给每条 user 贴上 /no_think，并把 <think> 段摘掉）
-curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+curl -N -s http://<板卡>:18280/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen3.5-27b",
   "messages": [{"role":"user","content":"1+1=?"}],
   "stream": true,
@@ -239,6 +239,9 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
 
 - **没有鉴权**。`HOST=0.0.0.0` 时局域网内谁能连上谁就能用满全部算力；Agent 跑在板卡本机时
   建议 `HOST=127.0.0.1`。要对外提供服务请自行加反向代理鉴权。
+  **默认端口是 18280**（2026-09-20 从 8080 改的）：换端口**不是**安全控制（同一个局域网里
+  扫一遍就找到了），它只是把这块板卡从"默认端口那一份名单"上挪开；顺手做掉的是上面那条
+  CORS。**改端口不是单向的**——同事的 SSH 隧道、cc-switch 的 Base URL、浏览器书签都要跟着改。
   **排队策略也架不住这一点**：网关只能按请求上带的身份分会话，没有任何办法核实身份是真的。
   一个客户端只要用 5 个不同的 `X-Conversation-Id` 各发一次，就能占满全部会话，
   让后来的人（包括真人）在队列里等到 `QUEUE_TIMEOUT`。**"超过 5 个排队"只在参与者都守规矩时成立。**
@@ -250,9 +253,13 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
   网关重启。默认值是 300，不要为了"省事"把它设成 0 跑多人场景。
 - **匿名对话占住的会话认得出、踢得掉，但不是常规操作**：得从 `/v1/pool` 读 `key` 再 close。
   按 `conversation_id` 关不掉匿名对话——它没有 id。这是"多人接入应该显式给身份"最硬的理由。
-- **CORS 是 `Access-Control-Allow-Origin: *`**（为了演示页开箱能跑）。它不加"谁能访问"这层
-  限制——没有鉴权时本来就谁都能访问——但它意味着**任何网页**都能在访客的浏览器里驱动
-  这块板卡。只在受控内网里跑演示，别把这个端口暴露到不可信网络。
+- **CORS 默认一个头都不发**（2026-09-20 改；以前是写死的 `Access-Control-Allow-Origin: *`）。
+  `*` 对这套服务是纯风险：API 本来就不要凭据，而 ACAO 是浏览器唯一的门禁 ⇒ 局域网里
+  **任何人打开的任意网页**都能背地里驱动这块板卡（读 `/v1/system`、发起生成、拿 `/v1/pool`
+  的 key 把别人的对话 close 掉）。演示页是**同源**的（页面由网关自己从 `GET /demo` 发出），
+  一个 CORS 头都用不上：同源请求不看 ACAO，`X-KV-Reuse` 同源下也默认可读。
+  真要让别的域名来用就显式放行**一个**来源（精确匹配，不做子串）：
+  `CORS_ORIGIN=https://那个域名 ./start_gateway.sh`；网关重启横幅里会写明当前放行了谁。
 - **演示页开着时占着 4 个会话**（`demo_4chat.html`，身份 `web-1` … `web-4`）。这是有意的：
   同一页里再点一次「②」就是这四段对话的第二轮，KV 复用演示靠它们活着。点「清空」或
   **关掉标签页**会交还（后者走 `sendBeacon`——`beforeunload` 里 `fetch` 会被浏览器取消）。
@@ -284,11 +291,11 @@ curl -N -s http://<板卡>:8080/v1/chat/completions -H 'Content-Type: applicatio
 
 ```sh
 # 板上（网关已起）
-./run_all_board_tests.sh http://127.0.0.1:8080      # 结果落 board_tests.log，末尾有 FAIL 汇总
-# 注：这套是纯 python3 的，可以直接在能连到板卡的机器上对着 http://<板卡IP>:8080 跑
+./run_all_board_tests.sh http://127.0.0.1:18280      # 结果落 board_tests.log，末尾有 FAIL 汇总
+# 注：这套是纯 python3 的，可以直接在能连到板卡的机器上对着 http://<板卡IP>:18280 跑
 
 # 网页演示页（需要 node，不在上面那套里；**必须在 serve/ 目录下跑**，它按相对路径读页面）
-node page_check.js http://<板卡IP>:8080             # 用桩 DOM 跑页面里的真实 JS，打到真板卡
+node page_check.js http://<板卡IP>:18280             # 用桩 DOM 跑页面里的真实 JS，打到真板卡
 # 它除了原先那几条，还会验：每一路带出去的身份是**它自己的** web-<n>、池子里每个会话分别
 # 记着自己的名字、关页面与点「清空」之后会话真的还了回去（后面这一条肉眼看不出来）、
 # 面板头那格性能小字写出来了、新一轮开始时那格是空的（挂着上一轮的数比空着更坏）
@@ -327,15 +334,15 @@ node page_check.js http://<板卡IP>:8080             # 用桩 DOM 跑页面里�
 # 对方的历史顶在前面，前缀对不上就静默整段重算（**答案照样对**，只是那一路变慢）。
 
 # 多用户接入演示（终端，纯标准库；不用 Web 前后端，直接接 API）
-python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --stagger 1.5
-python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --close      # 问完主动交还，排队的人立刻补上
-python3 demo_multiuser.py http://<板卡IP>:8080 6 96 --no-id      # 对照：不带身份会退化成串行
+python3 demo_multiuser.py http://<板卡IP>:18280 6 96 --stagger 1.5
+python3 demo_multiuser.py http://<板卡IP>:18280 6 96 --close      # 问完主动交还，排队的人立刻补上
+python3 demo_multiuser.py http://<板卡IP>:18280 6 96 --no-id      # 对照：不带身份会退化成串行
 
 # 本地（无板卡，用假后端）。`--frames-stdout` 是**网关**的开关：帧走子进程的 stdout，
 # 绕开 pass_fds（Windows 上直接不支持，实测 AssertionError）。Linux 上不加也能跑。
 python3 rkllm_gateway.py --frames-stdout --selftest -- python3 fake_backend.py   # 协议自检
 python3 rkllm_gateway.py --frames-stdout -- python3 fake_backend.py &            # 起服务给下面用
-python3 serve_http_test.py http://127.0.0.1:8080 quick
+python3 serve_http_test.py http://127.0.0.1:18280 quick
 python3 check_template.py
 ```
 

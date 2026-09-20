@@ -26,12 +26,13 @@
 
 用法（板卡上）：
     ./start_gateway.sh                       # 见同目录的启动脚本
-    python3 rkllm_gateway.py --port 8080 --sessions 4 -- <demo argv...>
+    python3 rkllm_gateway.py --port 18280 --sessions 4 -- <demo argv...>
     python3 rkllm_gateway.py --selftest -- <demo argv...>   # 只验帧协议，不起 HTTP
 """
 import argparse
 import codecs
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -1311,24 +1312,46 @@ def conversation_key(messages, explicit=None):
 
 # 演示页（多路对话框那个，窗口数由页面自己问 /health 决定）与网关同目录，用 GET /demo 直接打开。
 # 为什么由网关自己发而不是另起一个静态服务器：**同源**，浏览器就不会有 CORS 的坑，
-# 演示时也只有一个进程要管。CORS 头照样给（见下），是为了页面被存到本地用
-# file:// 打开、或者被别的 Agent 前端引用时也能用。
+# 演示时也只有一个进程要管。
 VIEW_DIR = os.path.dirname(os.path.abspath(__file__))
 DEMO_PAGE = "demo_4chat.html"
 
-CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-    # 浏览器默认**不让 JS 读自定义响应头**，X-KV-Reuse 必须显式 expose 出来，
-    # 否则页面上"复用到底有没有生效"这一栏永远是空的。
-    "Access-Control-Expose-Headers": "X-KV-Reuse",
-}
+# 跨源放行。**默认一个 CORS 头都不发**（2026-09-20 改）。
+#
+# 以前这里是写死的 `Access-Control-Allow-Origin: *`。那个值对这套服务是**纯风险**：
+# 这个 API **没有任何鉴权**，而 ACAO 是浏览器唯一的门禁 —— `*` 等于对外宣布"任何网页
+# 都可以读我的响应"，于是局域网里**任何人打开的任意网页**都能背地里驱动这块板卡
+# （读 `/v1/system`、发起生成、拿 `/v1/pool` 给的 key 把别人的对话 close 掉）。
+# 而演示页是**同源**的（同一个 host:port 发出来的），一个 CORS 头都用不上：
+# 同源请求本来就不看 ACAO，`X-KV-Reuse` 这种自定义响应头同源下也是默认可读的。
+# 真要让别的域名（比如另挂一个前端）来用，就显式 `--cors-origin https://那个域名`，
+# 而且是**精确匹配**、只回给匹配上的那一个来源，不做子串/通配。
+def cors_headers(allowed, origin):
+    """按"配置里允许的来源"和"这次请求带的 Origin"算出该发的 CORS 头。
+
+    默认参数（`allowed=None`）**永远返回空**——这是这条防线唯一重要的性质，
+    自检里专门钉了它（改回 `*` 必须让自检变红）。
+    """
+    if not allowed or not origin:
+        return {}
+    if allowed == "*" or origin == allowed:
+        return {
+            # 允许别人用就回它的来源；`*` 是运维自己显式写的，照它说的回。
+            "Access-Control-Allow-Origin": "*" if allowed == "*" else origin,
+            # 浏览器默认**不让 JS 读自定义响应头**，X-KV-Reuse 必须显式 expose 出来，
+            # 否则页面上"复用到底有没有生效"这一栏永远是空的。
+            "Access-Control-Expose-Headers": "X-KV-Reuse",
+        }
+    return {}
 
 
 class Gateway(object):
-    def __init__(self, backend, pool, verbose=False):
+    def __init__(self, backend, pool, verbose=False, cors_origin=None):
         self.backend = backend
         self.pool = pool
         self.verbose = verbose
+        # 允许哪个来源跨源调用（None = 一个都不允许）。见 cors_headers()。
+        self.cors_origin = cors_origin
         self.started_at = time.time()
         self.host = HostSampler()
         self.cards = CardStats()
@@ -1410,11 +1433,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 工具 ----
 
+    def _cors(self):
+        """这一次请求该发的 CORS 头。默认是**空字典**（不配置 `--cors-origin` 时）。
+
+        判定放在这里（而不是每个响应处各判一次），是为了让"默认不放行"这件事只有一处
+        可改——想改回 `*` 就得动 cors_headers()，而那里有自检钉着。
+        """
+        gw = self.gateway
+        if gw is None:
+            return {}
+        return cors_headers(gw.cors_origin, self.headers.get("Origin"))
+
     def _json(self, code, obj, extra_headers=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        for k, v in CORS_HEADERS.items():
+        for k, v in self._cors().items():
             self.send_header(k, v)
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
@@ -1460,17 +1494,23 @@ class Handler(BaseHTTPRequestHandler):
         带 `Content-Type: application/json` 的 POST **不是**简单请求，浏览器会先发一个
         OPTIONS 问一句"能不能发"。不处理这一条，页面上每个请求都会在控制台里失败，
         而在 curl/python 那一侧完全看不出来——因为它们压根不发预检。
+
+        **没配置 `--cors-origin` 时就老老实实回一个空的 204**：浏览器拿不到
+        `Access-Control-Allow-Origin`，预检就是不通过，这才是"不允许跨源"该有的样子。
+        演示页是同源的，同源请求**不发预检**，所以这条路径现在只服务想跨源来用的前端。
         """
         self._responded = False
         self.send_response(204)
-        for k, v in CORS_HEADERS.items():
+        cors = self._cors()
+        for k, v in cors.items():
             self.send_header(k, v)
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        # X-Conversation-Id 必须列进来，否则浏览器里发这个头会被预检拦掉（curl/python
-        # 不发预检，所以这个问题只在网页端现形，很容易查错方向）。
-        self.send_header("Access-Control-Allow-Headers",
-                         "Content-Type, X-Conversation-Id")
-        self.send_header("Access-Control-Max-Age", "600")
+        if cors:            # 不放行时这三个头一个都不用发（发了也没人认，还多余）
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            # X-Conversation-Id 必须列进来，否则浏览器里发这个头会被预检拦掉（curl/python
+            # 不发预检，所以这个问题只在网页端现形，很容易查错方向）。
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, X-Conversation-Id")
+            self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
         self.end_headers()
         self._responded = True
@@ -1479,7 +1519,8 @@ class Handler(BaseHTTPRequestHandler):
         """把演示页发出去。
 
         页面从这里取就是同源的（地址栏和接口都是同一个 host:port），CORS 这一关天然过。
-        头照样发，是为了页面被另存到本地、或被人挂到别的域名下时也能用。
+        页面被另存到本地用 `file://` 打开就跨源了——那种用法要显式给 `--cors-origin`，
+        默认不再顺手放行（见 cors_headers 上面那段）。
         """
         path = os.path.join(VIEW_DIR, DEMO_PAGE)
         try:
@@ -1489,7 +1530,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "demo page missing: %s (应与网关放在同一目录)" % path)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        for k, v in CORS_HEADERS.items():
+        for k, v in self._cors().items():
             self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -1695,7 +1736,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
-        for k, v in CORS_HEADERS.items():
+        for k, v in self._cors().items():
             self.send_header(k, v)
         for k, v in kv_reuse_headers(q.kv).items():
             self.send_header(k, v)
@@ -2524,6 +2565,130 @@ intr 0
         shutil.rmtree(root, ignore_errors=True)
 
 
+def selftest_cors(check):
+    """跨源放行这条线：**默认一个 CORS 头都不发**，配了才按精确匹配回。
+
+    为什么值得单独占一块：这段代码坏起来是"静默地把门打开"——多回一个
+    `Access-Control-Allow-Origin: *` 之后，功能上**什么都不坏**（同源的演示页照样跑、
+    别的测试照样全绿），只有站在"别人的浏览器"那个角度看才看得见。所以下面不只验
+    cors_headers() 的返回值，还**真起一个 HTTP 服务、真读响应头**：四个发响应的地方
+    是各写各的，函数返回值对不代表线路上发出去的头对。
+    """
+    print("== 跨源放行（CORS）：默认不放开，配了才按精确匹配回 ==")
+    check("没配 --cors-origin：带 Origin 的请求也不发任何 CORS 头",
+          cors_headers(None, "http://somebody-elses-page.example") == {}, "")
+    check("没配时连 `*` 都不发（这条防线唯一要紧的性质）",
+          "*" not in cors_headers(None, "http://x.example").values(), "")
+    check("没带 Origin（curl / python 那种）：什么也不发（没有来源可回）",
+          cors_headers("http://a.example", None) == {}, "")
+    matched = cors_headers("http://a.example", "http://a.example")
+    check("配了且精确匹配：回那个来源 + expose X-KV-Reuse",
+          matched == {"Access-Control-Allow-Origin": "http://a.example",
+                      "Access-Control-Expose-Headers": "X-KV-Reuse"},
+          "= %r" % (matched,))
+    check("配了但来源不匹配：一个头都不发（**不许退回 `*`**）",
+          cors_headers("http://a.example", "http://b.example") == {}, "")
+    # 子串匹配是这类代码最常见的写法，也是最容易放进来一个"看着像自己人"的域名。
+    check("前缀相同不算匹配（`a.example.evil.com` ≠ `a.example`）",
+          cors_headers("http://a.example", "http://a.example.evil.com") == {}, "")
+    check("显式写 `*` 才回 `*`（这是运维自己选的，照它说的回）",
+          cors_headers("*", "http://any.example").get("Access-Control-Allow-Origin")
+          == "*", "")
+    check("Gateway 的默认就是「不放行」（不许在构造函数里塞个默认来源）",
+          Gateway(None, None).cors_origin is None, "")
+
+    # ---- 线路上 ----
+    class _Gw(object):
+        """只当 Holder 用：Handler 读这几个字段。"""
+
+        verbose = False
+        started_at = 0.0
+
+        class backend(object):                              # noqa: N801
+            sessions = 2
+            ctx_size = 8192
+
+            @staticmethod
+            def alive():
+                return True
+
+        class pool(object):                                 # noqa: N801
+            @staticmethod
+            def snapshot():
+                return {"slots": [{"state": "free"}, {"state": "free"}], "waiting": []}
+
+    saved_gw = Handler.gateway
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    httpd.daemon_threads = True
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def get(path, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request("GET", path, headers=headers or {})
+            resp = conn.getresponse()
+            resp.read()
+            return {k.lower(): v for k, v in resp.getheaders()}
+        finally:
+            conn.close()
+
+    def preflight(headers):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request("OPTIONS", "/v1/chat/completions", headers=headers)
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status, {k.lower(): v for k, v in resp.getheaders()}
+        finally:
+            conn.close()
+
+    try:
+        # 默认网关（cors_origin 缺省）下，三条出口一个 CORS 头都不许有
+        Handler.gateway = _Gw()
+        Handler.gateway.cors_origin = None
+        for path in ("/health", "/demo"):
+            h = get(path, {"Origin": "http://somebody-elses-page.example"})
+            check("%s 带 Origin 也不发 ACAO（浏览器读不到响应）" % path,
+                  "access-control-allow-origin" not in h, "= %r" % (h.get("access-control-allow-origin"),))
+            check("%s 连 expose 头也不发" % path,
+                  "access-control-expose-headers" not in h, "")
+        status, h = preflight({"Origin": "http://somebody-elses-page.example",
+                               "Access-Control-Request-Method": "POST"})
+        check("预检仍是 204（拿 4xx/5xx 去「拒绝」只会变成报错，拦人的活儿浏览器自己会干）",
+              status == 204, "status=%d" % status)
+        check("预检里 ACAO 缺席 => 浏览器自己就把这个跨源请求拦了",
+              "access-control-allow-origin" not in h, "")
+        check("预检里也不再广告 Allow-Methods/Headers",
+              "access-control-allow-methods" not in h
+              and "access-control-allow-headers" not in h, "")
+
+        # 配了来源之后：匹配的放行、不匹配的一样不发
+        Handler.gateway.cors_origin = "http://a.example"
+        h = get("/health", {"Origin": "http://a.example"})
+        check("配了之后匹配来源能读到响应",
+              h.get("access-control-allow-origin") == "http://a.example", "= %r" % (h.get("access-control-allow-origin"),))
+        h = get("/health", {"Origin": "http://a.example.evil.com"})
+        check("配了之后不匹配来源（子串那种）照样读不到",
+              "access-control-allow-origin" not in h, "")
+        status, h = preflight({"Origin": "http://a.example",
+                               "Access-Control-Request-Method": "POST",
+                               "Access-Control-Request-Headers": "X-Conversation-Id"})
+        check("配了之后预检把自定义头也放行（否则网页端发 X-Conversation-Id 会被拦）",
+              h.get("access-control-allow-origin") == "http://a.example"
+              and "X-Conversation-Id" in (h.get("access-control-allow-headers") or ""),
+              "= %r" % (h.get("access-control-allow-headers"),))
+        # 同源的演示页**没有 Origin 头**，这是它一直能用的原因，得钉住。
+        h = get("/demo", {})
+        check("同源（请求里没有 Origin）的 /demo 不受影响",
+              "access-control-allow-origin" not in h and int(h.get("content-length") or 0) > 0,
+              "len=%r" % (h.get("content-length"),))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        Handler.gateway = saved_gw
+
+
 def selftest(backend, pool):
     """验证 C++ 侧的帧协议。比"直接上 HTTP"分段定位得清楚：协议不通时不用怀疑 HTTP。"""
     ok = True
@@ -2922,6 +3087,8 @@ def selftest(backend, pool):
     print("== 资源观测：/proc 解析、CPU 百分比算术、STAT 帧 ==")
     selftest_system(check, backend)
 
+    selftest_cors(check)
+
     print("\n%s" % ("自检全部通过" if ok else "自检有失败项，见上面的 FAIL"))
     return 0 if ok else 1
 
@@ -2934,7 +3101,15 @@ def main():
     global _VERBOSE
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8080)
+    # 端口 2026-09-20 从 8080 挪到 18280：8080 是"随手就能试"的那一个（几乎每个扫描器
+    # 都会先碰它），而这个服务**没有鉴权**，被扫到就等于被用上。换端口本身**不是**安全
+    # 控制（同一个局域网里扫一遍就找到了，见 start_gateway.sh 里对 HOST 的说明）——
+    # 它的作用是让这台机器不再落在"默认端口"那份名单上，配合收紧 CORS 一起看。
+    ap.add_argument("--port", type=int, default=18280)
+    ap.add_argument("--cors-origin", default=None,
+                    help="允许哪个**来源**跨源调用本服务（浏览器的那道门禁）。默认不给，"
+                         "即一个跨源请求都不放行；演示页是同源的，用不到它。要放开就写全 "
+                         "scheme://host[:port]（也可以写 `*`，但那等于把门拆了，别用）")
     ap.add_argument("--sessions", type=int, default=4,
                     help="期望的会话数。与后端 READY 报的对不上时**只警告、不退出**——"
                          "池子大小取自后端报的数（它才是真正知道几个会话可用的一方），"
@@ -2998,11 +3173,19 @@ def main():
         if args.selftest:
             return selftest(backend, pool)
 
-        Handler.gateway = Gateway(backend, pool, verbose=args.verbose)
+        Handler.gateway = Gateway(backend, pool, verbose=args.verbose,
+                                  cors_origin=args.cors_origin)
         httpd = ThreadingHTTPServer((args.host, args.port), Handler)
         httpd.daemon_threads = True
         print("[gateway] listening on http://%s:%d  (sessions=%d, model=%s)"
               % (args.host, args.port, backend.sessions, MODEL_ID), flush=True)
+        # 把"跨源放行"这件事在启动横幅里说清楚：它是**默认关闭**的，关了以后
+        # 谁想跨源来用（哪怕是把自己的演示页存到本地双击打开）都会失败，
+        # 到时候翻日志能一眼看到"哦，是没配 --cors-origin"，而不是去怀疑网络。
+        print("[gateway] 跨源(CORS): %s"
+              % ("放行 %s（其余来源一律拒绝）" % args.cors_origin if args.cors_origin
+                 else "全部拒绝（同源的 /demo 不受影响；要放行请给 --cors-origin）"),
+              flush=True)
         # 别再写死"4 个对话框"：页面 2026-09-20 起按 /health 的 sessions 决定开几个窗口
         # （32768 那份导出只够 2 路），屏幕上看的是几个就是几个。ctx_size 也一并印出来，
         # 因为它才是"为什么只有这么几个窗口"的答案。

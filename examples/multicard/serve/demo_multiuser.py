@@ -27,7 +27,7 @@
   python3 demo_multiuser.py [base_url] [用户数] [每轮token数]
       [--stagger 秒] [--rounds 轮数] [--plain] [--nothink] [--no-id] [--close]
 
-  默认 http://127.0.0.1:8080 / 6 个用户 / 96 token / 错开 1.5s / 1 轮
+  默认 http://127.0.0.1:18280 / 6 个用户 / 96 token / 错开 1.5s / 1 轮
   --plain    不用光标重绘（重定向到文件或录屏时用），改成打带时间戳的行
   --nothink  关思考（软开关，见方案文档 §9.7）
   --no-id    不给 conversation_id —— 用来演示"不带身份会退化成串行"
@@ -67,7 +67,7 @@ while i < len(argv):
     ARGS.append(a)
     i += 1
 
-BASE = ARGS[0] if len(ARGS) > 0 else "http://127.0.0.1:8080"
+BASE = ARGS[0] if len(ARGS) > 0 else "http://127.0.0.1:18280"
 NUSERS = int(ARGS[1]) if len(ARGS) > 1 else 6
 NP = int(ARGS[2]) if len(ARGS) > 2 else 96
 TIMEOUT = 1800

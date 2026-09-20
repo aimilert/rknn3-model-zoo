@@ -3,8 +3,8 @@
 """网关的 HTTP 客户端测试（只用标准库——板卡上没有 curl，也没有 requests）。
 
 先在本地对着桩后端跑，再到板卡上对着真后端跑同一份：
-    python serve_http_test.py http://127.0.0.1:8080            # 全量
-    python serve_http_test.py http://127.0.0.1:8080 quick      # 只跑 health/models/chat
+    python serve_http_test.py http://127.0.0.1:18280            # 全量
+    python serve_http_test.py http://127.0.0.1:18280 quick      # 只跑 health/models/chat
 
 关键的一项是多轮 KV 复用的 HTTP 级证据：同一段对话的第二轮，网关只发差异部分，
 后端回报的 prefill token 数应当**明显小于**把整段 prompt 重发一遍的那次。
@@ -23,7 +23,7 @@ import threading
 import urllib.error
 import urllib.request
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18280"
 MODE = sys.argv[2] if len(sys.argv) > 2 else "full"
 #   full    —— 默认：接口面 + 多轮 KV 复用 + 并发（run_all_board_tests.sh 跑这个）
 #   quick   —— 只跑到流式为止

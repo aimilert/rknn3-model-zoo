@@ -35,10 +35,15 @@
 //     身份，删中间一格再补一个，新格子正好捡回旧名字，网关认成同一段旧对话（拿旧历史、
 //     命中旧 KV），现场看着就是"删了没删掉"；不交还会话则要等到 IDLE_TTL 才有位置，
 //     而这期间屏幕上什么异常都看不出来
+//  15. 高度预算：整页正好一屏、对话区吃掉剩余高度、资源块封顶 1/4 屏（2026-09-20 加）——
+//     用户报"对话框下面空一大片"。根因是面板写死 `calc(50vh - 60px)`、资源区按内容长，
+//     三块加起来不到一屏。这类坏法**别的检查一条都照不到**：答案照样对、资源条照样刷、
+//     会话照样还，只有把页面真的渲染出来才看得见。桩 DOM 没有排版引擎，所以这一节
+//     解析 `<style>` 源码判高度关系（注释先剥掉，见那一段）。
 //
 // 用法（**必须在 serve/ 目录下跑**，它按相对路径读 demo_4chat.html）：
-//   node page_check.js http://<板卡IP>:8080
-//   MAXTOK=64 node page_check.js http://<板卡IP>:8080    # 只改本次演示的每轮长度，不动页面默认值
+//   node page_check.js http://<板卡IP>:18280
+//   MAXTOK=64 node page_check.js http://<板卡IP>:18280    # 只改本次演示的每轮长度，不动页面默认值
 //
 // 需要 node。后端**不一定是板卡**：对着本地桩后端（`fake_backend.py`，起法见 README.md 测试
 // 一节）就能整跑，2026-09-18 实测全绿——改完这一页先在本地过一遍，省一次板卡往返。桩验不
@@ -49,7 +54,7 @@
 const fs = require("fs");
 const vm = require("vm");
 
-const BASE = process.argv[2] || "http://127.0.0.1:8080";
+const BASE = process.argv[2] || "http://127.0.0.1:18280";
 
 if (!fs.existsSync("demo_4chat.html")) {
   console.log("FAIL: 当前目录没有 demo_4chat.html —— 请在 serve/ 目录下运行");
@@ -858,6 +863,115 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
       } finally { ctx.fetch = realFetch; }
     }
 
+    // ⑩ 高度预算（用户 2026-09-20：对话框下面空一大片，资源块要占底部 1/5~1/4）。
+    //    这一条也只能查源码：桩 DOM 没有排版引擎，"屏幕上有没有留白"是浏览器算出来的。
+    //    查的是**几块之间的高度关系**，不是具体像素——整页一屏、中间那块吃掉剩下的、
+    //    资源块封顶。以前是 `.panel{height:calc(50vh - 60px)}` 加上资源区按内容长，
+    //    三块加起来不到一屏，剩下的就是那片空白（用户看到的那片）。
+    {
+      const styleSrc = html.slice(html.indexOf("<style>") + 7, html.indexOf("</style>"))
+        // **注释要剥掉再解析**：上面那些 CSS 注释里恰好写着 `calc(50vh - 60px)`
+        // 这种"以前的写法"，不剥的话"不许用 vh 写死高度"这一条会被**注释里的例子**
+        // 判红/判绿——判红还好，最坏的一种是它替真代码挡住了检查。
+        .replace(/\/\*[\s\S]*?\*\//g, "");
+      // 解析成 `{选择器, 声明体, 所在的 @media}`。**必须区分 @media 里的规则**：
+      // `.swrap` 在媒体查询里是 `1fr`（退回上下两块），不区分的话"后面那条覆盖前面"
+      // 会让正常那两列读成 `1fr`——检查反过来被窄屏的规则骗了。
+      const rules = [];
+      (function scan(src, media) {
+        let i = 0;
+        for (;;) {
+          const open = src.indexOf("{", i);
+          if (open < 0) { return; }
+          const sel = src.slice(i, open).trim();
+          let depth = 1, j = open + 1;
+          while (j < src.length && depth > 0) {
+            if (src[j] === "{") { depth++; } else if (src[j] === "}") { depth--; }
+            j++;
+          }
+          const body = src.slice(open + 1, j - 1);
+          if (sel.charAt(0) === "@") { scan(body, sel.split(/\s+/)[0] + " " + sel.slice(sel.indexOf("("))); }
+          else { rules.push({ sel: sel, body: body, media: media }); }
+          i = j;
+        }
+      })(styleSrc, "");
+      // 同一个属性后面的规则覆盖前面的（和 CSS 一致），同一选择器列表里逗号分隔的
+      // 每一项都算命中（`html, body { height:100% }` 这一条就是靠它才查得到 body）。
+      // 第三个参数给 "@media" 就只查媒体查询里的那一条。
+      function decl(sel, prop, media) {
+        let out = null;
+        rules.forEach(function (r) {
+          const want = media ? r.media.indexOf(media) === 0 : r.media === "";
+          if (!want) { return; }
+          if (r.sel.split(",").map(function (s) { return s.trim(); }).indexOf(sel) < 0) { return; }
+          r.body.split(";").forEach(function (d) {
+            const i = d.indexOf(":");
+            if (i > 0 && d.slice(0, i).trim() === prop) { out = d.slice(i + 1).trim(); }
+          });
+        });
+        return out;
+      }
+
+      chk2(decl("html", "height") === "100%" && decl("body", "height") === "100%",
+           "整页高度没接成一屏（html 与 body 都要 height:100%）：html=" +
+           decl("html", "height") + " body=" + decl("body", "height"));
+      chk2(decl("body", "display") === "flex" && decl("body", "flex-direction") === "column",
+           "body 该是一列 flex（标题/对话区/资源区依次往下）：" + decl("body", "display") +
+           " / " + decl("body", "flex-direction"));
+      const mflex = (decl("main", "flex") || "").split(/\s+/);
+      chk2(Number(mflex[0]) >= 1 && decl("main", "min-height") === "0",
+           "对话区该吃掉标题与资源块之外的全部高度（flex:1 1 auto + min-height:0）：" +
+           decl("main", "flex") + " / min-height:" + decl("main", "min-height"));
+
+      // 这一条直接钉那个坑：任何一块用 vh 写死高度，底部就会重新出现一片空白
+      // （或反过来，内容被截掉）。**`max-height` 不算**——资源块封顶用的就是它。
+      const vhFixed = rules.filter(function (r) {
+        return /(^|;)\s*height\s*:\s*[^;]*vh/.test(";" + r.body);
+      }).map(function (r) {
+        return r.sel + "{" + (r.body.match(/(^|;)\s*height\s*:\s*([^;]*)/) || [])[2] + "}";
+      });
+      chk2(vhFixed.length === 0,
+           "有块用 vh 写死了高度——对话框下面那片空白就是这么来的：" + vhFixed.join(" · "));
+
+      // 上限本身是**矮屏的保险**，不是目标比例：这一块内容实测 249px，1080p 上占 25%、
+      // 1440p 上占 17%（用户要的 1/5~1/4 是靠"内容就这么高"实现的）。所以这条只钉住
+      // 两头：不许没上限（那会在矮屏上把对话区挤没），也不许小到把内容永远切掉一截。
+      const mh = decl(".syssec", "max-height") || "";
+      const mv = mh.match(/^(\d+(?:\.\d+)?)vh$/);
+      chk2(mv !== null && Number(mv[1]) >= 20 && Number(mv[1]) <= 36,
+           "资源块的封顶该落在 1/5~1/3 屏之间（矮屏保险，不是目标比例）：max-height=" + mh);
+      chk2(decl(".syssec", "overflow") === "auto",
+           "资源块超过上限时该在自己里面滚，而不是把对话区挤扁：" +
+           decl(".syssec", "overflow"));
+
+      // 资源块内部是**左右两栏**（左：RK3588 + 服务；右：四张卡）。这一条钉的是 JS 与
+      // CSS 的耦合：`swrap`/`sg-host`/`sg-cards` 这三个类名是两边唯一的联系，谁单方面
+      // 改了名，页面**照样能跑、数字照样对**——只是退回上下两行，那一块从 249px 长回
+      // 376px，底部重新开始挤。上面所有的功能检查都不会红。
+      const sysHtmlFix = run(SYS_FIX);
+      chk2(/class="swrap"/.test(sysHtmlFix),
+           "资源块该有一个 .swrap 包着两栏（没有它两栏就退回上下两行、高 376px）");
+      chk2(/class="sgrid sg-host"/.test(sysHtmlFix) &&
+           /class="sgrid sg-cards"/.test(sysHtmlFix),
+           "两栏的类名该是 sg-host / sg-cards（和 CSS 里那两条 minmax 对不上就散架）");
+      chk2(decl(".syssec .sg-cards", "grid-template-columns") !== null &&
+           decl(".syssec .sg-host", "grid-template-columns") !== null,
+           "CSS 里没有 .sg-host / .sg-cards 的列定义（四张卡会挤成一列）");
+      const cols = decl(".syssec .swrap", "grid-template-columns") || "";
+      chk2(cols.split("minmax").length - 1 === 2 && decl(".syssec .swrap", "display") === "grid",
+           ".swrap 该是两列网格（窄屏那栏由媒体查询管）：" + cols);
+      chk2(decl(".syssec .swrap", "grid-template-columns", "@media") === "1fr",
+           "窄屏该退回上下两块：媒体查询里没有 `grid-template-columns:1fr` 的话，" +
+           "窄窗口下两栏各自都放不下一整行（四张卡会一列排下去）");
+
+      // 标题与两条状态行锁住高度。少了这个，长句子会被对话区按 flex-shrink 压扁换行。
+      const squeezed = ["header", ".capline", ".sumline"].filter(function (s) {
+        return decl(s, "flex") !== "none";
+      });
+      chk2(squeezed.length === 0, "这几块该锁住高度、不许被压扁（flex:none）：" +
+           squeezed.join(" "));
+    }
+
     // 一起跑就补一拍：待机档最长要等 6 秒，"点了②之后卡是不是真的忙了"恰恰是演示时
     // 最想看的那一帧，不能等。
     {
@@ -889,7 +1003,8 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
       console.log("FAIL: 资源条有 %d 项不对", bad2);
       process.exit(1);
     }
-    console.log("  资源条全过（缺值不画 0 · 单位与颜色 · 旧数据标注 · 两半来源说明）\n");
+    console.log("  资源条全过（缺值不画 0 · 单位与颜色 · 旧数据标注 · 两半来源说明 · 轮询档位）\n");
+    console.log("  布局全过（整页一屏 · 对话区吃掉剩余高度 · 资源块两栏封顶 · 无人写死 vh）\n");
   }
 
   // 走**用户点「②」的那条路**（runAll），不是自己 `panels.map(send)` 一遍。

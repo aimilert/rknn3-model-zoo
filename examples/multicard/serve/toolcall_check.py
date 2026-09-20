@@ -37,13 +37,13 @@
   判据同 sticky_check.py：和冷会话对照，不用 `cached_tokens > 0`（前缀断在助手轮时，
   它前面的部分照样命中缓存）。
 
-用法：python3 toolcall_check.py http://127.0.0.1:8080
+用法：python3 toolcall_check.py http://127.0.0.1:18280
 """
 import json
 import sys
 import urllib.request
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18280"
 FAILS = []
 NOTES = []
 USED_CONV = []

@@ -105,7 +105,7 @@ rknn_multicard_demo.serve <- 后端二进制（build_serve.sh 的产物）
 ### 2.4 演示前 15 分钟：先自检一遍
 
 ```sh
-./run_all_board_tests.sh http://127.0.0.1:8080
+./run_all_board_tests.sh http://127.0.0.1:18280
 ```
 
 跑完后看文件末尾的汇总，必须是 `FAIL 行数：0`。
@@ -164,7 +164,7 @@ INSTALL_DIR=<安装目录> MODEL_DIR=<模型目录> ./restart_gateway.sh
 ```sh
 python3 -c "
 import json,urllib.request
-print(json.load(urllib.request.urlopen('http://127.0.0.1:8080/health')))
+print(json.load(urllib.request.urlopen('http://127.0.0.1:18280/health')))
 "
 ```
 
@@ -239,7 +239,7 @@ python3 -c "
 import json,urllib.request
 b={'model':'qwen3.5-27b','messages':[{'role':'user','content':'Say hello in five words.'}],
    'max_tokens':64,'chat_template_kw':{'enable_thinking':False}}
-r=urllib.request.Request('http://127.0.0.1:8080/v1/chat/completions',
+r=urllib.request.Request('http://127.0.0.1:18280/v1/chat/completions',
                          data=json.dumps(b).encode(),
                          headers={'Content-Type':'application/json'})
 print(json.load(urllib.request.urlopen(r))['choices'][0]['message']['content'])
@@ -265,7 +265,7 @@ Hello there, how are you?
 
 ```sh
 cd <板卡网关目录>
-python3 demo_4session.py http://127.0.0.1:8080 4 200
+python3 demo_4session.py http://127.0.0.1:18280 4 200
 ```
 
 这个脚本会**自己先量一遍单路做基线，再同时发 4 路**，最后把两个数并排打出来。
@@ -303,7 +303,7 @@ python3 demo_4session.py http://127.0.0.1:8080 4 200
 **录屏 / 重定向输出时**用 `--plain`（默认模式会用光标重绘，重定向后会满屏转义字符）：
 
 ```sh
-python3 demo_4session.py http://127.0.0.1:8080 4 200 --plain
+python3 demo_4session.py http://127.0.0.1:18280 4 200 --plain
 ```
 
 `--plain` 模式下每个增量打一行带路号的行，交错在一起，同样能看出并发：
@@ -324,7 +324,7 @@ python3 demo_4session.py http://127.0.0.1:8080 4 200 --plain
 
 ```sh
 cd <板卡网关目录>
-python3 sticky_check.py http://127.0.0.1:8080
+python3 sticky_check.py http://127.0.0.1:18280
 ```
 
 **观众该看到什么**：同一段对话的**第二轮比第一轮便宜得多**。
@@ -372,12 +372,16 @@ python3 sticky_check.py http://127.0.0.1:8080
 **在演示用的电脑上**打开浏览器（不是板卡上的浏览器）：
 
 ```
-http://<板卡IP>:8080/demo
+http://<板卡IP>:18280/demo
 ```
 
-> 为什么用 `http://<板卡IP>:8080/demo` 而不是双击本地的 `demo_4chat.html` 打开：
+> 为什么用 `http://<板卡IP>:18280/demo` 而不是双击本地的 `demo_4chat.html` 打开：
 > 双击走的是 `file://`，页面里的请求就没有来源、会被浏览器的跨域策略挡掉（控制台报
-> `Failed to fetch`）。网关给这个页面开了 CORS，但**必须通过它自己的 HTTP 端口访问**才成立。
+> `Failed to fetch`）。**网关从 2026-09-20 起默认不放行任何跨源请求**（以前那个
+> `Access-Control-Allow-Origin: *` 已收掉），所以这一页**只能**从它自己的 HTTP 端口取。
+> 确实要用 `file://` 打开，得显式放行那个来源——但浏览器给 `file://` 发的 `Origin` 是
+> 字符串 `null`，而**沙箱 iframe 发的也是 `null`**，写 `CORS_ORIGIN=null` 等于谁都放进来。
+> 别走这条路，同源打开就好。
 
 **操作**（两个按钮，按顺序点）：
 
@@ -539,7 +543,7 @@ http://<板卡IP>:8080/demo
 
 ```sh
 cd <板卡网关目录>
-python3 demo_multiuser.py http://127.0.0.1:8080 6 96 --stagger 1.5
+python3 demo_multiuser.py http://127.0.0.1:18280 6 96 --stagger 1.5
 #                                        └用户数 └每轮 token └错开 1.5 秒提问
 ```
 
@@ -570,7 +574,7 @@ python3 demo_multiuser.py http://127.0.0.1:8080 6 96 --stagger 1.5
 **同一句话的对照组**（强烈建议演，只要 20 秒）——加 `--no-id`：
 
 ```sh
-python3 demo_multiuser.py http://127.0.0.1:8080 6 96 --no-id
+python3 demo_multiuser.py http://127.0.0.1:18280 6 96 --no-id
 ```
 
 这时脚本不给身份，六个人问的又是同一句话，网关只能按内容认对话 → **六个人全挤到
@@ -582,7 +586,7 @@ python3 demo_multiuser.py http://127.0.0.1:8080 6 96 --no-id
 **排队的人什么时候能补上**——这一段是这一步的重点，因为它是"边缘服务器"能不能用的分水岭：
 
 ```sh
-python3 demo_multiuser.py http://127.0.0.1:8080 6 96 --stagger 1.5 --close
+python3 demo_multiuser.py http://127.0.0.1:18280 6 96 --stagger 1.5 --close
 ```
 
 加 `--close` 后，每个用户问完就调 `POST /v1/conversations/close` 把会话**主动还回去**，
@@ -611,7 +615,7 @@ python3 demo_multiuser.py http://127.0.0.1:8080 6 96 --stagger 1.5 --close
 
 ```sh
 IDLE_TTL=20 CONTEND_IDLE=0 QUEUE_TIMEOUT=120 NSESSION=2 ./start_gateway.sh
-python3 demo_multiuser.py http://127.0.0.1:8080 4 40 --stagger 0.6 --plain
+python3 demo_multiuser.py http://127.0.0.1:18280 4 40 --stagger 0.6 --plain
 ```
 
 **两个要主动说清楚的边界**（会被问到）：
@@ -631,21 +635,21 @@ python3 demo_multiuser.py http://127.0.0.1:8080 4 40 --stagger 0.6 --plain
 
 | 症状 | 原因 | 怎么办 |
 |---|---|---|
-| 连不上 8080 | 网关没起，或还在加载模型 | `tail -f gateway.log`；模型要加载约 240 秒 |
+| 连不上 18280 | 网关没起，或还在加载模型 | `tail -f gateway.log`；模型要加载约 240 秒 |
 | **4 行轮流动，一次只有一行在爬** | 并发被吃掉了（会话租约算错） | 看 `gateway.log` 里的**租约落点**：正常是 `0,1,2,3`；退化时是 `0,0` 或 `0,1,2,0`。重启网关；本问题已修（§9.7 坑 4） |
 | 各路速率和只有 1× | 同上 | 同上 |
 | 某一路明显更慢 | 路数 ≤ 会话数时各跑各的，正常；若路数 > 会话数则会排队 | `/health` 看 `sessions` 是否 ≥ 并发路数。**会话数不是想开多少就开多少**：它由"上下文 × 路数"的内存账定死（4096/8192 导出实测 5 路封顶，**32768 导出只够 2 路**）。⚠️ 在 32K 那类大导出上超开会把四张卡压死到要重启板卡，`start_gateway.sh` 会先拦下来（见 `CHANGELOG.md` 2026-09-20） |
 | 答案对，但慢 3~4 倍 | KV 复用没生效 | 看响应头 `X-KV-Reuse` 的 `sent` vs `full` |
 | 输出里混着 `<think>...` | 思考没关（默认开） | 正常现象，推理过程是原样透传的；不想看就用 `--nothink`，但它是软开关，不保证 |
 | 打开 `/demo` 报 404 / `demo page missing: ...` | `demo_4chat.html` 不在网关同目录 | 把 `demo_4chat.html` 和 `rkllm_gateway.py` 放一起（不改路径，网关按自己所在目录找） |
-| 网页上点按钮没反应，控制台 `Failed to fetch` | 用 `file://` 双击打开的，不是从板卡取的页面 | 改从 `http://<板卡IP>:8080/demo` 打开 |
+| 网页上点按钮没反应，控制台 `Failed to fetch` | 用 `file://` 双击打开的，不是从板卡取的页面 | 改从 `http://<板卡IP>:18280/demo` 打开 |
 | 网页上四个对话框**轮流出字** | 同第 3 步：并发被吃掉了 | 看 `gateway.log` 的租约落点；再看 `/v1/pool` 里四个会话是不是分别记着 `id:web-1`…`id:web-4`（记成 `h:...` 说明身份没发出去） |
 | 跑第 6 步时四个人全在排队 | 第 5 步的网页还开着，四个会话被它占着 | 页面点「清空」或关掉标签页；忘了关就从 `/v1/pool` 读 `id:web-N` 逐个 close |
 | 网页上点「①」之后点「②」，有一路一直不出字 | 基线那次没把会话还回去（旧版页面会这样） | 换新版 `demo_4chat.html`；或看 `/v1/pool` 里是不是有个 `id:web-baseline` 挂着 |
 | 网页上第二轮之后统计行没显示「复用」 | `base=0`，确实没复用（不是显示 bug） | 正常：首轮或换了全新问题时本就无前缀可复用。判据是 `X-KV-Reuse` 的 `base`，不是 `reset` |
 | 重定向后满屏 `^[[K` | 默认模式用 ANSI 重绘 | 加 `--plain` |
 | 第 6 步：**所有用户都落到同一个会话上** | 没带身份，网关按内容认对话 | 别加 `--no-id`；确认客户端带了 `X-Conversation-Id`。这正是 `--no-id` 对照组要演示的现象 |
-| 第 6 步：**用户一直停在"排队 Ns"，秒数涨到几百** | 占着会话的那些对话**正在跑**（`busy` 的会话不会被收），或第二级被关掉了（`CONTEND_IDLE=0`） | `curl -s http://<板卡IP>:8080/v1/pool` 看是谁占着、`idle_s` 多大：`state=busy` 就是在真跑，只能等；`state=idle` 且 `idle_s` 早过 15 秒还在排队，说明 `CONTEND_IDLE` 被设成了 0。都是自己刚才的测试残留就等 `IDLE_TTL`（默认 300s），或重启网关 |
+| 第 6 步：**用户一直停在"排队 Ns"，秒数涨到几百** | 占着会话的那些对话**正在跑**（`busy` 的会话不会被收），或第二级被关掉了（`CONTEND_IDLE=0`） | `curl -s http://<板卡IP>:18280/v1/pool` 看是谁占着、`idle_s` 多大：`state=busy` 就是在真跑，只能等；`state=idle` 且 `idle_s` 早过 15 秒还在排队，说明 `CONTEND_IDLE` 被设成了 0。都是自己刚才的测试残留就等 `IDLE_TTL`（默认 300s），或重启网关 |
 | 第 6 步：**排队的人最后报 503** | 等超过 `QUEUE_TIMEOUT`（默认 600s）；或没人交还会话 | 这是设计行为，不是 bug。会话数不够就调大 `NSESSION`（**上限由上下文定**：8K 导出 5 路、32K 导出 2 路，`start_gateway.sh` 会替你算）；给客户端加 `--close`，或把 `IDLE_TTL` 调短 |
 | 第 6 步：**排队的人等很久也没轮到**，`/v1/pool` 里 `idle_s` 涨过 15 秒还在涨 | 第二级回收被关掉了（`CONTEND_IDLE=0`），或连总开关都关了（`IDLE_TTL=0`） | 恢复默认 `CONTEND_IDLE=15`：**默认行为**是"只要有人在等，最闲的那一段静默到 15 秒就被收回来"，`idle_s` 涨不过它。另外让客户端问完调 `POST /v1/conversations/close` 永远是最快的那条路——网关不知道对话何时结束 |
 | `/v1/pool` 返回 404 | 网关是旧版本（这个端点是后加的） | 把新的 `rkllm_gateway.py` 传上板卡并重启（要重新加载模型 ~240s） |

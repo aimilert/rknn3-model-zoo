@@ -9,7 +9,7 @@
 # 用法：./run_all_board_tests.sh [base_url]
 #   环境变量：GATEWAY_DIR（默认 = 脚本自己所在目录）、LOG（默认 $GATEWAY_DIR/board_tests.log）
 set -u
-BASE=${1:-http://127.0.0.1:8080}
+BASE=${1:-http://127.0.0.1:18280}
 GATEWAY_DIR=${GATEWAY_DIR:-$(cd "$(dirname "$0")" && pwd)}
 R=${LOG:-$GATEWAY_DIR/board_tests.log}
 cd "$GATEWAY_DIR" || exit 1

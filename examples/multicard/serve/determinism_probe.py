@@ -17,7 +17,7 @@ top_p=0.9，top_k=1 就是取 argmax，温度乘不改变 argmax 的顺序，是
   C. 同一 session 上第二轮的粘性复用（验证复用那一路和全量那一路的差异量级，
      和 A 组的固有抖动相比是否更大——这是判断「复用有没有引入额外差异」的唯一办法）
 
-用法：python3 determinism_probe.py http://127.0.0.1:8080
+用法：python3 determinism_probe.py http://127.0.0.1:18280
 
 **用完全部交还**（2026-09-16 修）：本脚本一共用 6 段对话（A 组 1 + B 组 3 + C 组 2），
 而板卡的会话池只有 4 个。以前一个都不 close，前 4 段就占满了池子，第 5 段开始要等
@@ -28,7 +28,7 @@ import json
 import sys
 import urllib.request
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18280"
 TIMEOUT = 1800
 NP = 32
 # 一个对措辞敏感、但答案确定的短请求
