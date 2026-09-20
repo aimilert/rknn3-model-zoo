@@ -69,7 +69,11 @@ if echo "$NEEDED" | grep -qiE 'lib(asan|tsan|ubsan)'; then
 fi
 
 echo "=== 检查 3/3：用法行与本次的改动都在里面 ==="
-for pat in '--serve-fd' 'REJECT' 'prompt too long'; do
+# 每加一个"只有新后端才有"的字面量就往这里加一条：装上旧二进制时，报错要在这里，
+# 而不是等到板卡上某个请求返回 503。
+#   `STAT `        资源观测帧的类型行（2026-09-20）——旧网关不认这个标签，会整流错位
+#   `node_min_free` 同一批的字段名，比 'STAT ' 更专有（后者会匹配到一堆无关行）
+for pat in '--serve-fd' 'REJECT' 'prompt too long' 'STAT ' 'node_min_free'; do
   n=$(strings "$TMP" | grep -c -- "$pat" || true)
   echo "  '$pat' 出现 $n 次"
   if [ "$n" -eq 0 ]; then

@@ -688,6 +688,12 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
     chk2(/#0 NPU 55%\s+内存 91%/.test(t),
          "0 号卡该显示 NPU 55% / 内存 91%：" + JSON.stringify(t));
     chk2(/node 13 MB/.test(t), "最紧 node 的余量没画出来（这是最先撞墙的那一格）");
+    // "内存 91%" 到底是谁的 91%？**必须写明白**：2026-09-20 第一次上板时后端报的是
+    // dev_mem.sys_*（主机侧的小块内存，只有 ~19 MB），页面上就写成了"每卡 19 MB"，
+    // 而同一时刻 rknn-smi 报 93%。这一条把"整卡各 node 之和"这句话钉在 title 里。
+    chk2(/title="整卡 4\.5 GB \/ 5\.0 GB（各 node 之和），8 个 node"/.test(run(SYS_FIX)),
+         "内存那格没把口径写进 title（整卡各 node 之和 vs 主机侧 sys_*）：" +
+         JSON.stringify(run(SYS_FIX).slice(0, 500)));
     chk2(!/node 0 MB/.test(t), "node_min_free 为 0 说明**没采到**，不许画成「node 0 MB」");
     chk2(!/node null/.test(t), "读不到的 node 余量漏成了字面的「null」");
     // 没采到就**整格不显示**，不要印一个「node —」出来占位：四张卡各占一格，一格

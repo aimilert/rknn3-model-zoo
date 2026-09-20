@@ -205,7 +205,14 @@ def _argv_int(argv, name):
 # 而 RK3588 的一切都在 procfs/sysfs 里，网关直接读——不必为它绕一圈帧协议。
 
 STAT_MIN_INTERVAL = 0.9     # 两次 STAT 之间至少隔这么久（页面约 2s 轮一次，够用）
-STAT_WAIT = 0.35            # 发出 STAT 后最多等这么久；后端是就地答原子量，正常 <1ms
+# 发出 STAT 后最多等这么久。后端是**就地答原子量**、不碰设备也不进队列，正常 <1ms
+# （板上实测：同一台机器连着问 10 次，HTTP 全程 7~11ms）。但 2026-09-20 在板上量到
+# **偶发**的答复会晚于 0.35s——那版把 wait 设成 0.35，结果 /v1/system 每隔几次就拿到
+# 上一份 doc，busy_pct 由 0.0 变成 None，页面上就在数字和 "—" 之间闪。
+# 所以放成 1.0：页面轮询是 2s，多等这 0.65s 谁也不影响（这条路径只服务 /v1/system，
+# 不在聊天请求的路上）；而"等不到就返回旧的"这条兜底照旧在——后端真卡住时它仍然
+# 按时返回、只把年龄标出来。
+STAT_WAIT = 1.0
 
 _THERMAL_BASE = "sys/class/thermal"
 
@@ -361,11 +368,17 @@ class CardStats(object):
 
     第一次调用没有"上一次"，`busy_pct` 是 None——**不是 0%**。这和 HostSampler 是
     同一个道理：刚打开页面就显示"NPU 0%"，会让人以为板卡闲着。
+
+    同一份 doc 被连着采两次（后端那边 `now_us` 没动）时：不推进窗口，并把上一次算出的
+    百分比原样再给一次。**多个看页面的人同时轮询时每个请求都会走到这条路上**——窗口
+    是"上一次真拿到新 doc 到现在"这一段，谁先问谁算，后面的人拿到同一个数（而不是 "—"，
+    也不是一个被切短的窗口算出来的数）。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._prev = None          # (now_us, {card_name: busy_us})
+        self._last_pct = {}        # card_name -> 上一次算出来的利用率（同一份 doc 直接复用它）
 
     def sample(self, doc):
         if not isinstance(doc, dict):
@@ -378,7 +391,18 @@ class CardStats(object):
                 busy[c["name"]] = c.get("busy_us") or 0
         with self._lock:
             prev = self._prev
-            self._prev = (now_us, busy)
+            # ⚠️ 同一份 doc 连着被采两次（now_us 没动）时**不推进 _prev**，而且下面
+            # 把上一次算出来的百分比原样再给一次。这道"不推进"是 2026-09-20 在板上
+            # 量出来的：STAT 的答复偶尔会晚于 STAT_WAIT（0.35s 那版实测过 0.3s 还没到），
+            # 超时的调用拿到的是**上一份** doc ⇒ Δt=0 ⇒ 算不出比值 ⇒ 页面在 0% 和 "—"
+            # 之间闪。若这时把 _prev 挪到这份旧 doc 上，下一份真 doc 的 Δ 还只剩下
+            # 后半段，等于把一段观测悄悄切掉。两个毛病一起修：拿不到新 doc 就
+            # **既不动窗口、也照旧显示上一次的值**（值本身没变旧，它是同一份数据算的）。
+            if prev is None or not prev[0] or now_us > prev[0]:
+                self._prev = (now_us, busy)
+                repeated = False
+            else:
+                repeated = True
 
         cards = []
         pcts = []
@@ -406,13 +430,21 @@ class CardStats(object):
                               if (mem_at and now_us >= mem_at) else None),
                 "busy_pct": None,
             }
-            if prev and prev[0] and now_us > prev[0]:
-                p0 = prev[1].get(name)
+            if repeated:
+                # 这次是同一份 doc：百分比没得算，但**数据本身没变旧**，把上一次算的
+                # 原样给回去，别让页面在数字和 "—" 之间闪（"—" 要留给"真的没有值"）。
+                with self._lock:
+                    card["busy_pct"] = self._last_pct.get(name)
+            else:
+                p0 = prev[1].get(name) if prev else None
                 p1 = busy.get(name)
                 if p0 is not None and p1 is not None and p1 >= p0:
                     span = now_us - prev[0]
                     card["busy_pct"] = round(max(0.0, min(100.0,
                                                          (p1 - p0) * 100.0 / span)), 1)
+                if card["busy_pct"] is not None:
+                    with self._lock:
+                        self._last_pct[name] = card["busy_pct"]
             if card["busy_pct"] is not None:
                 pcts.append(card["busy_pct"])
             cards.append(card)
@@ -2280,6 +2312,25 @@ intr 0
               cs.sample({"now_us": 3000000,
                          "cards": [card("stage0", 1, 2900000)]})["cards"][0]["busy_pct"]
               is None, "")
+
+        # 同一份 doc 连着采两次：后端那边 now_us 没动（拿到的是缓存 / 答复超时）。
+        # 这时候**不许**把窗口推过去、也不许把上一次的数抹成 "—"。
+        # 板上就是这么闪的（2026-09-20）：busy_pct 在 0.0 和 None 之间来回跳。
+        cs2 = CardStats()
+        cs2.sample({"now_us": 1000000, "cards": [card("stage0", 0, 0)]})
+        ready = cs2.sample({"now_us": 2000000, "cards": [card("stage0", 500000, 0)]})
+        check("（前置）两次不同 doc 才算出 50.0%", ready["cards"][0]["busy_pct"] == 50.0,
+              "= %r" % (ready["cards"][0]["busy_pct"],))
+        again = cs2.sample({"now_us": 2000000, "cards": [card("stage0", 500000, 0)]})
+        check("同一份 doc 再来一次：给回上一次的数，不是 None",
+              again["cards"][0]["busy_pct"] == 50.0,
+              "= %r" % (again["cards"][0]["busy_pct"],))
+        # 关键：窗口没被这次"重复"吃掉——下一份真 doc 的 Δ 是从**上一次真 doc**起算的。
+        # 若把 _prev 推到了那份旧 doc 上，这里会算成 100%（Δ0.5s / Δ0.5s）而不是 50%。
+        span = cs2.sample({"now_us": 3000000, "cards": [card("stage0", 1000000, 0)]})
+        check("重复采样不吃掉窗口：下一份 doc 仍从上一份**真** doc 起算（50%，不是 100%）",
+              span["cards"][0]["busy_pct"] == 50.0,
+              "= %r" % (span["cards"][0]["busy_pct"],))
 
         print("== 后端 STAT 帧的解包与缓存 ==")
         bad_input = CardStats().sample(None)

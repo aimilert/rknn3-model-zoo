@@ -473,7 +473,14 @@ function renderSys(d) {
              '"><b>' + esc(m ? "#" + m[1] : nm) + '</b></span> ' +
         '<span class="m">NPU <b>' + fmtPct(c.busy_pct) + "</b></span> " +
           bar(c.busy_pct, 70, 90) + " " +
-        '<span class="m">内存 <b>' + fmtPct(c.mem_used_pct) + "</b></span> " +
+        // 这一格的字节数收进 title：四张卡都写出来会把条子挤成两行（RK3588 那半只有
+        // 一格，写得下）。title 里也顺带说清 91% 是**谁**的占比——整卡各 node 之和，
+        // 不是 dev_mem.sys_*（那是主机侧的小块内存，实测只有 ~19 MB，拿它当整卡内存
+        // 会显示成"每卡 19 MB"，而 rknn-smi 报的是 93%）。
+        '<span class="m" title="' + esc("整卡 " + (fmtBytes(c.mem_used) || "—") + " / " +
+          (fmtBytes(c.mem_total) || "—") + "（各 node 之和）" +
+          (c.node_num ? "，" + c.node_num + " 个 node" : "")) + '">内存 <b>' +
+          fmtPct(c.mem_used_pct) + "</b></span> " +
           bar(c.mem_used_pct, 85, 95) +
         // `> 0` 那一条是必须的：0 表示**后端一次都没采到**（查询失败），不是"还剩 0 字节"。
         // 后面那个 `|| "—"` 是第二道保险——fmtBytes 读不到时返回 null，少了它屏幕上会

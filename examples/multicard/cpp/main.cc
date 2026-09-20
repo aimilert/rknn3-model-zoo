@@ -340,8 +340,12 @@ struct StageContext
   std::atomic<uint64_t> stat_busy_us{0};
   std::atomic<uint64_t> stat_run_calls{0};
   std::atomic<uint64_t> stat_mem_at_us{0};    // 0 = 一次都还没采过
-  std::atomic<uint64_t> stat_mem_total{0};    // 整卡 sys_total（字节）
-  std::atomic<uint64_t> stat_mem_free{0};     // 整卡 sys_free（字节）
+  // ⚠️ 这两个是**该卡所有 node 的和**，不是 dev_mem.sys_total/sys_free。
+  // sys_* 是"本机侧的小块内存"（实测只有 ~19 MB，且它占的是驱动/传输缓冲，与模型
+  // 放不放得下无关）——2026-09-20 第一次上板就拿它当整卡内存显示过，页面上每张卡
+  // 写"19.0 MB"，而 `rknn-smi` 同一时刻报的是 ~93% 占用。见 refresh_stage_mem_stat。
+  std::atomic<uint64_t> stat_mem_total{0};    // Σ node.total（字节）= 整卡总量
+  std::atomic<uint64_t> stat_mem_free{0};     // Σ node.free（字节）= 整卡空闲
   std::atomic<uint64_t> stat_node_min_free{0};// 全卡最紧那个 node 的空闲（字节）
   std::atomic<uint32_t> stat_node_num{0};
 };
@@ -600,17 +604,25 @@ static void refresh_stage_mem_stat(StageContext& stage)
   }
   const uint32_t n = dev_mem.node_num < RKNN3_MAX_NPU_NODE_NUM ? dev_mem.node_num
                                                               : RKNN3_MAX_NPU_NODE_NUM;
+  // 整卡量 = 各 node 之和；**不能用 sys_total/sys_free**：那两个是"本机侧的小块内存"
+  // （同一个结构体里的另一组字段，实测 ~19 MB 量级，见 --probe 那段的老注释），拿它当
+  // 整卡内存显示出来的是个假数。node 才是模型真正落地的内存：8 个 node 各 ~634 MB，
+  // 加起来 ~5071 MB/卡，跟 `rknn-smi` 的占用率对得上（2 路 32K ⇒ 93/95%）。
+  uint64_t sum_total = 0, sum_free = 0;
   uint64_t tightest = 0;
   bool     have_tightest = false;
   for (uint32_t i = 0; i < n; ++i) {
+    const uint64_t node_total = dev_mem.node_mem_info[i].total;
     const uint64_t node_free = dev_mem.node_mem_info[i].free;
+    sum_total += node_total;
+    sum_free += node_free;
     if (!have_tightest || node_free < tightest) {
       tightest = node_free;
       have_tightest = true;
     }
   }
-  stage.stat_mem_total.store(dev_mem.sys_total, std::memory_order_relaxed);
-  stage.stat_mem_free.store(dev_mem.sys_free, std::memory_order_relaxed);
+  stage.stat_mem_total.store(sum_total, std::memory_order_relaxed);
+  stage.stat_mem_free.store(sum_free, std::memory_order_relaxed);
   stage.stat_node_min_free.store(have_tightest ? tightest : 0, std::memory_order_relaxed);
   stage.stat_node_num.store(n, std::memory_order_relaxed);
   stage.stat_mem_at_us.store(stat_now_us(), std::memory_order_relaxed);
