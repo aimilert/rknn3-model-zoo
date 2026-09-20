@@ -214,6 +214,17 @@ STAT_MIN_INTERVAL = 0.9     # 两次 STAT 之间至少隔这么久（页面约 2
 # 按时返回、只把年龄标出来。
 STAT_WAIT = 1.0
 
+# /v1/system 的快照缓存：**1 秒内不管几个人来问，只采一次**。
+#
+# 为什么要有它：一次快照 = 读十几个 procfs/sysfs 文件 + 一次 STAT 往返。这些读数和四路
+# 推理抢的是同一台 RK3588、同一条 DDR 带宽——多开几个页面就会变成"看的人越多、被看的那
+# 台机器越慢"。而这一块要看的都是**慢变量**（内存、温度、谁在占着会话），1 秒的陈旧谁也
+# 看不出差别；页面自己也是 2s/6s 轮一次。
+# 顺带把"同一秒里的两份 doc 完全一样"变成必然：页面靠 ts 判断要不要重画，重复的那一份
+# 连 DOM 都不动（见 demo_4chat.html 的 refreshSystem）。
+# 传 max_age=0 可以绕开缓存强制重采（自检里用它来量"缓存到底有没有生效"）。
+SYS_CACHE_S = 1.0
+
 _THERMAL_BASE = "sys/class/thermal"
 
 
@@ -260,22 +271,46 @@ def _read_meminfo(path):
     return out
 
 
+# 「有哪些热区、各自叫什么」是**开机就定下来的**，问一次就够。以前每一拍都重新
+# listdir 一遍、再把每个区的 type 读一遍——板卡上 7 个区就是 1 + 7 次 sysfs 打开，
+# 每拍都做，而它们连一个字节都不会变。现在只留"读温度"这一半（7 次）。
+# 只缓存**列成功**的结果：本机（没有 /sys）那种读不到的情况不缓存，免得偶然一次失败
+# 被记成"这台机器没有热区"。
+_THERMAL_ZONES = {}                     # base 路径 -> [(zone_dir_name, label), …]
+_THERMAL_ZONES_LOCK = threading.Lock()
+
+
+def _thermal_zones(base):
+    with _THERMAL_ZONES_LOCK:
+        hit = _THERMAL_ZONES.get(base)
+    if hit is not None:
+        return hit
+    zones = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return zones
+    for name in names:
+        if not name.startswith("thermal_zone"):
+            continue
+        try:
+            with open(os.path.join(base, name, "type"), "r") as fh:
+                label = fh.read().strip()
+        except (OSError, ValueError):
+            continue
+        zones.append((name, label))
+    with _THERMAL_ZONES_LOCK:
+        _THERMAL_ZONES[base] = zones
+    return zones
+
+
 def _read_thermals(base):
     """板上 7 路热区。**全是 RK3588 自己的**（含它自己那个 npu-thermal），
     RK1828 四张卡一个都不在里面——这一点别在页面上含糊掉。"""
     out = []
-    try:
-        names = sorted(os.listdir(base))
-    except OSError:
-        return out
-    for name in names:
-        if not name.startswith("thermal_zone"):
-            continue
-        d = os.path.join(base, name)
+    for name, label in _thermal_zones(base):
         try:
-            with open(os.path.join(d, "type"), "r") as fh:
-                label = fh.read().strip()
-            with open(os.path.join(d, "temp"), "r") as fh:
+            with open(os.path.join(base, name, "temp"), "r") as fh:
                 milli = int(fh.read().strip())
         except (OSError, ValueError):
             continue
@@ -1297,14 +1332,36 @@ class Gateway(object):
         self.started_at = time.time()
         self.host = HostSampler()
         self.cards = CardStats()
+        # /v1/system 的快照缓存（见 SYS_CACHE_S）。锁的作用不只是保护这两个字段：
+        # **同一时刻只有一个人去采**，后来的那个等在外面拿现成的——采一次要读十几个
+        # 文件、还要向后端要一帧，放进来两个人一起采等于把省下来的又花回去。
+        self._sys_lock = threading.Lock()
+        self._sys_doc = None
+        self._sys_at = 0.0
 
     def log(self, fmt, *args):
         if self.verbose:
             sys.stderr.write("[gateway] " + (fmt % args) + "\n")
             sys.stderr.flush()
 
-    def system_snapshot(self):
-        """`/v1/system` 的内容：RK3588（本机读）+ RK1828（后端 STAT 帧）+ 网关自己。
+    def system_snapshot(self, max_age=SYS_CACHE_S):
+        """`/v1/system` 的内容（带 `max_age` 秒的快照缓存，见 SYS_CACHE_S）。
+
+        `max_age=0` = 不要缓存、现在就采一份（自检与排障用）。
+        """
+        with self._sys_lock:
+            now = time.monotonic()
+            if self._sys_doc is not None and (now - self._sys_at) < max_age:
+                return self._sys_doc
+            doc = self._system_snapshot_now()
+            # 时间戳取**采完**的时刻，不是开始采的时刻：采这一份本身可能要等 STAT 一秒钟，
+            # 按开始时刻算的话它一出锁就是过期的，缓存等于不存在。
+            self._sys_doc = doc
+            self._sys_at = time.monotonic()
+            return doc
+
+    def _system_snapshot_now(self):
+        """RK3588（本机读）+ RK1828（后端 STAT 帧）+ 网关自己。
 
         **两半的可信度不一样，所以不用同一个形状糊在一起**：`host` 是这一秒读到的，
         `cards` 是从后端来的、带着它的采样时刻；`backend_stats_age_s` 说后者有多旧。
@@ -1477,7 +1534,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "uptime_s": round(time.time() - self.gateway.started_at, 1)})
         if path == "/v1/system":
             # 非 OpenAI 标准端点，纯观测：板卡此刻的 CPU / 内存 / 温度 / 每卡 NPU。
-            # 页面每 2s 轮一次；**这个端点永远不会因为后端卡住而报错**——拿不到新数就
+            # 页面每 2s（待机 6s）轮一次，网关侧还有 SYS_CACHE_S 秒的快照缓存（几个人同时
+            # 开着页面也只采一次）；**这个端点永远不会因为后端卡住而报错**——拿不到新数就
             # 返回上一份并带上年龄，因为"看板卡现在怎么样"正是它卡住时最需要的。
             try:
                 return self._json(200, self.gateway.system_snapshot())
@@ -2331,6 +2389,69 @@ intr 0
         check("重复采样不吃掉窗口：下一份 doc 仍从上一份**真** doc 起算（50%，不是 100%）",
               span["cards"][0]["busy_pct"] == 50.0,
               "= %r" % (span["cards"][0]["busy_pct"],))
+
+        print("== /v1/system 的快照缓存：同一秒里后来的看客不许再采一次 ==")
+        # 为什么这条重要到要单独验：一次快照 = 读十几个 procfs/sysfs 文件 + 一次 STAT
+        # 往返，而这些都是**被看的那台机器**出的钱（四路推理就在同一颗 RK3588 上跑）。
+        # 人数一多，"看状态"这件事本身就能把被观测的机器拖慢——这正是用户说的
+        # "尽量减少这个展示功能对于硬件资源的占用"。
+        calls = {"stats": 0, "host": 0}
+
+        class _Be(object):
+            """替身后端：它**只数采了几次**。这条要钉的正是次数，不是内容。"""
+
+            sessions = 2
+            ctx_size = 8192
+
+            def __init__(self):
+                self.stats = {"ok": False, "cards": [], "busy_pct": None}
+                self.stats_at = None
+
+            def request_stats(self, min_interval=0.0, wait=0.0):
+                calls["stats"] += 1
+                return self.stats
+
+            def alive(self):
+                return True
+
+        class _Pool(object):
+            def snapshot(self):
+                return {"slots": [{"state": "busy"}], "waiting": []}
+
+        class _Hs(HostSampler):
+            def sample(self, *a, **kw):
+                calls["host"] += 1
+                return HostSampler.sample(self, *a, **kw)
+
+        gw = Gateway(_Be(), _Pool())
+        gw.host = _Hs(root=root)
+        d1 = gw.system_snapshot()
+        d2 = gw.system_snapshot()
+        check("同一秒里的第二次调用：STAT 与 /proc 都只采了那一次",
+              calls["stats"] == 1 and calls["host"] == 1,
+              "stats=%d host=%d" % (calls["stats"], calls["host"]))
+        # **同一个对象**、不只是"内容一样"：内容一样也可能是又采了一遍然后恰好相同。
+        check("第二个人拿到的是同一份快照（ts 也同一个）", d1 is d2,
+              "%r vs %r" % (d1.get("ts"), d2.get("ts")))
+        check("返回的那份是完整形状（host/npu/backend/gateway 都在）",
+              all(k in d1 for k in ("ts", "host", "npu", "backend", "gateway")),
+              "keys=%s" % sorted(d1.keys()))
+
+        d3 = gw.system_snapshot(max_age=0)
+        check("max_age=0 绕开缓存、真去重采一次",
+              calls["stats"] == 2 and calls["host"] == 2 and d3 is not d1,
+              "stats=%d host=%d" % (calls["stats"], calls["host"]))
+
+        # 过期这一条是**必须有**的：只测"1 秒内不重采"的话，一个"缓存永不过期"的
+        # 写法（忘了比时间，或者时间戳写成 0）在自检里照样全绿——而它在板上是
+        # 资源条冻在打开那一帧、温度内存永远不动，屏幕上完全看不出是坏了。
+        time.sleep(SYS_CACHE_S + 0.05)
+        d4 = gw.system_snapshot()
+        check("过了 %gs 之后再问要重采（缓存不许永不过期）" % SYS_CACHE_S,
+              calls["stats"] == 3 and d4 is not d3,
+              "stats=%d" % calls["stats"])
+        check("重采出来的那份 ts 必须是新的（页面靠它判断要不要重画）",
+              d4["ts"] > d1["ts"], "%r -> %r" % (d1["ts"], d4["ts"]))
 
         print("== 后端 STAT 帧的解包与缓存 ==")
         bad_input = CardStats().sample(None)

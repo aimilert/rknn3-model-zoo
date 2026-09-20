@@ -97,24 +97,50 @@
   .capline.over { color:var(--warn); }
   .capline.over b { color:var(--warn); }
 
-  /* 资源条：RK3588（本机现读）+ RK1828（后端 STAT 帧）+ 服务状态。
-     **两半的可信度不一样，所以视觉上分组、并各带自己的时间**：左边是这一秒读到的，
-     右边是从后端来的一包原子量、带"多久之前采的"。末尾那句 note 不是客套话：
+  /* 资源使用：RK3588（本机现读）+ RK1828（后端 STAT 帧）+ 热区 + 服务状态。
+     它**在页面最底部、一整块**（2026-09-20 从标题下面挪下来）。挪的理由两条：
+     ① 原先它是标题与对话区之间的一条线——每核小柱 + 四张卡 + 服务状态全挤在一行、
+        格间只有 5px，投影仪上像一张发票；② 它抢在对话前面，第一眼看到的是"内存 60%"
+        而不是这一页真正要给人看的回答。
+     现在按"一块 = 一样东西"分块（一张卡 / RK3588 / 热区 / 服务），块内一行一个指标、
+     条子撑满行宽，块间 10px。**不是把它藏起来**：它仍常驻可见——它回答的是"此刻板卡
+     到底在干什么"，这个数任何时候都得看得见，只是不再跟对话抢地方。
+     **两半的可信度不一样，所以分块、并各带自己的时间**：RK3588 那块是这一秒现读的，
+     RK1828 那几块来自后端的一包原子量、带"多久之前采的"。底部那句 note 不是客套话：
      RK1828 是 PCIe 设备（驱动 rkep），主机侧既没有 hwmon 也没有 NPU 利用率查询接口，
-     不写出来，屏幕上那两个百分数会被当成硬件读数读走（2026-09-20 加）。 */
-  .sysline { display:flex; flex-wrap:wrap; align-items:center; gap:5px 16px;
-             padding:7px 18px; border-bottom:1px solid var(--line); background:#12151b;
-             font-size:12px; color:var(--dim); font-variant-numeric:tabular-nums; }
-  .sysline .grp { display:flex; align-items:center; gap:7px; min-width:0; flex-wrap:wrap; }
-  .sysline .grp + .grp { padding-left:15px; border-left:1px solid var(--line); }
-  .sysline .tag { font-size:10px; letter-spacing:.6px; color:#5f6878; text-transform:uppercase; }
-  .sysline b { color:var(--fg); font-weight:600; }
-  .sysline .m { white-space:nowrap; }
-  .sysline .dim2 { color:#6b7488; }
-  .sysline .off { color:#5f6878; }
-  .sysline b.warn { color:var(--warn); }
-  .sysline b.crit { color:var(--danger); }
-  .sysline .m.warn { color:var(--warn); }
+     不写出来屏幕上那两个百分数会被当成硬件读数读走。 */
+  .syssec { margin:0 12px 14px; background:var(--panel); border:1px solid var(--line);
+            border-radius:10px; padding:12px 14px 13px; }
+  .syssec .shead { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
+                   margin:0 0 11px; }
+  .syssec .shead h2 { margin:0; font-size:13px; font-weight:600; letter-spacing:.3px; }
+  .syssec .shead .snote { color:#5f6878; font-size:11px; }
+  .syssec .sgrid { display:grid; gap:10px;
+                   grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); }
+  .syssec .sgrid + .sgrid { margin-top:10px; }
+  /* 一块 = 一样东西。**边框是刻意的**：四张卡各自成块，屏幕上立刻能数出"四张卡"，
+     而排成一行时它们看起来是一条数据线。 */
+  .sblock { border:1px solid var(--line); border-radius:9px; background:#12151b;
+            padding:9px 11px 10px; min-width:0; font-size:12px; color:var(--dim); }
+  .sblock .bhead { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;
+                   margin-bottom:8px; }
+  .syssec .srow { display:flex; align-items:center; gap:9px; min-width:0;
+                  font-variant-numeric:tabular-nums; }
+  .syssec .srow + .srow { margin-top:7px; }
+  /* 标签固定宽度，几行的数字才会对齐成一列；`flex:none` 保证它不被条子挤扁。 */
+  .syssec .srow .lab { flex:none; width:32px; color:#5f6878; font-size:11px; }
+  /* 条子**撑满行宽**（不再是 52px 的小方块）：一块里只有一条，宽一点才能一眼看出
+     深浅；块本身是网格里的一格，所以再宽也不会把别的东西挤走。 */
+  .syssec .srow .bar { flex:1; min-width:34px; width:auto; }
+  .syssec b { color:var(--fg); font-weight:600; }
+  .syssec .tag { font-size:10px; letter-spacing:.6px; color:#5f6878; text-transform:uppercase; }
+  .syssec .m { white-space:nowrap; }
+  .syssec .dim2 { color:#6b7488; }
+  .syssec .off { color:#5f6878; }
+  .syssec b.warn, .syssec .m.warn { color:var(--warn); }
+  .syssec b.crit { color:var(--danger); }
+  /* 最后那句说明单独占一行、离上面的块子留一点空（贴着卡片边框会显得挤）。 */
+  .syssec .note { display:block; margin-top:10px; }
   /* 一格资源 = 名字 + 数 + 一条横条。条子自己画：`<progress>` 在深色底上是浏览器默认
      那套浅色描边，跟这一页对不上，而且各家渲染还不一样。 */
   .bar { display:inline-block; width:52px; height:6px; border-radius:3px; overflow:hidden;
@@ -123,8 +149,6 @@
            transition:width .5s ease; }
   .bar.warn i { background:var(--warn); }
   .bar.crit i { background:var(--danger); }
-  /* 四张卡挤在一行里，条子窄一点才塞得下（RK3588 那几格宽一点更好读）。 */
-  .sysline .cards .bar { width:40px; }
   /* 8 个核一根小柱子。高度**就是**占用率（0% 就是空柱子），不设最小高度——
      给 0% 留一根看得见的"底座"就等于编了一个数出来。 */
   .cores { display:inline-flex; gap:2px; align-items:stretch; height:15px; flex:none; }
@@ -204,11 +228,6 @@
   </div>
 </header>
 
-<!-- 资源配置条（JS 每次轮询整块重写）。**常驻一行**，理由和容量条一样：它回答的是
-     "此刻板卡到底在干什么"——NPU 忙不忙、内存还剩多少、温度上没上来。演示时这几个数
-     比任何一句话都先被看到，所以宁可占一行也不藏进弹窗。 -->
-<div id="sys" class="sysline"></div>
-
 <!-- 基线/四路聚合那一整句（setSum）。**和徽标分开**：徽标只有一个词，这行是一句话，
      以前两者挤在 #gstats 里，一句汇总能把标题行撑到换行。 -->
 <div id="cap" class="capline"></div>
@@ -216,6 +235,12 @@
 <div id="gsum" class="sumline"></div>
 
 <main id="grid"></main>
+
+<!-- 资源使用（JS 每次轮询整块重写）。**常驻可见**：它回答的是"此刻板卡到底在干什么"
+     ——NPU 忙不忙、内存还剩多少、温度上没上来，演示时这几个数比任何一句话都先被问到，
+     所以不藏进弹窗。但**放在对话下面**：它要紧，却不该抢在回答前面（2026-09-20 挪的，
+     原先它挤在标题正下方那一行里，第一眼看到的是"内存 60%"而不是模型答了什么）。 -->
+<section id="sys" class="syssec"></section>
 
 <script>
 "use strict";
@@ -343,12 +368,21 @@ function renderCap() {
 //   · **NPU 利用率是算出来的**（卡级忙时 ÷ 墙钟差），SDK 的查询枚举里根本没有利用率；
 //   · **温度只有 RK3588 自己的热区**。RK1828 是 PCIe 设备（驱动 rkep），主机侧没有
 //     hwmon、也没有 thermal_zone，那四张卡的结温在主机上取不到——这不是"没做"。
-const SYS_POLL_MS = 2000;
+// 轮询节流：**这是这一页对板卡唯一的常态负载**，所以分两档——有人生成时 2s（这会儿要看
+// 的是"卡忙起来没有"），待机时 6s（这时真正会变的只有温度和内存）。切到后台整块停掉
+// （visibilitychange，见文件末尾），切回来立刻补一次。
+// 板上这一拍的成本：网关读十几个 /proc、/sys 文件 + 一次 STAT 往返。所以两边都做了节制：
+// 网关侧有 1 秒的快照缓存（N 个人开着页面也只采一次），页面侧拿到的还是同一份 doc 时
+// **连 DOM 都不重写**（见 refreshSystem）。
+const SYS_POLL_BUSY_MS = 2000;
+const SYS_POLL_IDLE_MS = 6000;
 const SYS_STALE_S = 6;      // 快照超过这么多秒就当场标旧（后端不答了）
 
 let sysOn = false;
 let sysTimer = null;
 let sysSeq = 0;             // 请求序号：晚到的旧响应不许覆盖新的一帧
+let sysLastTs = null;       // 上一份**画到屏幕上**的 doc 的时间戳（同一份就不重画）
+let sysRenders = 0;         // 画过几次（只给检查用："同一份 doc 不重画"要能被验到）
 
 // 读不到就返回 null，由调用点决定怎么显示。**不能返回 0**：内存 0 GB 和"读不到"
 // 在屏幕上必须是两句话。
@@ -420,79 +454,63 @@ function thermHtml(list) {
          (rest > 0 ? ' <span class="dim2">+' + rest + "</span>" : "") + "</span>";
 }
 
-function renderSysErr(msg) {
-  document.getElementById("sys").innerHTML =
-    '<span class="grp"><span class="tag">资源</span><span class="off">读不到 /v1/system（' +
-    esc(msg) + '）——网关没起、或者这一页是当本地文件打开的</span></span>';
+// 一样东西 = 一块。**块内一行一个指标**（标签 + 数 + 条子），不是把四张卡和主机状态
+// 全塞进一条横向长行：前者自己往下长、永远不会互相挤；后者每加一个字段就要重新分配
+// 那几个 px，四个核柱 + 四张卡一摆上就成了一张发票。
+function sRow(lab, value, extra) {
+  // 标签与值之间那个**字面空格**不能省：`.srow` 是 flex，纯空白节点不占位（视觉上无影响），
+  // 但去掉标签之后文本才是「CPU 42%」而不是「CPU42%」——复制出来和读屏软件读到的都是前者。
+  return '<div class="srow">' + (lab ? '<span class="lab">' + lab + "</span> " : "") +
+         value + (extra ? " " + extra : "") + "</div>";
 }
 
-// 把一份 /v1/system 画出来。**整块重写**：这样一个数字动一下整条就跟着重排，
+function sBlock(head, body) {
+  return '<div class="sblock"><div class="bhead">' + head + "</div>" + body + "</div>";
+}
+
+function renderSysErr(msg) {
+  const el = document.getElementById("sys");
+  if (!el) { return; }
+  el.innerHTML = '<div class="shead"><h2>资源使用</h2></div>' +
+    '<span class="off">读不到 /v1/system（' + esc(msg) +
+    "）——网关没起、或者这一页是当本地文件打开的</span>";
+}
+
+// 把一份 /v1/system 画出来。**整块重写**：这样一个数字动一下整块就跟着重排，
 // 不会出现"一半是新的、一半还是上一次的"。
 function renderSys(d) {
   const el = document.getElementById("sys");
   if (!el) { return; }
+  sysRenders++;
+  const head = '<div class="shead"><h2>资源使用</h2> ' +
+    '<span class="snote">生成中每 2 秒刷一次、待机 6 秒，页面切到后台就停</span></div>';
   if (!d) {
-    el.innerHTML = '<span class="grp"><span class="tag">资源</span>' +
-                   '<span class="off">正在读取…</span></span>';
+    el.innerHTML = head + '<span class="off">正在读取…</span>';
     return;
   }
+  sysLastTs = d.ts;   // 记住画下去的这一份：下一拍若还是同一个 ts，连 DOM 都不动
   const host = d.host || {}, cpu = host.cpu || {}, mem = host.mem || {};
   const npu = d.npu || {}, be = d.backend || {}, gw = d.gateway || {};
-  const g = [];
+  const blocks = [];
 
   // ---- RK3588：本机现读 ----
   const memTotal = fmtBytes(mem.total);
   const memUsed = fmtBytes(mem.used);
-  // 每一格之间留一个空格。`.grp` 是 flex，纯空白节点不占位（不会因此多出间距），
-  // 但**去掉标签之后**文本才是「CPU 42% 内存 60%」而不是「CPU 42%内存 60%」——
-  // 复制出来和读屏软件读出来的都是前者，后者会连成一个词。
-  g.push('<span class="grp"><span class="tag">RK3588</span>' +
-    '<span class="m">CPU <b>' + fmtPct(cpu.pct) + "</b></span> " +
-    coresHtml(cpu.per_core) + " " +
-    '<span class="m">内存 <b>' + fmtPct(mem.used_pct) + "</b> " +
-      bar(mem.used_pct, 80, 92) +
-      (memTotal && memUsed ? ' <span class="dim2">' + memUsed + " / " + memTotal + "</span>" : "") +
-    "</span> " +
-    thermHtml(host.thermal) + " " +
-    ((cpu.loadavg && cpu.loadavg.length)
-      ? '<span class="m">负载 <b>' + cpu.loadavg[0].toFixed(2) + "</b></span> " : "") +
-    ((typeof host.uptime_s === "number")
-      ? '<span class="m dim2">开机 ' + fmtDur(host.uptime_s) + "</span>" : "") +
-    "</span>");
-
-  // ---- RK1828：后端 STAT 帧 ----
-  const cards = npu.cards || [];
-  if (cards.length) {
-    g.push('<span class="grp cards"><span class="tag">RK1828</span>' + cards.map(function (c, i) {
-      const nm = String(c.name || ("#" + i));
-      // 后端的 stage 名就是 `stage0`..`stage3`（一张卡一个）。页面上按卡号写更短。
-      const m = /^stage(\d+)$/.exec(nm);
-      // 名字和后面那几格之间**留一个空格**：`.grp` 是 flex，空白不会真的占位（不会
-      // 因此多出间距），但去掉标签之后文本才是「#0 NPU 55%」而不是「#0NPU 55%」。
-      return '<span class="m" title="' + esc(nm) + " 上下文 " + esc(String(c.ctx_len)) +
-             '"><b>' + esc(m ? "#" + m[1] : nm) + '</b></span> ' +
-        '<span class="m">NPU <b>' + fmtPct(c.busy_pct) + "</b></span> " +
-          bar(c.busy_pct, 70, 90) + " " +
-        // 这一格的字节数收进 title：四张卡都写出来会把条子挤成两行（RK3588 那半只有
-        // 一格，写得下）。title 里也顺带说清 91% 是**谁**的占比——整卡各 node 之和，
-        // 不是 dev_mem.sys_*（那是主机侧的小块内存，实测只有 ~19 MB，拿它当整卡内存
-        // 会显示成"每卡 19 MB"，而 rknn-smi 报的是 93%）。
-        '<span class="m" title="' + esc("整卡 " + (fmtBytes(c.mem_used) || "—") + " / " +
-          (fmtBytes(c.mem_total) || "—") + "（各 node 之和）" +
-          (c.node_num ? "，" + c.node_num + " 个 node" : "")) + '">内存 <b>' +
-          fmtPct(c.mem_used_pct) + "</b></span> " +
-          bar(c.mem_used_pct, 85, 95) +
-        // `> 0` 那一条是必须的：0 表示**后端一次都没采到**（查询失败），不是"还剩 0 字节"。
-        // 后面那个 `|| "—"` 是第二道保险——fmtBytes 读不到时返回 null，少了它屏幕上会
-        // 印出字面的 "node null"。
-        ((typeof c.node_min_free === "number" && c.node_min_free > 0)
-          ? ' <span class="m dim2" title="全卡最紧那个 node 还剩多少——这是最先撞墙的一格">node ' +
-            (fmtBytes(c.node_min_free) || "—") + "</span>" : "");
-    }).join(" ") + "</span>");
-  } else {
-    g.push('<span class="grp"><span class="tag">RK1828</span>' +
-           '<span class="off">读不到（后端还没答 STAT）</span></span>');
+  let hostBody =
+    sRow("CPU", "<b>" + fmtPct(cpu.pct) + "</b>", coresHtml(cpu.per_core)) +
+    sRow("内存", "<b>" + fmtPct(mem.used_pct) + "</b>", bar(mem.used_pct, 80, 92) +
+      (memTotal && memUsed ? ' <span class="dim2">' + memUsed + " / " + memTotal + "</span>" : ""));
+  const load = (cpu.loadavg && cpu.loadavg.length) ? cpu.loadavg[0].toFixed(2) : null;
+  const up = (typeof host.uptime_s === "number") ? fmtDur(host.uptime_s) : null;
+  if (load || up) {
+    hostBody += sRow("负载", load ? "<b>" + load + "</b>" : '<span class="off">—</span>',
+                     up ? '<span class="dim2">· 开机 ' + up + "</span>" : "");
   }
+  blocks.push(sBlock('<span class="tag">RK3588</span> <span class="dim2">本机现读</span>',
+                     hostBody));
+  // 热区单独一块：它是"哪里烫起来了"这一个问题的答案，挤在别的数里就没人看。
+  blocks.push(sBlock('<span class="tag">RK3588 热区</span>',
+                     '<div class="srow">' + thermHtml(host.thermal) + "</div>"));
 
   // ---- 服务：后端活着吗、会话占了几个、有没有人在排队、这份数据多旧 ----
   const alive = (be.alive !== false);
@@ -501,23 +519,67 @@ function renderSys(d) {
   // **"一次都没采到"和"采过但很旧"是两回事**，不能合成一句话：前者是页面刚打开、
   // 第一包还没回来（正常）；后者是后端不答了（有事）。所以只有后者才加警示。
   const stale = (ageNum !== null && ageNum > SYS_STALE_S);
-  g.push('<span class="grp"><span class="tag">服务</span>' +
-    '<span class="m">后端 <b class="' + (alive ? "" : "crit") + '">' +
-      (alive ? "正常" : "已退出") + "</b></span> " +
-    '<span class="m">会话 <b>' + (gw.bound == null ? "—" : gw.bound) + " / " +
-      (be.sessions == null ? "—" : be.sessions) + "</b></span> " +
-    '<span class="m' + ((gw.waiting > 0) ? " warn" : "") + '">排队 <b>' +
-      (gw.waiting == null ? "—" : gw.waiting) + "</b></span> " +
-    '<span class="m">数据 <b class="' + (stale ? "warn" : "") + '">' +
-      (ageNum === null ? (alive ? "还没采到" : "—") : ageNum.toFixed(1) + "s 前") +
-      "</b>" + (stale ? "（后端没在答）" : "") + "</span> " +
-    ((typeof gw.uptime_s === "number")
-      ? '<span class="m dim2">网关已跑 ' + fmtDur(gw.uptime_s) + "</span>" : "") +
-    "</span>");
+  let svc =
+    sRow("后端", '<b class="' + (alive ? "" : "crit") + '">' +
+                 (alive ? "正常" : "已退出") + "</b>") +
+    sRow("会话", "<b>" + (gw.bound == null ? "—" : gw.bound) + " / " +
+                 (be.sessions == null ? "—" : be.sessions) + "</b>") +
+    sRow("排队", '<b class="' + ((gw.waiting > 0) ? "warn" : "") + '">' +
+                 (gw.waiting == null ? "—" : gw.waiting) + "</b>") +
+    sRow("数据", '<b class="' + (stale ? "warn" : "") + '">' +
+                 (ageNum === null ? (alive ? "还没采到" : "—") : ageNum.toFixed(1) + "s 前") +
+                 "</b>" + (stale ? "（后端没在答）" : ""));
+  if (typeof gw.uptime_s === "number") {
+    svc += sRow("网关", '<span class="dim2">已跑 ' + fmtDur(gw.uptime_s) + "</span>");
+  }
+  blocks.push(sBlock('<span class="tag">服务</span>', svc));
 
-  g.push('<span class="note">NPU 是卡级忙时占比（SDK 没有利用率查询接口）· ' +
-         "温度只有 RK3588 的热区，RK1828 是 PCIe 设备、主机侧没有 hwmon</span>");
-  el.innerHTML = g.join("");
+  // ---- RK1828：后端 STAT 帧。**一张卡一块**（原来四张卡挤在同一行里）----
+  // 单开一个数组而不是接在 blocks 后面：没卡的时候那一块"读不到"也要画出来，
+  // 靠 slice 切的话它正好会被切掉。
+  const cardBlocks = [];
+  const cards = npu.cards || [];
+  cards.forEach(function (c, i) {
+    const nm = String(c.name || ("#" + i));
+    // 后端的 stage 名就是 `stage0`..`stage3`（一张卡一个）。页面上按卡号写更短。
+    const m = /^stage(\d+)$/.exec(nm);
+    // 块头里那个空格同样不能省（`#0` 和 `ctx` 之间）：去掉标签后就是「#0 ctx 32768」。
+    const bhead = '<span class="tag">RK1828</span> ' +
+      '<b title="' + esc(nm + " 上下文 " + String(c.ctx_len)) + '">' +
+      esc(m ? "#" + m[1] : nm) + "</b> " +
+      '<span class="dim2">ctx ' + esc(String(c.ctx_len)) + "</span>";
+    let body =
+      sRow("NPU", "<b>" + fmtPct(c.busy_pct) + "</b>", bar(c.busy_pct, 70, 90)) +
+      // 字节数收进 title（一块里写两个字节串会把这一行挤到换行）。title 里也顺带说清
+      // 91% 是**谁**的占比——整卡各 node 之和，不是 dev_mem.sys_*（那是主机侧的小块
+      // 内存，实测只有 ~19 MB，拿它当整卡内存会显示成"每卡 19 MB"，而 rknn-smi 报 93%）。
+      sRow("内存", '<span class="m" title="' + esc("整卡 " + (fmtBytes(c.mem_used) || "—") +
+        " / " + (fmtBytes(c.mem_total) || "—") + "（各 node 之和）" +
+        (c.node_num ? "，" + c.node_num + " 个 node" : "")) + '"><b>' +
+        fmtPct(c.mem_used_pct) + "</b></span>", bar(c.mem_used_pct, 85, 95));
+    // `> 0` 那一条是必须的：0 表示**后端一次都没采到**（查询失败），不是"还剩 0 字节"。
+    // 后面那个 `|| "—"` 是第二道保险——fmtBytes 读不到时返回 null，少了它屏幕上会
+    // 印出字面的 "node null"。
+    if (typeof c.node_min_free === "number" && c.node_min_free > 0) {
+      body += sRow("node", '<span class="dim2" title="全卡最紧那个 node 还剩多少——' +
+        '这是最先撞墙的一格">' + (fmtBytes(c.node_min_free) || "—") + "</span>");
+    }
+    // 块头和第一行之间的那个空格：`.bhead` 是块级元素，多这一个空格在屏幕上不占位，
+    // 但去掉标签之后就是「… ctx 32768 NPU 55%」而不是「… ctx 32768NPU 55%」。
+    cardBlocks.push(sBlock(bhead + " ", body));
+  });
+  if (!cardBlocks.length) {
+    cardBlocks.push(sBlock('<span class="tag">RK1828</span> ',
+                           '<span class="off">读不到（后端还没答 STAT）</span>'));
+  }
+
+  // 两块网格：上面三块是"这台机器（RK3588）+ 服务"，下面那一行是"四张卡"。
+  // 分开是刻意的——**四张卡要一眼数得出来是四张**，混在一堆块里数不出来。
+  el.innerHTML = head +
+    '<div class="sgrid">' + blocks.join("") + "</div>" +
+    '<div class="sgrid">' + cardBlocks.join("") + "</div>" +
+    '<span class="note">NPU 是卡级忙时占比（SDK 没有利用率查询接口）· ' +
+    "温度只有 RK3588 的热区，RK1828 是 PCIe 设备、主机侧没有 hwmon</span>";
 }
 
 async function refreshSystem() {
@@ -533,7 +595,21 @@ async function refreshSystem() {
     return;
   }
   if (mine !== sysSeq) { return; }   // 已经有更新的一帧在路上了，这份是旧的，丢掉
+  // 网关侧有 1 秒的快照缓存（几个人同时开着页面也只采一次），所以连着两拍很可能拿到
+  // **同一份 doc**。这时候连 DOM 都不动：innerHTML 重写会让整块重新排版一次，
+  // 而数字一个都没变——白花的这一次排版在板卡那边看不到，在看页面这台机器上是要出钱的。
+  // `doc.ts != null` 那一条是必须的：万一碰上不带 ts 的应答（老网关、或者有人自己写了个
+  // 转发），`undefined === undefined` 会让这一页**从此再也不刷新**——屏幕上就是数字冻在
+  // 打开那一帧，看着还挺正常。宁可不省这一次重画。
+  if (doc && doc.ts != null && doc.ts === sysLastTs) { return; }
   renderSys(doc);
+}
+
+// 有人在生成就快一点，闲着就慢一点。**这不是省流量，是省板卡**：这一块的每一拍都要
+// 网关读一遍 /proc、/sys，再向后端要一次 STAT；而待机时真正会变的只有温度和内存。
+function sysIntervalMs() {
+  return panels.some(function (p) { return p.streaming; })
+    ? SYS_POLL_BUSY_MS : SYS_POLL_IDLE_MS;
 }
 
 function sysTick() {
@@ -541,7 +617,7 @@ function sysTick() {
   if (!sysOn) { return; }
   // 自排下一拍（而不是 setInterval）：串行，慢响应不会堆起来把请求叠成一串。
   refreshSystem().then(function () {
-    if (sysOn) { sysTimer = setTimeout(sysTick, SYS_POLL_MS); }
+    if (sysOn) { sysTimer = setTimeout(sysTick, sysIntervalMs()); }
   });
 }
 
@@ -554,6 +630,14 @@ function startSysPoll() {
 function stopSysPoll() {
   sysOn = false;
   if (sysTimer) { clearTimeout(sysTimer); sysTimer = null; }
+}
+
+// 某一轮刚开始生成时立刻补一拍：不补的话，待机档最长要等 6 秒才看到卡忙起来——
+// 而"点了②之后卡是不是真的忙了"恰恰是演示时最想看的那一帧。
+function sysWake() {
+  if (!sysOn) { return; }
+  if (sysTimer) { clearTimeout(sysTimer); }
+  sysTimer = setTimeout(sysTick, 0);
 }
 
 // 读后端的容量。**失败不抛**：页面可能被当本地文件打开（那时没有同源后端），
@@ -882,6 +966,9 @@ async function send(p) {
   setPerf(p, "");
   render(p);
   updateGlobal();
+  // 生成一起来就让资源那块立刻补一拍：待机档是 6 秒，不补的话点了「② 同时提问」之后
+  // 最多 6 秒里，屏幕上四张卡还是闲着的——而那正是演示时最想看到"卡忙起来"的一帧。
+  sysWake();
   try {
     // 这一路的名字**必须稳定**：`p.convId` 从建面板那一刻定下，之后不管顺序怎么变、
     // 别的窗口删没删，它都不动。改了名字就是换了对话，网关会当成新人重新分会话，
@@ -1146,7 +1233,7 @@ document.addEventListener("visibilitychange", function () {
 
 // 后端被换成别的 NSESSION 重启之后，开着的这一页要能自己发现（容量条会转警告色、
 // 「＋」会禁用）。**容量这块仍然用 focus 而不是定时轮询**：它是一次性的、结论很少变，
-// 而资源条那边是每 2s 一次、量的是"现在"——两件事的时效要求不一样。
+// 而资源那块是每 2s/6s 一次、量的是"现在"——两件事的时效要求不一样。
 window.addEventListener("focus", function () { refreshHealth(); });
 </script>
 </body>

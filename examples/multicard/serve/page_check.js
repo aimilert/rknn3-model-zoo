@@ -237,6 +237,13 @@ vm.runInContext(script + "\n;globalThis.__t = { panels: panels, send: send, "
                + "startSysPoll: startSysPoll, stopSysPoll: stopSysPoll, "
                + "refreshSystem: refreshSystem, "
                + "sysOn: function () { return sysOn; }, "
+               // "这一块有多贵、省在哪"这几条要能被验到：刷新档位（生成中/待机）、
+               // 画过几次、以及"同一份 doc 来了要不要重画"那道闸。都是 let，交闭包。
+               + "sysIntervalMs: sysIntervalMs, sysWake: sysWake, "
+               + "sysRenders: function () { return sysRenders; }, "
+               + "sysLastTs: function () { return sysLastTs; }, "
+               + "SYS_POLL_BUSY_MS: SYS_POLL_BUSY_MS, "
+               + "SYS_POLL_IDLE_MS: SYS_POLL_IDLE_MS, "
                + "SYS_STALE_S: SYS_STALE_S };", ctx);
 
 const { panels, send, summarize, addPanel, removePanel, capReady } = ctx.__t;
@@ -685,8 +692,10 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
     // `\s+` 而不是单个空格：每一格之间那点空白靠的是 HTML 源码里的空格（`.grp` 是
     // flex，空白不占位），去掉标签之后可能是两个空格——**这里要钉的是"有没有这两格
     // 数、数对不对"，不是空白的个数**。
-    chk2(/#0 NPU 55%\s+内存 91%/.test(t),
-         "0 号卡该显示 NPU 55% / 内存 91%：" + JSON.stringify(t));
+    // 卡号后面先跟 `ctx 32768`（2026-09-20 改成一块一张卡：一块的头是「RK1828 #0
+    // ctx 32768」，把这一路跑着什么上下文长度也写在同一行，省得回头去翻启动参数）。
+    chk2(/#0\s+ctx 32768\s+NPU 55%\s+内存 91%/.test(t),
+         "0 号卡该显示 #0 / ctx 32768 / NPU 55% / 内存 91%：" + JSON.stringify(t));
     chk2(/node 13 MB/.test(t), "最紧 node 的余量没画出来（这是最先撞墙的那一格）");
     // "内存 91%" 到底是谁的 91%？**必须写明白**：2026-09-20 第一次上板时后端报的是
     // dev_mem.sys_*（主机侧的小块内存，只有 ~19 MB），页面上就写成了"每卡 19 MB"，
@@ -707,8 +716,9 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
 
     // ③ 缺值必须是「—」，**不是 0%**。1 号卡的 busy_pct 是 null（第一次采样还没有差值），
     //    这一格画成 0% 就是"板卡闲着"，而它恰恰是最该判断"跑没跑起来"的那一帧。
-    chk2(/#1 NPU —\s/.test(t), "没采到值的 NPU 该显示「—」而不是 0%：" + JSON.stringify(t));
-    chk2(!/#1 NPU 0%/.test(t), "缺值被画成了 0%（= 谎报板卡闲着）");
+    chk2(/#1\s+ctx 32768\s+NPU —\s/.test(t),
+         "没采到值的 NPU 该显示「—」而不是 0%：" + JSON.stringify(t));
+    chk2(!/NPU 0%/.test(t), "缺值被画成了 0%（= 谎报板卡闲着）");
 
     // ④ 那两句"别读歪"的话必须在条子上，不能只写在文档里。
     chk2(/NPU 是卡级忙时占比/.test(t), "没说明 NPU 利用率是算出来的（SDK 没有利用率查询接口）");
@@ -772,6 +782,92 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
       document.hidden = false; visListeners.forEach(f => f());
       chk2(ctx.__t.sysOn() === true, "切回来没重新开轮询");
     }
+    // ⑨ 位置（用户 2026-09-20 要求挪到网页底部）与"这一块有多贵"（要求少占硬件资源）。
+    //    位置这一条只能查源码：桩 DOM 是"按 id 现建元素"，没有父子顺序这回事。
+    const iSys = html.indexOf('id="sys"'), iGrid = html.indexOf('id="grid"');
+    chk2(iSys > 0 && iGrid > 0 && iSys > iGrid,
+         "资源那一块该在对话区（#grid）**下面**：" + iGrid + " -> " + iSys);
+    chk2(iSys < html.indexOf("</body>"),
+         "资源那一块跑到 </body> 外面去了（浏览器会把它丢掉）");
+
+    // 刷新档位：生成中 2s、待机 6s。**这不是两个随手定的数**——这一块每一拍都要网关
+    // 读一遍 /proc、/sys，再向后端要一帧 STAT，而四路推理就跑在同一颗 RK3588 上。
+    const idleMs = ctx.__t.sysIntervalMs();
+    chk2(idleMs === ctx.__t.SYS_POLL_IDLE_MS && idleMs === 6000,
+         "待机档该是 6 秒一次：" + idleMs);
+    // 用一个假面板去戳"有人在生成"这个条件：真面板此刻是几个、是不是 streaming，
+    // 都取决于上面几节跑到了哪儿；拿它当输入的话这条会随别人改而莫名其妙地红/绿。
+    panels.push({ streaming: true });
+    const busyMs = ctx.__t.sysIntervalMs();
+    const busyMs2 = ctx.__t.sysIntervalMs();   // 再问一次：别把 panels 改坏了
+    panels.pop();
+    chk2(busyMs === ctx.__t.SYS_POLL_BUSY_MS && busyMs === 2000,
+         "有人生成时该是 2 秒一次（不然「卡忙起来」要等 6 秒才看得见）：" + busyMs);
+    chk2(busyMs2 === 2000, "sysIntervalMs 每次调用都会改状态（应该是纯读）：" + busyMs2);
+    chk2(ctx.__t.sysIntervalMs() === 6000, "生成结束该退回待机档");
+
+    // 同一份 doc 不重画。网关侧 1s 快照缓存让"同一秒里后来的看客拿到同一份"成为必然，
+    // 而 DOM 重写会让整块重新排版一次——数字一个没变，这一次排版白花。
+    // 反过来那半更重要：**ts 变了就必须画**，否则资源条会冻在打开那一帧。
+    {
+      const realFetch = ctx.fetch;
+      // 夹具本身带 `ts: 1`，所以"没有 ts"这一档必须**删掉**这一格——`d.ts = undefined`
+      // 是删不掉的（`Object.assign` 复制出来的那一格还在，值也还是 1），那样测的就不是
+      // "没有 ts"，而是"ts 没变"。
+      const mk = (ts) => function () {
+        const d = Object.assign({}, SYS_FIX);
+        if (ts === undefined) { delete d.ts; } else { d.ts = ts; }
+        return Promise.resolve({ ok: true, status: 200,
+                                 json: () => Promise.resolve(d) });
+      };
+      try {
+        ctx.fetch = mk(1000);
+        await ctx.__t.refreshSystem();
+        const n1 = ctx.__t.sysRenders();
+        chk2(ctx.__t.sysLastTs() === 1000, "画完该记住这一份的 ts：" + ctx.__t.sysLastTs());
+        ctx.fetch = mk(1000);                    // 同一秒里的第二拍：还是同一份
+        await ctx.__t.refreshSystem();
+        chk2(ctx.__t.sysRenders() === n1,
+             "同一份 doc 又画了一遍（白排一次版）：" + n1 + " -> " + ctx.__t.sysRenders());
+        chk2(/CPU 42%/.test(stripHtml(ctx.__t.sysHtml())), "跳过重画不该把内容清掉");
+        ctx.fetch = mk(1001);                    // 下一拍：ts 变了
+        await ctx.__t.refreshSystem();
+        chk2(ctx.__t.sysRenders() === n1 + 1,
+             "ts 变了却没重画——资源条会冻在打开那一帧");
+        // 不带 ts 的应答（老网关 / 别人自己写的转发）：宁可多画，**不许冻住**。
+        ctx.fetch = mk(undefined);
+        await ctx.__t.refreshSystem();
+        const n2 = ctx.__t.sysRenders();
+        await ctx.__t.refreshSystem();
+        chk2(ctx.__t.sysRenders() === n2 + 1,
+             "应答里没有 ts 时被当成「和上一份一样」了——这一页从此不再刷新");
+      } finally { ctx.fetch = realFetch; }
+    }
+
+    // 一起跑就补一拍：待机档最长要等 6 秒，"点了②之后卡是不是真的忙了"恰恰是演示时
+    // 最想看的那一帧，不能等。
+    {
+      const realFetch = ctx.fetch;
+      let sysCalls = 0;
+      ctx.fetch = function (u, o) {
+        if (String(u).indexOf("/v1/system") >= 0) { sysCalls++; }
+        return realFetch(u, o);
+      };
+      try {
+        ctx.__t.stopSysPoll();
+        ctx.__t.startSysPoll();                  // 第一拍立刻发
+        await new Promise((r) => setTimeout(r, 120));
+        const c1 = sysCalls;
+        chk2(c1 >= 1, "开轮询之后第一拍没发出去（calls=" + c1 + "）");
+        ctx.__t.sysWake();                       // 生成开始时补的这一拍
+        await new Promise((r) => setTimeout(r, 120));
+        chk2(sysCalls > c1, "sysWake 没补出这一拍（还在等档位到期）");
+      } finally {
+        ctx.__t.stopSysPoll();
+        ctx.fetch = realFetch;
+      }
+    }
+
     // 上面把资源条改成了夹具/错误文案，恢复成真数据，别影响后面那几节（它们会重画页面）。
     ctx.__t.renderSys(null);
 
@@ -1004,6 +1100,51 @@ const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("
     if (!/排队 42\.0s/.test(finalStat)) {
       console.log("FAIL: 统计行没把排队时长摊出来（tok/s 会把排队算进分母，看着像模型慢）");
       bad++;
+    }
+  }
+
+  // 放在最后是因为它会**真发一轮请求**（会占一段对话、会往 sentIds 里加东西）。
+  // 这一节要钉的是"sysWake 有没有被**接**在生成那条路上"——函数写得好好的、send() 里
+  // 忘了调，屏幕上的现象是"点了②之后最多 6 秒里四张卡还都画着闲着"，而那正是演示时
+  // 最想看到"卡忙起来"的一帧。前面那几节只证明了 sysWake 自己有用，证不了它被调用。
+  {
+    const realFetch = ctx.fetch;
+    let sysCalls = 0;
+    ctx.fetch = function (u, o) {
+      if (String(u).indexOf("/v1/system") >= 0) { sysCalls++; }
+      return realFetch(u, o);
+    };
+    try {
+      ctx.__t.stopSysPoll();
+      await new Promise((r) => setTimeout(r, 50));
+      ctx.__t.startSysPoll();                  // 先把轮询开起来（第一拍不等档位）
+      await new Promise((r) => setTimeout(r, 150));
+      const before = sysCalls;
+      panels[0].input.value = "补一拍";         // 空输入框 send() 会直接 return，等于空跑
+      await send(panels[0]);
+      await new Promise((r) => setTimeout(r, 150));
+      if (sysCalls <= before) {
+        console.log("FAIL: send() 里没接 sysWake —— 生成起来之后要等 6 秒档位才看得到卡忙"
+                    + "（calls " + before + " -> " + sysCalls + "）");
+        bad++;
+      } else {
+        console.log("\n生成开始时补的那一拍: 请求数 " + before + " -> " + sysCalls);
+      }
+      // 这一轮**真的占了一段对话**，用完就还（和页面里点「×」走同一条路）。
+      // 不还的话：板上默认 IDLE_TTL 300s，下一个人要等到超时才有位置；而对本地桩
+      // 网关（`--idle-ttl 0` = 不回收）就是**永久占着**——同一个桩网关连跑两遍
+      // page_check，第二遍会在"增删窗口"那一节直接红，看着像页面坏了。
+      if (!removePanel(panels[0])) {
+        console.log("  WARN: 这一轮占的会话没能交还（removePanel 拒绝了），桩网关连跑时会串味");
+      } else {
+        // 交还是**异步**发出去的（removePanel 不 await 它），而这一节之后脚本马上就要
+        // `process.exit`——不等这一下，那个会话就留在池子里了：板上占着 IDLE_TTL（默认
+        // 300s），本地桩网关（`--idle-ttl 0` = 不回收）则是**永久**占着。
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    } finally {
+      ctx.__t.stopSysPoll();
+      ctx.fetch = realFetch;
     }
   }
 
