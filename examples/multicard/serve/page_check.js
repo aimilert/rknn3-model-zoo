@@ -4,7 +4,7 @@
 // 这里跑的就是 `<script>` 里的原文（正则抽出来原样喂给 vm），只有 DOM 是假的。
 //
 // 它守的几条都是**踩过坑才加的**：
-//   1. 四路必须各自带**显式身份**（`X-Conversation-Id: web-1..4`）—— 靠"首问不同"认对话
+//   1. 每一路必须各自带**显式身份**（`X-Conversation-Id: web-<n>`）—— 靠"首问不同"认对话
 //      是会撞的，而且撞了之后答案全对、只是变慢，屏幕上根本看不出来
 //   2. 每一路占到的会话，在 `/v1/pool` 里必须记着**它自己的**名字 —— 光看会话号还不够：
 //      身份没送出去的话会话号照样是四个不同值，但占的是四段**匿名**对话
@@ -27,6 +27,14 @@
 //     看着跟单路基线 10.6 是一路的。下面那组 fixture 拿那几个真实数钉死两个数都要算对
 //  12. 被摊薄/排过队必须当场说破 —— 稀释时不报"平均只有 1.37/4 路在跑"、排队时不标
 //     "伸缩比不可引用"，这两种数就会被当成并发性能读走。**数没错，是没人知道它是什么**
+//  13. 窗口数上限必须是**问后端要的**，且「＋」到上限真的加不动（2026-09-20 加）——
+//     页面自己写死 4 的话，NSESSION=2 时它照样让你开第 3、4 个窗口（那两格只会排队，
+//     屏幕上看着像"并发退化了"）；最坏的一种是拿 32K 导出去凑 4 路，那是把板卡压死、
+//     要重启才能恢复的那条路。上限错了不会报错，只会让演示里的数变成假的
+//  14. 增删窗口不许复用身份、删窗口要**当场交还会话**（2026-09-20 加）—— 用"第几格"当
+//     身份，删中间一格再补一个，新格子正好捡回旧名字，网关认成同一段旧对话（拿旧历史、
+//     命中旧 KV），现场看着就是"删了没删掉"；不交还会话则要等到 IDLE_TTL 才有位置，
+//     而这期间屏幕上什么异常都看不出来
 //
 // 用法（**必须在 serve/ 目录下跑**，它按相对路径读 demo_4chat.html）：
 //   node page_check.js http://<板卡IP>:8080
@@ -59,6 +67,16 @@ function makeEl(tag) {
       contains(c) { return this._s.has(c); },
     },
     appendChild(c) { this.children.push(c); c.parentNode = this; return c; },
+    // 页面删窗口时用 el.remove()（浏览器里是标准方法，桩以前没有）。漏了它的后果
+    // 不是"删不掉"，而是那条路在桩里直接 TypeError——于是"删窗口之后身份有没有被
+    // 复用"这件最该检查的事，恰恰是桩里唯一跑不到的地方。
+    remove() {
+      if (!this.parentNode) { return; }
+      const arr = this.parentNode.children || [];
+      const i = arr.indexOf(this);
+      if (i >= 0) { arr.splice(i, 1); }
+      this.parentNode = null;
+    },
     addEventListener(ev, fn) { (this._listeners[ev] = this._listeners[ev] || []).push(fn); },
     querySelector(sel) {
       if (sel[0] === "[") {
@@ -148,9 +166,15 @@ const ctx = {
   // 页面里的 API 是 ""（同源相对路径），浏览器会自动按页面来源补全；node 不会，
   // 所以这里替它补——**只是替浏览器补全这一步，请求本身没做任何改写**。
   fetch: (url, opts) => {
-    const h = (opts && opts.headers) || {};
-    sentIds.push(h["X-Conversation-Id"] || null);
-    try { sentBodies.push(JSON.parse(opts.body)); } catch (e) { sentBodies.push(null); }
+    // 只记**对话请求**的身份和请求体。页面 2026-09-20 起还会 GET /health 拿窗口数上限
+    // （见 demo_4chat.html 的 MAX_SESSIONS），把它也算进来就会往下面那两条逐字比对的
+    // 断言里插一个 null——而那两条守的是"每路有没有带着自己的身份发出去""输入框里的
+    // 输出上限有没有真的被带上"，跟健康检查没有半点关系。
+    if (String(url).indexOf("/v1/chat/completions") >= 0) {
+      const h = (opts && opts.headers) || {};
+      sentIds.push(h["X-Conversation-Id"] || null);
+      try { sentBodies.push(JSON.parse(opts.body)); } catch (e) { sentBodies.push(null); }
+    }
     return fetch(abs(url), opts);
   },
   // 页面用 localStorage 记住上次的输出上限。桩给一个**真的小 store**，而不是一对空函数：
@@ -184,9 +208,18 @@ vm.runInContext(script + "\n;globalThis.__t = { panels: panels, send: send, "
                + "lastRound: function () { return lastRound; }, "
                // 基线速率是页面里一个会被改的变量，"交出当时的值"没有意义——
                // 要的是**读得到当下的值**，所以交一个闭包而不是快照。
-               + "baselineRate: function () { return lastSingleRate; } };", ctx);
+               + "baselineRate: function () { return lastSingleRate; }, "
+               // 窗口数上限这一整套（2026-09-20 加）。上限是从后端 /health 的 ctx_size
+               // 反推出来的，页面启动时**先查再建窗口**，所以 `capReady` 是个 Promise：
+               // 检查必须 await 它，否则量到的是"还没建窗口"的中间态，而那种空跑照样
+               // 全绿。`maxSessions`/`ctxSize` 同理要交闭包——它们是 let，快照会过期。
+               + "capReady: capReady, addPanel: addPanel, removePanel: removePanel, "
+               + "maxSessions: function () { return MAX_SESSIONS; }, "
+               + "ctxSize: function () { return CTX_SIZE; }, "
+               + "capHtml: function () { return document.getElementById(\"cap\").innerHTML; }, "
+               + "capOver: function () { return document.getElementById(\"cap\").className; } };", ctx);
 
-const { panels, send, summarize } = ctx.__t;
+const { panels, send, summarize, addPanel, removePanel, capReady } = ctx.__t;
 
 // ---------- 汇总那一句的算术（纯函数，不联网） ----------
 //
@@ -248,11 +281,25 @@ function fixture(name, rs, wall, baseline) {
       "排队警告必须排在伸缩比之后（它撤的就是刚印出来的那个数）");
   chk(!/排过队/.test(h1), "没人排队时不许报排队（假警报会把真警报淹掉）");
 
+  // ④ 只有两路（2026-09-20 加）：末句里的路数必须是**当时那几路**，不能写死"四路"。
+  // 32K 那份导出只够 2 路会话，页面就只开 2 个窗口——那时屏幕上写"四路长短不齐"是假话，
+  // 而这句话正是判读那两个数的关键（它解释的是分母里混进了什么）。
+  const two = [{ tok: 300, el: 30, waited: 0 }, { tok: 20, el: 2, waited: 0 }];
+  const h4 = fixture("两路", two, 30.0, 10.63);
+  chk(/2 路并发/.test(h4), "两路时开头该写「2 路并发」而不是「4 路并发」");
+  chk(/2 路长短不齐/.test(h4), "两路时稀释警告该写「2 路长短不齐」（写死成「四路」是假话）");
+  chk(!/四路/.test(h4), "两路时整句里不该出现「四路」（把句数写死是演示里最容易出的假话）");
+  chk(near(grab(h4, /平均只有 ([\d.]+)\/2 路在跑/), 1.07, 0.02), "平均在跑路数该是 1.07/2");
+  const h5 = fixture("两路齐", [{ tok: 100, el: 10, waited: 0 }, { tok: 100, el: 10, waited: 0 }],
+                    10.05, null);
+  chk(/2 路差不多同时收工/.test(h5), "两路等长时该写「2 路差不多同时收工」");
+  chk(!/四路/.test(h5), "两路时整句里不该出现「四路」");
+
   if (bad) {
     console.log("FAIL: 汇总算术有 %d 条不对（上面每一条都对着真实运行数钉过）", bad);
     process.exit(1);
   }
-  console.log("  汇总算术 3 组 fixture 全过\n");
+  console.log("  汇总算术 5 组 fixture 全过\n");
 }
 
 // 统计行是**HTML**（速率要加粗，见页面里的 setStat），桩又把 _text 与 _html 分开存
@@ -261,18 +308,9 @@ function fixture(name, rs, wall, baseline) {
 // 在页面完全正常的情况下报 FAIL——**空跑也像失败**，比不检查更费时间。
 // 这个取值器两边都认，改哪一边都不会再假装报错。
 const statOf = (el) => el.textContent || el.innerHTML;
-console.log("buildPanels 建出 %d 个面板", panels.length);
-if (panels.length !== 4) { console.log("FAIL: 面板数不是 4"); process.exit(1); }
-
-const qs = panels.map(p => p.input.value);
-console.log("四个默认问题:", JSON.stringify(qs, null, 0));
-if (new Set(qs).size !== 4) {
-  // 四路是不是四段对话，现在由显式身份保证，**不再依赖问题不同**——所以这不是
-  // 并发问题，是素材问题：这四问是挑过的演示默认值（见 demo_4chat.html 的注释），
-  // 短了会四路参差、长了会顶到 max_tokens，重复说明改的时候抄错了。
-  console.log("FAIL: 四个默认问题有重复（不影响并发，但这四个默认值是挑过的，请对齐页面注释）");
-  process.exit(1);
-}
+const stripHtml = (s) => String(s).replace(/<[^>]*>/g, "");
+const poolSlots = async () => ((await (await fetch(BASE + "/v1/pool")).json()).slots || []);
+const webHeld = (slots) => slots.map(s => s.key).filter(x => x && x.startsWith("id:web-"));
 
 (async () => {
   // 等 `id:web-*` 全部从会话池里消失（交还是异步发出的，给最多 4 秒）。
@@ -280,18 +318,272 @@ if (new Set(qs).size !== 4) {
   async function waitReleased() {
     let held = [];
     for (let k = 0; k < 40; k++) {
-      const p = await (await fetch(BASE + "/v1/pool")).json();
-      held = (p.slots || []).map(s => s.key).filter(x => x && x.startsWith("id:web-"));
+      held = webHeld(await poolSlots());
       if (!held.length) { return []; }
       await new Promise(r => setTimeout(r, 100));
     }
     return held;
   }
 
+  let bad0 = 0;
+
+  // ---------- 建窗：窗口数上限是**问后端要的**，不是页面自己定的 ----------
+  // 这一节以前是在顶层直接 `if (panels.length !== 4)`。改成 async 不是风格问题：
+  // 页面 2026-09-20 起先 GET /health 拿到后端会话数**再**建窗口，顶层那一刻窗口还是 0 个，
+  // 而"0 个"如果也当通过，这一整段就成了空跑——**空跑全绿比报错更难发现**。
+  await capReady;
+  const health = await (await fetch(BASE + "/health")).json();
+  console.log("后端 /health: sessions=%s ctx_size=%s",
+              health.sessions, health.ctx_size);
+  console.log("页面读到: 会话 %d · 上下文 %s · 窗口 %d 个",
+              ctx.__t.maxSessions(), ctx.__t.ctxSize(), panels.length);
+
+  // 上限必须**等于后端真开出来的会话数**。页面要是自己写死 4：换成 NSESSION=2 起后端，
+  // 它照样让你开第 3、第 4 个窗口，那两格只会排队（屏幕上看着像"并发退化了"）；
+  // 更坏的是拿 32K 导出去凑 4 路——那是把板卡压死要重启的那条路（见 memory
+  // qwen35-ctx-export：32K 每卡只够 2 路）。
+  if (ctx.__t.maxSessions() !== health.sessions) {
+    console.log("FAIL: 页面上限 %d ≠ 后端 /health 的 sessions %d（上限是自己编的，不是问来的）",
+                ctx.__t.maxSessions(), health.sessions);
+    bad0++;
+  }
+  if (ctx.__t.ctxSize() !== health.ctx_size) {
+    console.log("FAIL: 页面显示的上下文 %s ≠ 后端 /health 的 ctx_size %s",
+                ctx.__t.ctxSize(), health.ctx_size);
+    bad0++;
+  }
+  const wantPanels = Math.min(4, health.sessions);
+  if (panels.length !== wantPanels) {
+    console.log("FAIL: 初始窗口数该是 min(4, 后端会话数) = %d 个，实际 %d 个",
+                wantPanels, panels.length);
+    bad0++;
+  }
+
+  const capText = stripHtml(ctx.__t.capHtml());
+  console.log("容量条:", capText);
+  // 容量条要**一直**回答"为什么我只能开这几个窗口"，所以这三个数必须都在上面。
+  if (!/上下文/.test(capText) || !/后端会话/.test(capText) || !/窗口 \d+\/\d+/.test(capText)) {
+    console.log("FAIL: 容量条没把「上下文 / 后端会话 / 窗口 n/N」说全：" + JSON.stringify(capText));
+    bad0++;
+  }
+  // 分子是**屏幕上真摆着的窗口数**、分母是上限，两者不等才是正常的（上限 6 时屏幕只摆 4 个）。
+  const capWin = capText.match(/窗口 (\d+)\/(\d+)/);
+  if (!capWin || Number(capWin[1]) !== panels.length || Number(capWin[2]) !== health.sessions) {
+    console.log("FAIL: 容量条上的窗口数与实际不符（该是 窗口 %d/%d）：%s",
+                panels.length, health.sessions, JSON.stringify(capText));
+    bad0++;
+  }
+  // 「②」的文案要跟着窗口数走。写死"4 路"而实际只开 2 个窗口，是在演示里说假话。
+  const allText = stripHtml(byId["all"].textContent);
+  if (allText.indexOf("② " + panels.length + " 路") < 0) {
+    console.log("FAIL: 「②」的文案没跟着窗口数走（窗口 %d 个，按钮写着 %s）",
+                panels.length, JSON.stringify(allText));
+    bad0++;
+  }
+
+  const qs = panels.map(p => p.input.value);
+  console.log("默认问题:", JSON.stringify(qs, null, 0));
+  if (new Set(qs).size !== qs.length) {
+    // 各窗口是不是各段对话，现在由显式身份保证，**不再依赖问题不同**——所以这不是
+    // 并发问题，是素材问题：这几问是挑过的演示默认值（见 demo_4chat.html 的注释），
+    // 短了会参差、长了会顶到 max_tokens，重复说明改的时候抄错了。
+    console.log("FAIL: 默认问题有重复（不影响并发，但这几个默认值是挑过的，请对齐页面注释）");
+    bad0++;
+  }
+  if (bad0) {
+    console.log("FAIL: 建窗这一节有 %d 项不对", bad0);
+    process.exit(1);
+  }
+  console.log("  建窗与容量条全过\n");
+
+  // ---------- 增删窗口：这一页新功能的正身 ----------
+  // 用户 2026-09-20 要的三件事，逐条钉死。三条都是**照跑照出答案、屏幕上却不对**的坏法：
+  //   a) 「＋」加上去的窗口必须有**自己的新身份**——复用旧身份的话，网关按 key 认对话，
+  //      新窗口第一个问题就命中旧窗口的 KV、还接着旧历史，现场看着就是"删了没删掉"
+  //   b) 加到上限就**真的加不动**（按钮禁用 + 点了不涨）。上限是后端容量，不是屏幕摆得下几个
+  //   c) 删窗口必须**当场把会话还回去**。网关只排队不抢占，不还的话新窗口/新客户端要一直
+  //      等到 IDLE_TTL（默认 300s）——而这几分钟里屏幕上什么异常都看不出来
+  {
+    const cap = health.sessions;
+    const usedIds = new Set(panels.map(p => p.convId));
+    const btn = byId["addwin"];
+    const idPane = (p) => (p ? p.convId : null);
+    let bad1 = 0;
+
+    // 面板显示号（"面板 3"）在增删之后必须**重排**，而对话身份（convId）不许动。
+    // 序号是给眼睛看的，身份是给网关认对话的；两者一旦绑在一起，删掉中间那格就会让
+    // 后面几格全都"换了一段对话"——KV 复用直接没了，屏幕上一点异常都看不出来。
+    const namesOk = () => {
+      const got = panels.map(p => p.name.textContent);
+      const want = panels.map((p, i) => "面板 " + (i + 1));
+      if (JSON.stringify(got) !== JSON.stringify(want)) {
+        console.log("FAIL: 面板显示号没重排：%s（该是 %s）",
+                    JSON.stringify(got), JSON.stringify(want));
+        return false;
+      }
+      return true;
+    };
+
+    // (b) 到上限就加不动。注意闸门看的是**上限**不是屏幕：cap>4 时屏幕只摆 4 个，
+    // 那时「＋」是能用的（这一条下面那段就靠它）。
+    if (btn.disabled !== (panels.length >= cap)) {
+      console.log("FAIL: 「＋」按钮的禁用状态与实际不符（窗口 %d / 上限 %d，disabled=%s）",
+                  panels.length, cap, btn.disabled);
+      bad1++;
+    }
+    const n0 = panels.length;
+    if (n0 >= cap) {
+      const p0 = addPanel();
+      if (p0) {
+        console.log("FAIL: 窗口已到上限 %d 还能加成第 %d 个", cap, panels.length);
+        bad1++;
+        removePanel(p0);
+      } else {
+        // 再**点一下按钮**。真实浏览器对 disabled 的按钮不派发 click，桩会——所以这一下
+        // 验的是 `addPanel` 自己那道闸，它才是"上限刚被 /health 改小"那一瞬间唯一站着的。
+        btn._listeners["click"].forEach(fn => fn());
+        if (panels.length !== n0) {
+          console.log("FAIL: 到上限后点「＋」竟然多出一个窗口（%d → %d）", n0, panels.length);
+          bad1++;
+        }
+      }
+    }
+
+    // 腾一个位置出来，好让「＋」**真的能加一次**。窗口数 = min(4, 上限)，常见的两种配置
+    // （8K 导出 NSESSION=4、32K 导出 NSESSION=2）都是"屏上摆满 = 到上限了"——不先删一个的话，
+    // 新加的这条"增删窗口"在最常见的配置下**一次都跑不到**，检查全绿却什么都没验。
+    // `panels.length >= 2` 这个前提不能省：NSESSION=1 时页面上只有一个窗口，而"至少留一个"
+    // 是**故意**的（全删光之后连单路基线都量不了）。那种配置下这一节本来就无从验起，
+    // 要的是明说一句，不是报一个假 FAIL。
+    let freed = null;
+    if (panels.length < cap) {
+      console.log("（上限 %d > 屏幕上的 %d 个窗口，「＋」本来就有空位，不用腾）", cap, panels.length);
+    } else if (panels.length < 2) {
+      console.log("（上限只有 %d 个会话，页面上只有一个窗口——删了就没法量基线，故意不给删："
+                  + "增删这一节跳过）", cap);
+    } else {
+      freed = panels[panels.length - 1];
+      if (!removePanel(freed)) {
+        console.log("FAIL: 为了腾位置删最后一个窗口，removePanel 拒绝了（它既不在生成、也不是最后一个）");
+        bad1++;
+        freed = null;
+      } else {
+        console.log("腾位置：删掉 %s（剩 %d 个 / 上限 %d）", freed.convId, panels.length, cap);
+        if (!namesOk()) { bad1++; }
+      }
+    }
+
+    // 腾过位置（freed 非空）或本来就有空位（N < cap），这里都应该加得动。
+    // 只有 NSESSION=1 那种"屏幕上一个窗口、上限也只有一个"的配置才无从加起，上面已明说。
+    const canAdd = panels.length < cap;
+    const added = canAdd ? addPanel() : null;
+    if (canAdd && !added) {
+      console.log("FAIL: 还有空位（现在 %d 个 / 上限 %d）却加不动", panels.length, cap);
+      bad1++;
+    }
+    const slot = added;
+    if (slot) {
+      console.log("「＋」加成第 %d 个，身份 %s（用过的：%s）",
+                  panels.length, slot.convId, JSON.stringify([...usedIds]));
+      if (usedIds.has(slot.convId)) {
+        console.log("FAIL: 新窗口复用了旧身份 %s —— 网关会把它当成那段旧对话（接着旧历史、命中旧 KV）",
+                    slot.convId);
+        bad1++;
+      }
+      usedIds.add(slot.convId);
+      if (byId["grid"].children.indexOf(slot.el) < 0) {
+        console.log("FAIL: 新窗口没进 #grid（面板数组里有、页面上没有）");
+        bad1++;
+      }
+      if (!namesOk()) { bad1++; }
+
+      // (c) 删窗口要把会话**当场**还回去。先让它真的占住一个会话——不先发一次的话，
+      // 后面那次 `waitReleased` 从一开始就是空的，这条检查就成了"空跑也算过"。
+      slot.input.value = "删窗口检查";
+      await send(slot);
+      const mine = (await poolSlots()).filter(s => s.key === "id:" + slot.convId);
+      console.log("删之前，%s 占着: %s", slot.convId,
+                  JSON.stringify(mine.map(s => "s" + s.session)));
+      if (!mine.length) {
+        console.log("FAIL: %s 发过一轮却没在 /v1/pool 里占到会话（身份没送出去？）", slot.convId);
+        bad1++;
+      }
+      const gone = slot.convId;
+      const nBefore = panels.length;
+      if (!removePanel(slot)) {
+        console.log("FAIL: removePanel 拒绝了删除（这个窗口既不在生成、也不是最后一个）");
+        bad1++;
+      } else {
+        if (panels.length !== nBefore - 1) {
+          console.log("FAIL: 删完窗口数该是 %d，实际 %d", nBefore - 1, panels.length);
+          bad1++;
+        }
+        if (byId["grid"].children.indexOf(slot.el) >= 0) {
+          console.log("FAIL: 删掉的窗口还挂在 #grid 上（DOM 没摘，只是数组里没了）");
+          bad1++;
+        }
+        // 交还是 fetch 发出去的（removePanel 没 await 它），所以这里**必须轮询**而不是
+        // 立刻读一次：立刻读会把"还没送到"误判成"没还"。要区分的不是几毫秒的时序，
+        // 而是"当场还"与"占到 IDLE_TTL（默认 300 秒）超时"——4 秒上限对这条界线绰绰有余。
+        const after = await waitReleased();
+        if (after.length) {
+          console.log("FAIL: 删窗口没把会话还回去，还占着 %s（新窗口要等 IDLE_TTL 才有位置）",
+                      JSON.stringify(after));
+          bad1++;
+        }
+        console.log("删掉 %s 后池子里还占着的 web 会话: %s", gone, JSON.stringify(after));
+        if (!namesOk()) { bad1++; }
+
+        // 删了再加：新窗口的身份**不能**是刚用过的任何一个。这是这条功能最容易写错的一处——
+        // 拿"第几格"当身份的话，删中间那格再补一个，新格子正好捡回旧名字，网关认成同一段
+        // 对话（旧历史 + 旧 KV），用户看到的就是"删了没删掉"。
+        const again = addPanel();
+        console.log("删了再加，新窗口身份 %s", idPane(again));
+        if (!again) {
+          console.log("FAIL: 删掉一个之后「＋」加不回来了（%d 个 / 上限 %d）", panels.length, cap);
+          bad1++;
+        } else {
+          if (usedIds.has(again.convId)) {
+            console.log("FAIL: 新窗口捡回了用过的身份 %s（网关会当成同一段旧对话）", again.convId);
+            bad1++;
+          }
+          usedIds.add(again.convId);
+          // 腾过位置就要**把它留着**（窗口数回到原样），没腾过就收回去——两种情况下
+          // 这一节跑完的窗口数都必须是 wantPanels，后面那一轮并发检查按这个数比。
+          if (!freed) {
+            removePanel(again);
+            console.log("（没腾位置，把它删回去，恢复 %d 个窗口）", panels.length);
+          }
+        }
+        if (!namesOk()) { bad1++; }
+      }
+    }
+
+    if (panels.length !== wantPanels) {
+      console.log("FAIL: 增删这一节跑完窗口数该是 %d，实际 %d（后面那一轮按这个数比）",
+                  wantPanels, panels.length);
+      bad1++;
+    }
+    const leftover = await waitReleased();
+    if (leftover.length) {
+      console.log("FAIL: 增删窗口这一节跑完还留着 web 会话: %s", JSON.stringify(leftover));
+      bad1++;
+    }
+    if (bad1) {
+      console.log("FAIL: 增删窗口有 %d 项不对", bad1);
+      process.exit(1);
+    }
+    console.log("  增删窗口全过（身份不复用 · 到上限加不动 · 删除当场交还会话 · 显示号重排）\n");
+  }
+
   // 走**用户点「②」的那条路**（runAll），不是自己 `panels.map(send)` 一遍。
   // 差别就在汇总行：自己发的话，页面里 summarize + setSum 那两句压根不执行，
   // 于是"四路那一句怎么算的"完全没有检查覆盖 —— 2026-09-18 改口径时就是这么发现的。
   // 代价是拿不到 runAll 的返回值，得问它要（lastRound）。
+  // 上面"删窗口"那一节已经发过请求了，所以下面两处逐字比对的是**这一轮新增的那几条**。
+  // 不比整份：整份里混着前面几次探针请求，逐字比对会必然失败，而失败信息又会指向拼错的
+  // 方向（"身份不对"）——那是最费时间的一种假警报。
+  const idBase = sentIds.length, bodyBase = sentBodies.length;
   await ctx.__t.runAll();
   const round = ctx.__t.lastRound();
   if (!round) { console.log("FAIL: runAll 没留下这一轮的结果"); process.exit(1); }
@@ -327,10 +619,20 @@ if (new Set(qs).size !== 4) {
   // 身份**有没有真的送出去**。这一条是最要紧的：四路匿名时，会话号照样是四个不同值
   // （按首问内容各分一个），四路也照样并发——但占的是四段**匿名**对话，认不出也关不掉，
   // 页面就这么把四个会话全扣在手里，后来的客户端一个都进不来。这个坑真踩过。
-  console.log("\n四路带出去的身份:", JSON.stringify(sentIds));
-  const wantIds = ["web-1", "web-2", "web-3", "web-4"];
-  if (JSON.stringify(sentIds) !== JSON.stringify(wantIds)) {
-    console.log("FAIL: 四路带出去的身份不是 " + JSON.stringify(wantIds)
+  // 期望的身份**从面板自己身上取**，不再写死 web-1..4。窗口能增删之后，写死的那一串
+  // 会因为"删过中间一格"而整体错位：那时检查报的是身份错，真正的问题却是检查自己
+  // 记着的是旧名单——真东西反而被这行 FAIL 盖住。顺带把"有没有 null / 有没有重复"
+  // 一起查了：那才是这一段真正要守的东西（身份没送出去 = 四段匿名对话被扣着）。
+  const wantIds = panels.map(p => p.convId);
+  const gotIds = sentIds.slice(idBase);
+  console.log("\n各路带出去的身份:", JSON.stringify(gotIds),
+              "（面板上是", JSON.stringify(wantIds), "）");
+  const idsBad = gotIds.length !== wantIds.length
+    || gotIds.some(x => !x)                       // 有请求没带身份头
+    || JSON.stringify(gotIds) !== JSON.stringify(wantIds)
+    || new Set(gotIds).size !== gotIds.length;    // 两路挤进同一段对话
+  if (idsBad) {
+    console.log("FAIL: 带出去的身份不是 " + JSON.stringify(wantIds)
                 + "（匿名对话会把会话扣住不放，后面的客户端全被堵住）");
     // 匿名对话**关不掉名字**（它没有名字），所以这一项失败时池子里会留下几个清不掉的
     // 会话，后面每一次重跑都会撞上它们。把清理办法直接写在这里，省得下一个人从头查。
@@ -344,22 +646,27 @@ if (new Set(qs).size !== 4) {
   // 答案照出、四路照样并发，只是长度还停在老的默认值上——从结果上完全看不出来
   //（"模型自己停的"和"上限压根没送出去"长得一模一样）。
   const wantMax = Number(byId["maxtok"].value);
-  console.log("\n四路带出去的 max_tokens:",
-              JSON.stringify(sentBodies.map(b => (b ? b.max_tokens : null))),
+  const gotBodies = sentBodies.slice(bodyBase);
+  console.log("\n各路带出去的 max_tokens:",
+              JSON.stringify(gotBodies.map(b => (b ? b.max_tokens : null))),
               "（输入框里是 " + wantMax + "）");
   if (!(wantMax > 0)) {
     console.log("FAIL: 输入框里的输出上限不是正数：" + JSON.stringify(byId["maxtok"].value));
     bad++;
-  } else if (sentBodies.some(b => !b || b.max_tokens !== wantMax)) {
+  } else if (gotBodies.some(b => !b || b.max_tokens !== wantMax)) {
     console.log("FAIL: 有请求带出去的 max_tokens 与输入框不符（该是 " + wantMax
                 + "）——输入框没接线？");
     bad++;
   }
 
   const sess = panels.map(p => p.kvSession);
-  console.log("\n四路落到的会话:", JSON.stringify(sess));
-  if (new Set(sess).size !== 4) {
-    console.log("FAIL: 四路没有落在四个不同会话上（会退化成串行！）");
+  console.log("\n各路落到的会话:", JSON.stringify(sess));
+  // 期望值跟着面板数走，不再写死 4：窗口数是由后端上下文容量决定的（32K 只够 2 路），
+  // 写死 4 的话那份配置下这条会必然报 FAIL——而真正要守的"每一路各占一个会话、
+  // 没有两路挤在一起（挤在一起就是退化成串行）"跟窗口数根本无关。
+  if (new Set(sess).size !== panels.length || sess.some(x => x === undefined || x === null)) {
+    console.log("FAIL: %d 路没有落在 %d 个不同会话上（会退化成串行！）",
+                panels.length, panels.length);
     bad++;
   }
   // 会话池里那四个会话，是不是**记着各自的名字**（光有会话号不够：身份没送出去时
@@ -367,13 +674,16 @@ if (new Set(qs).size !== 4) {
   const pool = await (await fetch(BASE + "/v1/pool")).json();
   const holder = {};
   (pool.slots || []).forEach(s => { holder[s.session] = s.key; });
-  console.log("跑完四路后 /v1/pool 的归属:",
+  console.log("跑完这一轮后 /v1/pool 的归属:",
               JSON.stringify((pool.slots || []).map(s => s.session + "=" + s.key)));
   panels.forEach((p, i) => {
+    // 期望的 key 从**面板自己的身份**来，不是"第几格"。窗口能增删之后，序号会在删掉中间
+    // 一格时整体前移：按序号算的话，被删那一格后面的会话全都"记的是别人的名字"，
+    // 检查会报一排身份错，而真正的问题是检查自己拿着过期的名单。
     const got = holder[p.kvSession];
-    if (got !== "id:web-" + (i + 1)) {
-      console.log("  FAIL: 面板 %d 占着 s%s，但池子里记的是 %s（该是 id:web-%d）",
-                  i + 1, p.kvSession, JSON.stringify(got), i + 1);
+    if (got !== "id:" + p.convId) {
+      console.log("  FAIL: 面板 %d 占着 s%s，但池子里记的是 %s（该是 id:%s）",
+                  i + 1, p.kvSession, JSON.stringify(got), p.convId);
       bad++;
     }
   });

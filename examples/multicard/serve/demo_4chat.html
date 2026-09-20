@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>4 路并发推理演示</title>
+<title>多路并发推理演示</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef;
           --dim:#8b94a7; --accent:#4da3ff; --ok:#3ddc84; --warn:#ffb454;
@@ -86,6 +86,17 @@
   .sumline:not(:empty) { padding:9px 18px; border-bottom:1px solid var(--line); background:#12151b; }
   .sumline b { color:var(--ok); font-size:15px; }
 
+  /* 容量条：**常驻一行**，写清"当前上下文 / 后端开了几个会话 / 开了几个窗口"。
+     为什么它必须单独占一行而不是挤进汇总行：汇总行是 setSum 管的，一有结果就被
+     整句覆盖——而"为什么只能开 2 个窗口"这件事在**任何时候**都得看得见（32K 时每路
+     KV 要 406.7 MB/卡，每卡只够 2 路；窗口开多了就是排队，不是并发）。
+     超了会变警告色：那只可能是后端被换成会话更少的配置而页面还开着。 */
+  .capline { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums;
+             padding:7px 18px; border-bottom:1px solid var(--line); }
+  .capline b { color:var(--fg); font-weight:600; }
+  .capline.over { color:var(--warn); }
+  .capline.over b { color:var(--warn); }
+
   main { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:12px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
            display:flex; flex-direction:column; height:calc(50vh - 60px); min-height:300px; }
@@ -93,6 +104,14 @@
   .phead { display:flex; align-items:center; gap:8px; padding:9px 14px;
            border-bottom:1px solid var(--line); font-size:13px; }
   .phead .name { font-weight:600; }
+  /* 每个窗口一个 ×。小、不抢眼，但要够大好戳——演示时是鼠标在点它。
+     删掉它=这段对话不要了，会话**当场交还**（不等 IDLE_TTL）：网关只排队不抢占，
+     留着不放的话下一个窗口要等到超时才有位置，而屏幕上一点异常都看不出来。 */
+  .phead .close { border:0; background:transparent; color:var(--dim); font-size:15px;
+                  line-height:1; padding:2px 7px; border-radius:5px; cursor:pointer;
+                  font-family:inherit; font-weight:400; }
+  .phead .close:hover:not(:disabled) { background:#3a1d22; color:var(--danger); }
+  .phead .close:disabled { opacity:.3; cursor:not-allowed; }
   .dot { width:8px; height:8px; border-radius:50%; background:#3a4150; }
   .dot.on { background:var(--accent); animation:pulse 1s infinite; }
   @keyframes pulse { 50% { opacity:.25; } }
@@ -133,7 +152,7 @@
 <body>
 <header>
   <div class="brand">
-    <h1>4 路并发推理 · Qwen3.5-27B · RK1828 ×4</h1>
+    <h1>多路并发推理 · Qwen3.5-27B · RK1828 ×4</h1>
     <!-- 徽标里那句字是 JS 写的（setStatus），灯的颜色也是 JS 换的 -->
     <span id="status" class="badge idle"><i class="led"></i><span id="gstats">待机</span></span>
   </div>
@@ -142,14 +161,17 @@
     <label class="tog">输出上限
       <span class="numbox"><input type="number" id="maxtok" min="1" step="64"><span class="unit">tok</span></span>
     </label>
+    <button id="addwin" class="btn-secondary" title="新增一个对话窗口">＋ 加窗口</button>
     <button id="baseline" class="btn-secondary">① 先量单路基线</button>
-    <button id="all" class="btn-primary">② 4 路同时提问</button>
+    <button id="all" class="btn-primary">② 同时提问</button>
     <button id="clear" class="btn-danger">清空</button>
   </div>
 </header>
 
 <!-- 基线/四路聚合那一整句（setSum）。**和徽标分开**：徽标只有一个词，这行是一句话，
      以前两者挤在 #gstats 里，一句汇总能把标题行撑到换行。 -->
+<div id="cap" class="capline"></div>
+
 <div id="gsum" class="sumline"></div>
 
 <main id="grid"></main>
@@ -213,56 +235,170 @@ const DEFAULT_Q = [
 const panels = [];
 let lastSingleRate = null;     // 单路基线（只有一路在跑时记下来）
 
-function buildPanels() {
-  const grid = document.getElementById("grid");
-  for (let i = 0; i < 4; i++) {
-    const el = document.createElement("div");
-    el.className = "panel";
-    el.innerHTML =
-      '<div class="phead"><span class="dot"></span><span class="name">面板 ' + (i + 1) +
-      '</span><span class="hint" data-role="sess"></span>' +
-      '<span class="perf" data-role="perf"></span></div>' +
-      '<div class="log" data-role="log"></div>' +
-      '<div class="stat" data-role="stat"></div>' +
-      '<div class="pfoot"><div class="inbox">' +
-      '<textarea data-role="in" rows="1" placeholder="输入问题，Enter 发送 · Shift+Enter 换行"></textarea>' +
-      '<button data-role="go" class="send" title="发送（Enter）" aria-label="发送">' +
-      '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" ' +
-      'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">' +
-      '<path d="M4 12h14M12 6l6 6-6 6"/></svg></button>' +
-      '</div></div>';
-    grid.appendChild(el);
+// ---------- 窗口数上限：由**后端的会话数**决定，不是写死的 4 ----------
+//
+// 为什么上限必须问后端：KV 在 session_init 时按"每路满上下文"一次性预分配，所以
+// ctx 越大每路越贵、每卡能开的窗口越少——32K 导出实测每路 406.7 MB/卡，每卡只够 2 路
+// （再多就是 `rknn3_session_init` 分配失败，端点不应答，**要把板卡重启**）。
+// 所以这一页不许自己编一个数：`/health` 的 `sessions` 是后端真开出来的会话数，
+// `ctx_size` 是它的上下文长度。运维用 NSESSION=2 起、页面就最多 2 个窗口；
+// 换成 8K 那份导出起 NSESSION=4，这里就自动变回 4 个。
+let MAX_SESSIONS = 4;          // 兜底：读不到 /health 时按老行为（4 路）
+let CTX_SIZE = null;           // 后端命令行里的 --ctx-size（读不到就不显示这一格）
+let capKnown = false;          // 是否真读到了后端容量（读不到时容量条要说清楚）
+let nextUid = 1;               // 单调递增，**绝不复用**，理由见 newConvId()
 
-    const p = {
-      el: el,
-      id: i,                   // 面板号，用来生成它的对话身份（见 streamChat 的 convId）
-      log: el.querySelector('[data-role=log]'),
-      stat: el.querySelector('[data-role=stat]'),
-      sess: el.querySelector('[data-role=sess]'),
-      perf: el.querySelector('[data-role=perf]'),
-      input: el.querySelector('[data-role=in]'),
-      go: el.querySelector('[data-role=go]'),
-      dot: el.querySelector('.dot'),
-      messages: [],            // 这一路自己的对话历史 —— 多轮就靠它，也是 KV 复用的前提
-      streaming: false,
-      kv: "",
-      ttft: null,              // 首字延迟（第一个增量到手的时间），性能小字要它
-    };
-    p.input.value = DEFAULT_Q[i];
-    grow(p.input);
-    p.input.addEventListener("input", function () { grow(p.input); });
-    p.input.addEventListener("keydown", function (e) {
-      // Enter 发送、**Shift+Enter 换行**。单行 input 时回车只有发送一个意思，改成
-      // textarea 之后回车默认是换行（不拦的话按回车什么都不发生），所以必须显式分流。
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();     // 不然发送的同时还往框里插一个换行
-        send(p);
-      }
-    });
-    p.go.addEventListener("click", function () { send(p); });
-    panels.push(p);
-    render(p);
+// 窗口身份 `web-<n>` 必须是**一次性**的。删掉窗口 2 再加一个，如果新窗口又叫 `web-2`，
+// 网关会把它当成刚才那段对话（同一个 key）——新窗口的第一个问题会命中旧对话的 KV、
+// 还接着旧历史，现场看着就是"删了没删掉"。序号可以重排，身份不行。
+function newConvId() { return "web-" + (nextUid++); }
+
+// 面板显示号（"面板 3"）在增删之后**重排**，但对话身份（convId）不动。
+// 序号是给眼睛看的，身份是给网关认对话的，两者一旦绑在一起，删掉中间那个窗口就会
+// 让后面几格全都"换了一段对话"（KV 复用直接没了，还看不出来）。
+function renumber() {
+  panels.forEach(function (p, i) { p.name.textContent = "面板 " + (i + 1); });
+}
+
+// 容量条。三件事一起说：上下文多长、后端开了几个会话、现在开了几个窗口。
+// **一直显示**，因为它回答的是"为什么我只能开这么几个窗口"——这个问题在看演示的
+// 每一秒都存在，不能等到没结果的时候才看见。
+function renderCap() {
+  const n = panels.length;
+  const el = document.getElementById("cap");
+  const parts = [];
+  parts.push("上下文 <b>" + (CTX_SIZE === null ? "?" : CTX_SIZE.toLocaleString()) + "</b>");
+  parts.push("后端会话 <b>" + MAX_SESSIONS + "</b>");
+  parts.push("窗口 <b>" + n + "/" + MAX_SESSIONS + "</b>");
+  if (!capKnown) { parts.push("（读不到 /health，按默认值显示）"); }
+  else if (n > MAX_SESSIONS) {
+    parts.push("窗口比后端会话多，多出来的只会排队，不是并发");
+  } else if (n === MAX_SESSIONS && MAX_SESSIONS > 1) {
+    parts.push(MAX_SESSIONS + " 路并发");
   }
+  el.innerHTML = parts.join(" · ");
+  el.className = "capline" + (n > MAX_SESSIONS ? " over" : "");
+
+  const btn = document.getElementById("addwin");
+  const full = n >= MAX_SESSIONS;
+  btn.disabled = full;
+  btn.title = full
+    ? ("已到上限：后端只开了 " + MAX_SESSIONS + " 个会话"
+       + (CTX_SIZE === null ? "" : "（上下文 " + CTX_SIZE.toLocaleString() + " 时每路 KV 按满上下文预分配）")
+       + "。要更多窗口就得用更小的上下文导出、或者改用更少的窗口数重启后端。")
+    : "新增一个对话窗口";
+
+  // 「②」的文案跟着窗口数走（以前写死"4 路"，窗口变成 2 个之后就成了假话）
+  document.getElementById("all").textContent = "② " + n + " 路同时提问";
+}
+
+// 读后端的容量。**失败不抛**：页面可能被当本地文件打开（那时没有同源后端），
+// 或者网关还没起来——这两种情况下都用兜底值继续，只是容量条上说明白。
+async function refreshHealth() {
+  try {
+    const r = await fetch(API + "/health");
+    if (!r.ok) { return; }
+    const h = await r.json();
+    if (typeof h.sessions === "number" && h.sessions > 0) { MAX_SESSIONS = h.sessions; }
+    if (typeof h.ctx_size === "number") { CTX_SIZE = h.ctx_size; }
+    capKnown = true;
+  } catch (e) {
+    /* 保持上一次的值（首次就是兜底值） */
+  }
+  renderCap();
+}
+
+function makePanel() {
+  const el = document.createElement("div");
+  el.className = "panel";
+  el.innerHTML =
+    '<div class="phead"><span class="dot"></span><span class="name" data-role="name"></span>' +
+    '<span class="hint" data-role="sess"></span>' +
+    '<span class="perf" data-role="perf"></span>' +
+    '<button class="close" data-role="close" title="关闭这个窗口（会话当场交还）" ' +
+    'aria-label="关闭窗口">×</button></div>' +
+    '<div class="log" data-role="log"></div>' +
+    '<div class="stat" data-role="stat"></div>' +
+    '<div class="pfoot"><div class="inbox">' +
+    '<textarea data-role="in" rows="1" placeholder="输入问题，Enter 发送 · Shift+Enter 换行"></textarea>' +
+    '<button data-role="go" class="send" title="发送（Enter）" aria-label="发送">' +
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M4 12h14M12 6l6 6-6 6"/></svg></button>' +
+    '</div></div>';
+
+  const p = {
+    el: el,
+    convId: newConvId(),     // 这一格的对话身份，**从此刻起不再变**
+    name: el.querySelector('[data-role=name]'),
+    log: el.querySelector('[data-role=log]'),
+    stat: el.querySelector('[data-role=stat]'),
+    sess: el.querySelector('[data-role=sess]'),
+    perf: el.querySelector('[data-role=perf]'),
+    input: el.querySelector('[data-role=in]'),
+    go: el.querySelector('[data-role=go]'),
+    close: el.querySelector('[data-role=close]'),
+    dot: el.querySelector('.dot'),
+    messages: [],            // 这一路自己的对话历史 —— 多轮就靠它，也是 KV 复用的前提
+    streaming: false,
+    kv: "",
+    ttft: null,              // 首字延迟（第一个增量到手的时间），性能小字要它
+  };
+  p.input.addEventListener("input", function () { grow(p.input); });
+  p.input.addEventListener("keydown", function (e) {
+    // Enter 发送、**Shift+Enter 换行**。单行 input 时回车只有发送一个意思，改成
+    // textarea 之后回车默认是换行（不拦的话按回车什么都不发生），所以必须显式分流。
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();     // 不然发送的同时还往框里插一个换行
+      send(p);
+    }
+  });
+  p.go.addEventListener("click", function () { send(p); });
+  p.close.addEventListener("click", function () { removePanel(p); });
+  return p;
+}
+
+function addPanel() {
+  if (panels.length >= MAX_SESSIONS) { return null; }
+  const p = makePanel();
+  panels.push(p);
+  document.getElementById("grid").appendChild(p.el);
+  p.input.value = DEFAULT_Q[(panels.length - 1) % DEFAULT_Q.length];
+  grow(p.input);
+  render(p);
+  renumber();
+  renderCap();
+  updateGlobal();
+  return p;
+}
+
+function removePanel(p) {
+  // 正在生成的不许删：它多半正占着会话，DOM 一没，那一路的结果回来就没处写了。
+  if (p.streaming) { return false; }
+  const i = panels.indexOf(p);
+  if (i < 0) { return false; }
+  // 至少留一个。全删光之后这一页就只剩一个"＋"，连"单路基线"都没法量了。
+  if (panels.length <= 1) { return false; }
+  panels.splice(i, 1);
+  // 历史跟着 DOM 一起没了，会话留着只是占着不放——**当场交还**。网关只排队不抢占，
+  // 不还的话新窗口/新客户端要一直等到 IDLE_TTL（默认 300s）超时才有位置，
+  // 而那几分钟里屏幕上什么异常都看不出来。
+  closeConv(p.convId);
+  if (p.el.remove) { p.el.remove(); }
+  else if (p.el.parentNode && p.el.parentNode.removeChild) { p.el.parentNode.removeChild(p.el); }
+  renumber();
+  renderCap();
+  updateGlobal();
+  return true;
+}
+
+// 先建几个窗口：最多 4 个（屏幕摆得下），且不超过后端会话数。
+// 32K 那份导出只够 2 路，于是这里就建 2 个——**不是页面小气，是板卡只有这点内存**。
+const MAX_PANELS_ON_SCREEN = 4;
+
+function buildPanels() {
+  const want = Math.min(MAX_PANELS_ON_SCREEN, MAX_SESSIONS);
+  for (let i = 0; i < want; i++) { addPanel(); }
 }
 
 function addMsg(p, kind, who, text) {
@@ -447,14 +583,18 @@ async function closeConv(convId) {
   } catch (e) { /* 交还失败不影响演示：最坏就是退回"等 TTL 超时"的老行为 */ }
 }
 
-// 关页面 = 这次演示结束了，把五个身份都还回去（四个面板 + 基线）。
+// 关页面 = 这次演示结束了，把当前**所有**窗口的身份都还回去（加基线那一个）。
+// 这里必须遍历 `panels` 而不是写死一串名字：窗口是可以增删的，写死的那几个名字
+// 在删过窗口之后就对不上了——对不上的后果是那段对话一直占到 IDLE_TTL 超时，
+// 后面来的人干等五分钟，而屏幕上一点异常都看不出来。
 // 用 `sendBeacon` 而**不是** `fetch`：页面正在卸载时 fetch 会被浏览器直接取消，
 // 这段代码就等于没写；sendBeacon 由浏览器代发，是 unload 里唯一靠得住的方式。
-// 只在关页面时还、不在面板跑完就还：同一页里那四段对话是要留着的（第二轮看 KV 复用）。
+// 只在关页面时还、不在面板跑完就还：同一页里那几段对话是要留着的（第二轮看 KV 复用）。
 // 正文用普通字符串（text/plain）就行——网关的 `_read_json` 只认 Content-Length，
 // 不看 Content-Type；而且这个类型是"安全"的，连预检都不用发。
 window.addEventListener("beforeunload", function () {
-  ["web-1", "web-2", "web-3", "web-4", "web-baseline"].forEach(function (id) {
+  const ids = panels.map(function (p) { return p.convId; }).concat(["web-baseline"]);
+  ids.forEach(function (id) {
     try {
       navigator.sendBeacon(API + "/v1/conversations/close",
                            JSON.stringify({ conversation_id: id }));
@@ -479,8 +619,9 @@ async function send(p) {
   render(p);
   updateGlobal();
   try {
-    // 这一路的名字**必须稳定**："web-1" 永远是这一格。改了名字就是换了对话，
-    // 网关会当成新人重新分会话，多轮的 KV 复用也就没了。
+    // 这一路的名字**必须稳定**：`p.convId` 从建面板那一刻定下，之后不管顺序怎么变、
+    // 别的窗口删没删，它都不动。改了名字就是换了对话，网关会当成新人重新分会话，
+    // 多轮的 KV 复用也就没了（所以这里用的是身份，不是"第几个面板"）。
     const r = await streamChat(p.messages, function (soFar, el, n) {
       bubble.textContent = soFar;
       p.log.scrollTop = p.log.scrollHeight;
@@ -494,7 +635,7 @@ async function send(p) {
       } else {
         setStat(p, "⏳ " + el.toFixed(1) + "s · " + n + " 块");
       }
-    }, "web-" + (p.id + 1), function (el) {
+    }, p.convId, function (el) {
       // 还没拿到会话。**这里一定要说话**：这几秒到几分钟里页面上本来只有一个转圈，
       // 看着像卡死，而真相是"四个会话都被别的对话占着"。写清楚是"等会话"还是
       // "等模型"，用户才不会把它当成"板卡坏了/网络断了"。
@@ -584,11 +725,13 @@ function summarize(rs, wall, baseline) {
            + " tok / 墙钟 " + wall.toFixed(1) + "s）";
   if (den < n - 0.5) {
     // 摊薄警告：这是分母里混进了空转时间，不是"并发退化"。
-    html += " · <span style='color:var(--warn)'>四路长短不齐，平均只有 " + den.toFixed(2) + "/"
+    // 路数写成 n 而不是"四路"：窗口能增删之后屏幕上可能只有 2 路，说"四路"是假话，
+    // 而这句话正是判读那两个数的关键（它解释的是分母里混进了什么）。
+    html += " · <span style='color:var(--warn)'>" + n + " 路长短不齐，平均只有 " + den.toFixed(2) + "/"
           + n + " 路在跑</span>，墙钟摊薄 " + agg.toFixed(2) + " tok/s（空转的路也算进了分母，"
           + "别当并发性能看）";
   } else {
-    html += " · 墙钟摊薄 " + agg.toFixed(2) + " tok/s（四路差不多同时收工，二者等价）";
+    html += " · 墙钟摊薄 " + agg.toFixed(2) + " tok/s（" + n + " 路差不多同时收工，二者等价）";
   }
   if (baseline) {
     html += " · <span style='color:var(--warn)'>伸缩 " + (solo / baseline).toFixed(2)
@@ -634,7 +777,7 @@ document.getElementById("baseline").addEventListener("click", async function () 
     setSum("单路基线：<b>" + r.rate.toFixed(2) + " tok/s</b>（" + r.tok
            + " tok / " + r.el.toFixed(1) + "s"
            + (r.waited > 0.05 ? "，其中排队 " + r.waited.toFixed(1) + "s" : "")
-           + "）→ 现在点「② 4 路同时提问」");
+           + "）→ 现在点「② " + panels.length + " 路同时提问」");
   } catch (err) {
     setStatus("err", "基线失败");
     // 汇总行是 innerHTML（要加粗），所以错误文本必须转义 —— 它来自网关的响应体。
@@ -657,7 +800,12 @@ async function runAll() {
   // 全都是空的就填回默认问题（第二轮之后输入框是空的，历史还在——
   // 这一批就变成"四段对话各自的第二轮"，顺带能看到 KV 复用）
   if (panels.every(function (p) { return !p.input.value.trim(); })) {
-    panels.forEach(function (p, i) { p.input.value = DEFAULT_Q[i]; grow(p.input); });
+    // 按**当前位置**取默认问题，且循环取：窗口数不再是固定的 4，多开或删过之后
+    // `DEFAULT_Q[i]` 会取到 undefined（输入框变空，这一路就静默不发）
+    panels.forEach(function (p, i) {
+      p.input.value = DEFAULT_Q[i % DEFAULT_Q.length];
+      grow(p.input);
+    });
   }
   const n = panels.filter(function (p) { return p.input.value.trim(); }).length;
   setStatus("busy", "生成中 " + n + " 路");
@@ -675,6 +823,18 @@ async function runAll() {
 }
 document.getElementById("all").addEventListener("click", runAll);
 
+// 「＋ 加窗口」。到上限时按钮本来就是 disabled（浏览器对 disabled 的按钮不派发 click），
+// 但 `addPanel` 自己那道闸**不能撤**：上限是 `refreshHealth` 异步改的，从"还能加"到
+// "加不动了"之间没有重绘，键盘/脚本/以及这一瞬间的点击都绕得过 disabled。
+// 加不动时补一句话：只把按钮变灰的话，用户会以为页面坏了，而不是"板卡只有这么多会话"。
+document.getElementById("addwin").addEventListener("click", function () {
+  if (addPanel()) { return; }
+  document.getElementById("cap").innerHTML +=
+    " —— 不能再加了：后端只开了 " + MAX_SESSIONS + " 个会话"
+    + (CTX_SIZE === null ? ""
+       : "（上下文 " + CTX_SIZE.toLocaleString() + " 时每路 KV 按满上下文预分配）");
+});
+
 document.getElementById("clear").addEventListener("click", resetAll);
 
 function resetAll() {
@@ -683,22 +843,35 @@ function resetAll() {
     p.log.innerHTML = "";
     p.sess.textContent = "";
     p.stat.textContent = "";
-    p.input.value = DEFAULT_Q[i];
+    p.input.value = DEFAULT_Q[i % DEFAULT_Q.length];
     grow(p.input);
     p.ttft = null;
     setPerf(p, "");          // 头上那格性能小字也是"上一次的结果"，一起清
     p.lastRate = null;
-    // 「清空」= 这四段对话我不要了。历史已经删了，留着会话也只是占着不放：
-    // 显式交还，后面的人（或下一次演示）立刻能用满 4 个会话。
-    closeConv("web-" + (i + 1));
+    // 「清空」= 这几段对话我不要了。历史已经删了，留着会话也只是占着不放：
+    // 显式交还，后面的人（或下一次演示）立刻能用满所有会话。
+    // **交还的是身份而不是"第几格"**：窗口删过之后序号和身份就对不上了，
+    // 按序号还等于还错人（真会话没还，还把一个不存在的 key 报给网关）。
+    closeConv(p.convId);
   });
   lastSingleRate = null;
   setSum("");
   updateGlobal();
 }
 
-buildPanels();
-updateGlobal();
+// 窗口数上限在**建面板之前**就要拿到，所以顺序不能反：反过来是先摆出兜底的 4 个窗口、
+// 等 /health 回来再砍掉多的——屏幕上先闪一下再消失，更糟的是那 4 个窗口一旦发过请求
+// 就已经把会话占住了。读不到 /health（页面被当本地文件打开、网关没起）就按兜底值走。
+// capReady 交出去给 page_check.js 等（它是异步的，检查脚本必须等它落地再数面板）。
+let capReady = refreshHealth().then(function () {
+  buildPanels();
+  updateGlobal();
+});
+
+// 后端被换成别的 NSESSION 重启之后，开着的这一页要能自己发现（容量条会转警告色、
+// 「＋」会禁用）。**用 focus 而不是定时轮询**：演示跑起来的时候多一个请求就是给
+// 测量添噪音，而且一个常驻的 setInterval 会让 page_check.js 那个 node 进程不退出。
+window.addEventListener("focus", function () { refreshHealth(); });
 </script>
 </body>
 </html>

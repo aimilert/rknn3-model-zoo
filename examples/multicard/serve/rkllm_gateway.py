@@ -166,12 +166,37 @@ class _Request(object):
         return self.raw.decode("utf-8", "replace")
 
 
+def _argv_int(argv, name):
+    """从后端命令行里取一个整数选项（`--ctx-size 8192` 或 `--ctx-size=8192`）。
+
+    要它是为了 `/health` 能报出 `ctx_size`：**窗口数上限是上下文长度决定的**
+    （KV 按"每路满上下文"预分配，ctx 越大每路越贵、能开的窗口越少），页面不拿到
+    这个数就只能写死一个，换一份导出就变成骗人。
+
+    解析**真实 argv** 而不是另存一份配置：子进程真正收到的那个值才算数。
+    取不到/不是整数就回 None——宁可让页面少显示一格，也不要编一个数出来。
+    """
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            val = argv[i + 1]
+        elif a.startswith(name + "="):
+            val = a.split("=", 1)[1]
+        else:
+            continue
+        try:
+            return int(val)
+        except ValueError:
+            return None
+    return None
+
+
 class Backend(object):
     """demo 子进程 + 帧协议。所有方法都线程安全。"""
 
     def __init__(self, argv, log_path, frame_fd=None):
         self.argv = argv
         self.log_path = log_path
+        self.ctx_size = _argv_int(argv, "--ctx-size")
         # None  → 正常路径：自己开管道，用 pass_fds 把写端交给子进程，并追加
         #         --serve-fd <号> 告诉它认哪个号（Linux 板卡上走这条）。
         # "stdout" → 帧从子进程的 stdout 读。这条是给**本地自检的桩后端**用的：
@@ -917,7 +942,7 @@ def conversation_key(messages, explicit=None):
 # 4. HTTP / OpenAI
 # ===========================================================================
 
-# 演示页（4 个对话框那个）与网关同目录，用 GET /demo 直接打开。
+# 演示页（多路对话框那个，窗口数由页面自己问 /health 决定）与网关同目录，用 GET /demo 直接打开。
 # 为什么由网关自己发而不是另起一个静态服务器：**同源**，浏览器就不会有 CORS 的坑，
 # 演示时也只有一个进程要管。CORS 头照样给（见下），是为了页面被存到本地用
 # file:// 打开、或者被别的 Agent 前端引用时也能用。
@@ -1064,6 +1089,12 @@ class Handler(BaseHTTPRequestHandler):
                                                "degraded"),
                                     "model": MODEL_ID,
                                     "sessions": self.gateway.backend.sessions,
+                                    # 后端真正拿到的 --ctx-size。页面要用它把"窗口数
+                                    # 上限由上下文长度决定"这条关系讲给用户听
+                                    # （KV 每路按满上下文预分配：32K 每路 406.7 MB/卡，
+                                    # 每卡只够 2 路；8K 那份导出便宜得多）。取不到就是 null，
+                                    # 页面会自己退化成不显示这一格。
+                                    "ctx_size": self.gateway.backend.ctx_size,
                                     # 「还能不能干活」必须能从这一行看出来。现场最坑的一种
                                     # 状态是 status:"ok" + sessions:4 + 四个 slot 全 dead：
                                     # 后端子进程已经退出、每个请求都 503，而 /health 报的是
@@ -2218,8 +2249,14 @@ def main():
         httpd.daemon_threads = True
         print("[gateway] listening on http://%s:%d  (sessions=%d, model=%s)"
               % (args.host, args.port, backend.sessions, MODEL_ID), flush=True)
-        print("[gateway] 演示页（4 个对话框）: http://%s:%d/demo"
-              % (args.host, args.port), flush=True)
+        # 别再写死"4 个对话框"：页面 2026-09-20 起按 /health 的 sessions 决定开几个窗口
+        # （32768 那份导出只够 2 路），屏幕上看的是几个就是几个。ctx_size 也一并印出来，
+        # 因为它才是"为什么只有这么几个窗口"的答案。
+        print("[gateway] 演示页（窗口数 = 本后端的会话数，当前 %d 个；上下文 %s）: "
+              "http://%s:%d/demo"
+              % (backend.sessions,
+                 backend.ctx_size if backend.ctx_size is not None else "未在命令行给出",
+                 args.host, args.port), flush=True)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
