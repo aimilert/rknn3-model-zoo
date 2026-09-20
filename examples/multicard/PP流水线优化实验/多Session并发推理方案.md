@@ -783,6 +783,7 @@ git checkout -b feature/multisession-concurrency
 #   7c425b9  multicard/serve: split the aggregate into per-path rate sum and wall-clock average  (v1.20；§9.16)
 #   b53d328  multicard/serve: size the session count from the export, and bound the page by it  (v1.21；§9.17)
 #   242ddec  multicard/serve: put per-card and host resource usage on the demo page  (v1.22；§9.18)
+#   1b92d3d  multicard/serve: read card memory from the nodes, and hold the busy window still  (v1.23；§9.18.6)
 git tag p0-baseline     # 指向 d59a239，回归对照点
 git tag p1-session-split
 git tag p2-concurrent
